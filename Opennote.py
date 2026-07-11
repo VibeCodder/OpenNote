@@ -345,9 +345,16 @@ def _apply_text_font(item, family=None, bold=None, italic=None, underline=None, 
     # actual text edits do), so a TableItem never hears about a font/size
     # change through _on_cell_text_changed and its row heights go stale -
     # the new, possibly taller text then overflows the old row bounds.
-    # Force a relayout here whenever the target exposes one (TableItem).
+    # Force a relayout here whenever the target exposes one (TableItem,
+    # or a MediaCardMixin item's title/description bars).
     if hasattr(item, "_layout_cells"):
         item._layout_cells()
+        item.update()
+    if hasattr(item, "_on_title_desc_text_changed"):
+        item._on_title_desc_text_changed()
+        item.update()
+    if isinstance(item, TextNoteItem):
+        item._on_text_changed()
         item.update()
 
 
@@ -698,11 +705,11 @@ class TextNoteItem(BaseComponentItem):
         self.text_item.setPlainText(text)
         self.text_item.setTextInteractionFlags(Qt.NoTextInteraction)
         self.text_item.setFont(QFont("Segoe UI", 11))
+        self._autosizing = False
         if font_family or font_size or bold or italic or underline:
             _apply_text_font(self, family=font_family, bold=bold, italic=italic,
                               underline=underline, point_size=font_size)
         self.text_item.document().contentsChanged.connect(self._on_text_changed)
-        self._autosizing = False
         self.link_url = None
         if link_url:
             self.set_link(link_url)
@@ -724,19 +731,19 @@ class TextNoteItem(BaseComponentItem):
         self.text_item.setTextWidth(max(10, self._w - 20))
 
     def _on_text_changed(self):
-        # Grow the note's height to fit its text so typed content never
-        # spills outside the visible card - it never shrinks back on its
-        # own (deleting text won't shrink the note), only grows on demand.
+        # Fit the note's height to its text - grows so typed content
+        # never spills outside the visible card, and (unlike before)
+        # shrinks back down too, so deleting or shrinking text doesn't
+        # leave a big empty note behind. Never shrinks below min_h.
         if self._autosizing:
             return
         doc_h = self.text_item.document().size().height()
         needed_h = doc_h + 20
-        if needed_h > self._h:
-            self._autosizing = True
-            try:
-                self.set_size(self._w, needed_h)
-            finally:
-                self._autosizing = False
+        self._autosizing = True
+        try:
+            self.set_size(self._w, needed_h)
+        finally:
+            self._autosizing = False
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.Antialiasing)
@@ -990,50 +997,145 @@ class MediaCardMixin:
 
     TITLE_H = 26
     DESC_H = 24
+    MIN_MEDIA_H = 40  # smallest room left for the actual media once the
+                       # title/description bars have grown to fit their text
 
-    def _init_title_desc(self, title="", description=""):
+    def _init_title_desc(self, title="", description="", show_title=True, show_description=True,
+                          title_font=None, desc_font=None, title_color=None, desc_color=None):
+        # Whether the title/description bars are shown at all - toggled
+        # via the "Show Title"/"Show Description" context menu entries
+        # (see _build_media_context_menu). When both are off, the media
+        # itself simply fills the whole component with no chrome.
+        self.show_title = True if show_title is None else bool(show_title)
+        self.show_description = True if show_description is None else bool(show_description)
+
         self.title_item = EditableTextItem(self)
-        self.title_item.setDefaultTextColor(QColor("#ffffff"))
-        self.title_item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.title_item.setDefaultTextColor(QColor(title_color) if title_color else QColor("#ffffff"))
+        self.title_item.setFont(
+            _font_from_dict(title_font, base_family="Segoe UI", base_size=10.0, base_bold=True)
+            if title_font else QFont("Segoe UI", 10, QFont.Bold)
+        )
         self.title_item.setPlainText(title)
         self.title_item.setTextInteractionFlags(Qt.NoTextInteraction)
         self.title_item.document().setDocumentMargin(4)
 
         self.description_item = EditableTextItem(self)
-        self.description_item.setDefaultTextColor(QColor("#aaaaaa"))
-        self.description_item.setFont(QFont("Segoe UI", 9))
+        self.description_item.setDefaultTextColor(QColor(desc_color) if desc_color else QColor("#aaaaaa"))
+        self.description_item.setFont(
+            _font_from_dict(desc_font, base_family="Segoe UI", base_size=9.0, base_bold=False)
+            if desc_font else QFont("Segoe UI", 9)
+        )
         self.description_item.setPlainText(description)
         self.description_item.setTextInteractionFlags(Qt.NoTextInteraction)
         self.description_item.document().setDocumentMargin(4)
+
+        # Dynamic bar heights - fit the current text/font, growing or
+        # shrinking as needed. Recomputed on every text edit
+        # (_on_title_desc_text_changed, wired below) and after every
+        # toolbar font/size change (see _apply_text_font's hook for
+        # _on_title_desc_text_changed).
+        self._title_h = self.TITLE_H
+        self._desc_h = self.DESC_H
+        self._autosizing_td = False
+        # Set the text width once up front (needed for an accurate wrapped
+        # document height) before measuring, then measure/grow, then lay
+        # out again at the now-final bar heights.
         self._layout_title_desc()
+        self._recalc_title_desc_heights()
+        self._ensure_title_desc_component_height()
+        self._layout_title_desc()
+
+        self.title_item.document().contentsChanged.connect(self._on_title_desc_text_changed)
+        self.description_item.document().contentsChanged.connect(self._on_title_desc_text_changed)
+
+        self._update_title_desc_visibility()
+
+    def _update_title_desc_visibility(self):
+        self.title_item.setVisible(self.show_title)
+        self.description_item.setVisible(self.show_description)
+
+    def _title_bar_h(self):
+        return self._title_h if self.show_title else 0
+
+    def _desc_bar_h(self):
+        return self._desc_h if self.show_description else 0
+
+    def _measure_bar_h(self, item, min_h):
+        return max(min_h, item.document().size().height() + 8)
+
+    def _recalc_title_desc_heights(self):
+        """Fit the title/description bar heights to their current text
+        and font size - grows when there's more content, and (unlike
+        TextNoteItem's own height) shrinks back down too, so deleting or
+        shrinking text doesn't leave a big empty bar behind."""
+        self._title_h = self._measure_bar_h(self.title_item, self.TITLE_H)
+        self._desc_h = self._measure_bar_h(self.description_item, self.DESC_H)
+
+    def _ensure_title_desc_component_height(self):
+        """Grow the component's overall height if the (possibly now
+        taller) title/description bars no longer leave enough room for
+        the media itself."""
+        needed = self._title_bar_h() + self._desc_bar_h() + self.MIN_MEDIA_H
+        if needed > self._h:
+            self.prepareGeometryChange()
+            self._h = needed
+
+    def _on_title_desc_text_changed(self):
+        """Wired to both text items' contentsChanged signal, and also
+        called directly as the relayout hook after a toolbar font/size
+        change (see _apply_text_font) - either way, the title/description
+        frames resize to fit, growing the component if needed."""
+        if self._autosizing_td:
+            return
+        self._autosizing_td = True
+        try:
+            self._recalc_title_desc_heights()
+            self._ensure_title_desc_component_height()
+            self._layout_title_desc()
+            self.on_resized()
+        finally:
+            self._autosizing_td = False
+        self.update()
+
+    def font_targets(self, editing_item=None):
+        """What the toolbar's Font/B/I/U/Size controls should restyle:
+        just the title or description currently being edited, if any,
+        otherwise both together - the same "whole thing at once"
+        behavior Text Note and Table already use."""
+        if editing_item is self.title_item or editing_item is self.description_item:
+            return [editing_item]
+        return [self.title_item, self.description_item]
 
     def _layout_title_desc(self):
         self.title_item.setPos(4, 0)
         self.title_item.setTextWidth(max(10, self._w - 8))
-        self.description_item.setPos(4, self._h - self.DESC_H)
+        self.description_item.setPos(4, self._h - self._desc_bar_h())
         self.description_item.setTextWidth(max(10, self._w - 8))
 
     def _media_rect(self):
         """The area available for the actual media content, between the
-        title bar and the description bar."""
-        top = self.TITLE_H
-        bottom = self._h - self.DESC_H
+        title bar and the description bar (either or both may be hidden,
+        in which case the media simply extends to that edge)."""
+        top = self._title_bar_h()
+        bottom = self._h - self._desc_bar_h()
         return QRectF(0, top, self._w, max(10, bottom - top))
 
     def _paint_title_desc_chrome(self, painter):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#1e1e1e"))
-        painter.drawRect(QRectF(0, 0, self._w, self.TITLE_H))
-        painter.drawRect(QRectF(0, self._h - self.DESC_H, self._w, self.DESC_H))
+        if self.show_title:
+            painter.drawRect(QRectF(0, 0, self._w, self._title_bar_h()))
+        if self.show_description:
+            painter.drawRect(QRectF(0, self._h - self._desc_bar_h(), self._w, self._desc_bar_h()))
 
     def _title_desc_double_click(self, event):
         """Call from the subclass's mouseDoubleClickEvent; returns True if
         the click was on the title/description bar and was handled."""
         y = event.pos().y()
         target = None
-        if y < self.TITLE_H:
+        if self.show_title and y < self._title_bar_h():
             target = self.title_item
-        elif y > self._h - self.DESC_H:
+        elif self.show_description and y > self._h - self._desc_bar_h():
             target = self.description_item
         if target is None:
             return False
@@ -1047,6 +1149,12 @@ class MediaCardMixin:
     def _title_desc_serialize(self, d):
         d["title"] = self.title_item.toPlainText()
         d["description"] = self.description_item.toPlainText()
+        d["show_title"] = self.show_title
+        d["show_description"] = self.show_description
+        d["title_font"] = _font_to_dict(self.title_item.font())
+        d["description_font"] = _font_to_dict(self.description_item.font())
+        d["title_color"] = self.title_item.defaultTextColor().name()
+        d["description_color"] = self.description_item.defaultTextColor().name()
         return d
 
     @staticmethod
@@ -1054,24 +1162,65 @@ class MediaCardMixin:
         return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _title_desc_html(self):
-        title = self._escape_html(self.title_item.toPlainText())
-        desc = self._escape_html(self.description_item.toPlainText())
+        title = self._escape_html(self.title_item.toPlainText()) if self.show_title else ""
+        desc = self._escape_html(self.description_item.toPlainText()) if self.show_description else ""
         return (
             f'<div class="media-title">{title}</div>' if title else "",
             f'<div class="media-desc">{desc}</div>' if desc else "",
         )
+
+    # -- toggling title/description on/off, wired up through each media
+    # subclass's context menu (see e.g. ImageItem._build_context_menu) --
+    def _toggle_show_title(self):
+        self.show_title = not self.show_title
+        self._update_title_desc_visibility()
+        self.on_resized()
+        self.update()
+
+    def _toggle_show_description(self):
+        self.show_description = not self.show_description
+        self._update_title_desc_visibility()
+        self.on_resized()
+        self.update()
+
+    def _build_media_context_menu(self, menu):
+        """Call from the subclass's _build_context_menu override to add
+        the "Show Title"/"Show Description" checkable entries."""
+        title_action = menu.addAction("Show Title")
+        title_action.setCheckable(True)
+        title_action.setChecked(self.show_title)
+        desc_action = menu.addAction("Show Description")
+        desc_action.setCheckable(True)
+        desc_action.setChecked(self.show_description)
+        menu.addSeparator()
+        self._media_title_action = title_action
+        self._media_desc_action = desc_action
+
+    def _handle_media_context_action(self, action):
+        """Call from the subclass's _handle_context_action override;
+        returns True if the action was one of ours and was handled."""
+        if action is getattr(self, "_media_title_action", None):
+            self._toggle_show_title()
+            return True
+        if action is getattr(self, "_media_desc_action", None):
+            self._toggle_show_description()
+            return True
+        return False
 
 
 class ImageItem(MediaCardMixin, BaseComponentItem):
     TYPE_NAME = "image"
 
     def __init__(self, x=0, y=0, w=240, h=180, pixmap=None, b64=None, item_id=None,
-                 title="", description=""):
+                 title="", description="", show_title=True, show_description=True,
+                 title_font=None, desc_font=None, title_color=None, desc_color=None):
         super().__init__(x, y, w, h, item_id)
         self.pixmap_orig = pixmap if pixmap is not None else base64_to_pixmap(b64)
         self.min_w, self.min_h = 120, 140
         self.setAcceptDrops(True)
-        self._init_title_desc(title, description)
+        self._init_title_desc(title, description, show_title, show_description,
+                               title_font=title_font, desc_font=desc_font,
+                               title_color=title_color, desc_color=desc_color)
 
     def set_pixmap(self, pixmap):
         self.pixmap_orig = pixmap
@@ -1085,6 +1234,12 @@ class ImageItem(MediaCardMixin, BaseComponentItem):
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+    def _build_context_menu(self, menu):
+        self._build_media_context_menu(menu)
+
+    def _handle_context_action(self, action):
+        self._handle_media_context_action(action)
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -1147,7 +1302,8 @@ class GifItem(MediaCardMixin, BaseComponentItem):
     TYPE_NAME = "gif"
 
     def __init__(self, x=0, y=0, w=240, h=180, gif_bytes=None, b64=None, item_id=None,
-                 title="", description=""):
+                 title="", description="", show_title=True, show_description=True,
+                 title_font=None, desc_font=None, title_color=None, desc_color=None):
         super().__init__(x, y, w, h, item_id)
         if gif_bytes is not None:
             self.gif_bytes = gif_bytes
@@ -1160,7 +1316,9 @@ class GifItem(MediaCardMixin, BaseComponentItem):
         self._current_pixmap = QPixmap()
         self.min_w, self.min_h = 120, 140
         self.setAcceptDrops(True)
-        self._init_title_desc(title, description)
+        self._init_title_desc(title, description, show_title, show_description,
+                               title_font=title_font, desc_font=desc_font,
+                               title_color=title_color, desc_color=desc_color)
         self._setup_movie()
 
     def _setup_movie(self):
@@ -1193,6 +1351,12 @@ class GifItem(MediaCardMixin, BaseComponentItem):
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+    def _build_context_menu(self, menu):
+        self._build_media_context_menu(menu)
+
+    def _handle_context_action(self, action):
+        self._handle_media_context_action(action)
 
     def paint(self, painter, option, widget=None):
         rect = self._media_rect()
@@ -1431,7 +1595,8 @@ class VideoItem(MediaCardMixin, BaseComponentItem):
     DRAG_STRIP_H = 16
 
     def __init__(self, x=0, y=0, w=320, h=220, video_bytes=None, b64=None, item_id=None,
-                 title="", description=""):
+                 title="", description="", show_title=True, show_description=True,
+                 title_font=None, desc_font=None, title_color=None, desc_color=None):
         super().__init__(x, y, w, h, item_id)
         if video_bytes is not None:
             self.video_bytes = video_bytes
@@ -1442,7 +1607,9 @@ class VideoItem(MediaCardMixin, BaseComponentItem):
         self.min_w, self.min_h = 200, 220
         self.player_node = VideoPlayerNode(self.video_bytes, parent=self)
         self.setAcceptDrops(True)
-        self._init_title_desc(title, description)
+        self._init_title_desc(title, description, show_title, show_description,
+                               title_font=title_font, desc_font=desc_font,
+                               title_color=title_color, desc_color=desc_color)
         self._resize_player()
 
     def _resize_player(self):
@@ -1466,6 +1633,12 @@ class VideoItem(MediaCardMixin, BaseComponentItem):
     def set_video_bytes(self, data):
         self.video_bytes = data
         self.player_node.set_video_bytes(data)
+
+    def _build_context_menu(self, menu):
+        self._build_media_context_menu(menu)
+
+    def _handle_context_action(self, action):
+        self._handle_media_context_action(action)
 
     def paint(self, painter, option, widget=None):
         media = self._media_rect()
@@ -2592,6 +2765,12 @@ class BoardCardItem(BaseComponentItem):
     TYPE_NAME = "board"
     DEFAULT_COLOR = "#2b2b2b"
     MEDIA_GAP = 18  # vertical gap between stacked image/gif/video subitems
+    SUB_MEDIA_TITLE_H = 22  # title bar above an image/gif/video subitem,
+                             # shown only when that subitem has a title
+                             # AND its "show_title" flag is on - mirrors
+                             # MediaCardMixin.TITLE_H on the standalone
+                             # components these subitems came from.
+    SUB_MEDIA_DESC_H = 20   # same idea for the description bar below
     VIDEO_HANDLE_H = 14  # thin dotted drag-strip above each embedded video
                           # player, mirroring VideoItem.DRAG_STRIP_H - the
                           # player widget below it consumes clicks for its
@@ -2753,6 +2932,33 @@ class BoardCardItem(BaseComponentItem):
                 return idx
         return len(self.subitems)
 
+    def _sub_media_chrome(self, item):
+        """For an image/gif/video subitem, decide whether its title/desc
+        bars should be drawn (on AND actually has text) and how tall each
+        one is - shared by paint() and _estimate_content_height() so the
+        two never disagree about how much vertical space a subitem needs."""
+        show_title = bool(item.get("show_title", True)) and bool(item.get("title"))
+        show_desc = bool(item.get("show_description", True)) and bool(item.get("description"))
+        title_h = self.SUB_MEDIA_TITLE_H if show_title else 0
+        desc_h = self.SUB_MEDIA_DESC_H if show_desc else 0
+        return show_title, show_desc, title_h, desc_h
+
+    def _paint_sub_media_title(self, painter, rect, text):
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#1e1e1e"))
+        painter.drawRect(rect)
+        painter.setPen(QColor("#ffffff"))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        painter.drawText(rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+
+    def _paint_sub_media_desc(self, painter, rect, text):
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#1e1e1e"))
+        painter.drawRect(rect)
+        painter.setPen(QColor("#aaaaaa"))
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.drawText(rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+
     def _estimate_content_height(self):
         """Approximate the total height needed to show every subitem
         without anything getting clipped - mirrors the layout math in
@@ -2770,11 +2976,14 @@ class BoardCardItem(BaseComponentItem):
             kind = item.get("kind")
             if kind in ("image", "gif"):
                 pm = base64_to_pixmap(item.get("data", ""))
-                h = self._subitem_media_height(pm, avail_w, 10 ** 6)
+                _, _, title_h, desc_h = self._sub_media_chrome(item)
+                h = self._subitem_media_height(pm, avail_w, 10 ** 6) + title_h + desc_h
                 y += h + self.MEDIA_GAP
             elif kind == "video":
                 aspect = item.get("aspect") or (9 / 16)
-                h = self._subitem_media_height(None, avail_w, 10 ** 6, aspect=aspect) + self.VIDEO_HANDLE_H
+                _, _, title_h, desc_h = self._sub_media_chrome(item)
+                h = (self._subitem_media_height(None, avail_w, 10 ** 6, aspect=aspect)
+                     + self.VIDEO_HANDLE_H + title_h + desc_h)
                 y += h + self.MEDIA_GAP
             elif kind == "text":
                 sub_font = QFont(item.get("font_family") or "Segoe UI", 10)
@@ -3023,8 +3232,12 @@ class BoardCardItem(BaseComponentItem):
                 # with KeepAspectRatio below fills the box exactly - no
                 # cropping and no letterboxing, and it stays correct no
                 # matter how the card gets resized afterwards.
-                h = self._subitem_media_height(pm, avail_w, remaining_h)
-                r = QRectF(pad, y, avail_w, h)
+                show_title, show_desc, title_h, desc_h = self._sub_media_chrome(item)
+                media_h = self._subitem_media_height(pm, avail_w, remaining_h - title_h - desc_h)
+                if show_title:
+                    self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item.get("title", ""))
+                    y += title_h
+                r = QRectF(pad, y, avail_w, media_h)
                 painter.setBrush(QColor("#111111"))
                 painter.setPen(Qt.NoPen)
                 painter.drawRect(r)
@@ -3033,7 +3246,11 @@ class BoardCardItem(BaseComponentItem):
                     px = r.x() + (r.width() - scaled.width()) / 2
                     py = r.y() + (r.height() - scaled.height()) / 2
                     painter.drawPixmap(int(px), int(py), scaled)
-                y += h + self.MEDIA_GAP
+                y += media_h
+                if show_desc:
+                    self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item.get("description", ""))
+                    y += desc_h
+                y += self.MEDIA_GAP
                 self._subitem_rects.append((idx, QRectF(pad, row_top, avail_w, y - row_top)))
             elif kind == "video":
                 # Videos have no decoded thumbnail to measure, but the
@@ -3047,9 +3264,12 @@ class BoardCardItem(BaseComponentItem):
                 # player widget for clicks), instead of the old static
                 # "\u25B6 video" placeholder that had no playback at all.
                 aspect = item.get("aspect") or (9 / 16)
+                show_title, show_desc, title_h, desc_h = self._sub_media_chrome(item)
+                if show_title:
+                    self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item.get("title", ""))
+                    y += title_h
                 media_h = self._subitem_media_height(
-                    None, avail_w, remaining_h - self.VIDEO_HANDLE_H, aspect=aspect)
-                h = media_h + self.VIDEO_HANDLE_H
+                    None, avail_w, remaining_h - self.VIDEO_HANDLE_H - title_h - desc_h, aspect=aspect)
                 handle_r = QRectF(pad, y, avail_w, self.VIDEO_HANDLE_H)
                 painter.setBrush(QColor("#1e1e1e"))
                 painter.setPen(Qt.NoPen)
@@ -3063,7 +3283,11 @@ class BoardCardItem(BaseComponentItem):
                 proxy.setPos(pad, y + self.VIDEO_HANDLE_H)
                 proxy.resize(avail_w, media_h)
                 proxy.show()
-                y += h + self.MEDIA_GAP
+                y += self.VIDEO_HANDLE_H + media_h
+                if show_desc:
+                    self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item.get("description", ""))
+                    y += desc_h
+                y += self.MEDIA_GAP
                 self._subitem_rects.append((idx, QRectF(pad, row_top, avail_w, y - row_top)))
             elif kind == "text":
                 sub_font = QFont(item.get("font_family") or "Segoe UI", 10)
@@ -3188,12 +3412,23 @@ class BoardCardItem(BaseComponentItem):
         rows = []
         for item in self.subitems:
             kind = item.get("kind")
-            if kind == "image":
-                rows.append(f'<div class="sub-image"><img src="data:image/png;base64,{item.get("data","")}"/></div>')
-            elif kind == "gif":
-                rows.append(f'<div class="sub-image"><img src="data:image/gif;base64,{item.get("data","")}"/></div>')
-            elif kind == "video":
-                rows.append(f'<div class="sub-video"><video controls src="data:video/mp4;base64,{item.get("data","")}"></video></div>')
+            if kind in ("image", "gif", "video"):
+                show_title = bool(item.get("show_title", True)) and bool(item.get("title"))
+                show_desc = bool(item.get("show_description", True)) and bool(item.get("description"))
+                t_html = (f'<div class="media-title">{MediaCardMixin._escape_html(item.get("title",""))}</div>'
+                          if show_title else "")
+                d_html = (f'<div class="media-desc">{MediaCardMixin._escape_html(item.get("description",""))}</div>'
+                          if show_desc else "")
+                if kind == "image":
+                    media = f'<img src="data:image/png;base64,{item.get("data","")}"/>'
+                    css_class = "sub-image"
+                elif kind == "gif":
+                    media = f'<img src="data:image/gif;base64,{item.get("data","")}"/>'
+                    css_class = "sub-image"
+                else:
+                    media = f'<video controls src="data:video/mp4;base64,{item.get("data","")}"></video>'
+                    css_class = "sub-video"
+                rows.append(f'<div class="{css_class}">{t_html}{media}{d_html}</div>')
             elif kind == "text":
                 t = (
                     item.get("text", "")
@@ -3245,11 +3480,19 @@ def component_to_subitem(item):
     if isinstance(item, ImageItem):
         return {
             "kind": "image", "data": pixmap_to_base64(item.pixmap_orig),
-            # Title/description aren't shown while embedded in a card,
-            # but are kept so they come back if the subitem is later
-            # dragged back out into its own standalone component.
+            # Title/description are kept, along with whether each is
+            # currently shown, so they come back exactly as they were -
+            # both while embedded in a card (see BoardCardItem.paint())
+            # and if the subitem is later dragged back out into its own
+            # standalone component (see subitem_to_component).
             "title": item.title_item.toPlainText(),
             "description": item.description_item.toPlainText(),
+            "show_title": item.show_title,
+            "show_description": item.show_description,
+            "title_font": _font_to_dict(item.title_item.font()),
+            "description_font": _font_to_dict(item.description_item.font()),
+            "title_color": item.title_item.defaultTextColor().name(),
+            "description_color": item.description_item.defaultTextColor().name(),
         }
     if isinstance(item, GifItem):
         return {
@@ -3257,6 +3500,12 @@ def component_to_subitem(item):
             "data": base64.b64encode(item.gif_bytes).decode("ascii") if item.gif_bytes else "",
             "title": item.title_item.toPlainText(),
             "description": item.description_item.toPlainText(),
+            "show_title": item.show_title,
+            "show_description": item.show_description,
+            "title_font": _font_to_dict(item.title_item.font()),
+            "description_font": _font_to_dict(item.description_item.font()),
+            "title_color": item.title_item.defaultTextColor().name(),
+            "description_color": item.description_item.defaultTextColor().name(),
         }
     if isinstance(item, VideoItem):
         return {
@@ -3269,6 +3518,12 @@ def component_to_subitem(item):
             "aspect": (item._h / item._w) if item._w else (9 / 16),
             "title": item.title_item.toPlainText(),
             "description": item.description_item.toPlainText(),
+            "show_title": item.show_title,
+            "show_description": item.show_description,
+            "title_font": _font_to_dict(item.title_item.font()),
+            "description_font": _font_to_dict(item.description_item.font()),
+            "title_color": item.title_item.defaultTextColor().name(),
+            "description_color": item.description_item.defaultTextColor().name(),
         }
     if isinstance(item, (TextNoteItem, PlainTextItem)):
         f = item.text_item.font()
@@ -3321,13 +3576,25 @@ def subitem_to_component(subitem, x, y):
     kind = subitem.get("kind")
     if kind == "image":
         return ImageItem(x, y, b64=subitem.get("data"),
-                          title=subitem.get("title", ""), description=subitem.get("description", ""))
+                          title=subitem.get("title", ""), description=subitem.get("description", ""),
+                          show_title=subitem.get("show_title", True),
+                          show_description=subitem.get("show_description", True),
+                          title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
+                          title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"))
     if kind == "gif":
         return GifItem(x, y, b64=subitem.get("data"),
-                        title=subitem.get("title", ""), description=subitem.get("description", ""))
+                        title=subitem.get("title", ""), description=subitem.get("description", ""),
+                        show_title=subitem.get("show_title", True),
+                        show_description=subitem.get("show_description", True),
+                        title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
+                        title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"))
     if kind == "video":
         return VideoItem(x, y, b64=subitem.get("data"),
-                          title=subitem.get("title", ""), description=subitem.get("description", ""))
+                          title=subitem.get("title", ""), description=subitem.get("description", ""),
+                          show_title=subitem.get("show_title", True),
+                          show_description=subitem.get("show_description", True),
+                          title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
+                          title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"))
     if kind == "text":
         cls = PlainTextItem if subitem.get("note_type") == "plaintext" else TextNoteItem
         kwargs = dict(
@@ -3372,13 +3639,25 @@ def deserialize_component(d):
         )
     elif t == "image":
         item = ImageItem(x, y, w, h, b64=d.get("data"), item_id=item_id,
-                          title=d.get("title", ""), description=d.get("description", ""))
+                          title=d.get("title", ""), description=d.get("description", ""),
+                          show_title=d.get("show_title", True),
+                          show_description=d.get("show_description", True),
+                          title_font=d.get("title_font"), desc_font=d.get("description_font"),
+                          title_color=d.get("title_color"), desc_color=d.get("description_color"))
     elif t == "gif":
         item = GifItem(x, y, w, h, b64=d.get("data"), item_id=item_id,
-                        title=d.get("title", ""), description=d.get("description", ""))
+                        title=d.get("title", ""), description=d.get("description", ""),
+                        show_title=d.get("show_title", True),
+                        show_description=d.get("show_description", True),
+                        title_font=d.get("title_font"), desc_font=d.get("description_font"),
+                        title_color=d.get("title_color"), desc_color=d.get("description_color"))
     elif t == "video":
         item = VideoItem(x, y, w, h, b64=d.get("data"), item_id=item_id,
-                          title=d.get("title", ""), description=d.get("description", ""))
+                          title=d.get("title", ""), description=d.get("description", ""),
+                          show_title=d.get("show_title", True),
+                          show_description=d.get("show_description", True),
+                          title_font=d.get("title_font"), desc_font=d.get("description_font"),
+                          title_color=d.get("title_color"), desc_color=d.get("description_color"))
     elif t == "drawing":
         item = DrawingItem(x, y, w, h, strokes=d.get("strokes", []), item_id=item_id)
     elif t == "arrow":
@@ -3763,8 +4042,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .board-card {{ background:#2b2b2b; border-radius:10px; border:1px solid #111; color:#eee; overflow:hidden; box-shadow:0 4px 10px rgba(0,0,0,.5); }}
   .board-title {{ background:#1e1e1e; padding:8px 12px; font-weight:600; }}
   .board-body {{ padding:8px; overflow:auto; height:calc(100% - 40px); }}
-  .sub-image img {{ width:100%; border-radius:4px; margin-bottom:18px; display:block; }}
-  .sub-video video {{ width:100%; border-radius:4px; margin-bottom:18px; }}
+  .sub-image, .sub-video {{ margin-bottom:18px; border-radius:4px; overflow:hidden; background:#111; }}
+  .sub-image img {{ width:100%; display:block; }}
+  .sub-video video {{ width:100%; display:block; }}
+  .sub-image .media-title, .sub-video .media-title {{ font-size:12px; padding:4px 8px; }}
+  .sub-image .media-desc, .sub-video .media-desc {{ font-size:11px; padding:4px 8px; }}
   .sub-text {{ margin-bottom:8px; font-size:13px; color:#ddd; }}
   .sub-checklist {{ list-style:none; padding:0; margin:0 0 8px 0; font-size:13px; color:#ddd; }}
   .sub-checklist li {{ margin-bottom:4px; }}
@@ -4173,10 +4455,14 @@ class MainWindow(QMainWindow):
         sel = [it for it in all_sel if isinstance(it, (DrawingItem, ArrowItem))]
         text_sel = [it for it in all_sel if isinstance(it, (TextNoteItem, PlainTextItem))]
         table_sel = [it for it in all_sel if isinstance(it, TableItem)]
+        # Image/GIF/Video components each carry a title + description
+        # text pair (see MediaCardMixin.font_targets) that should get the
+        # exact same Font/B/I/U/Size toolbar treatment as a Text Note.
+        media_sel = [it for it in all_sel if isinstance(it, MediaCardMixin)]
         # Anything with a font to edit via the toolbar's Font/B/I/U/Size
-        # controls - Text Note, plain Text, and now Table (whose cells
-        # each carry their own font - see TableItem.font_targets).
-        font_sel = text_sel + table_sel
+        # controls - Text Note, plain Text, Table (whose cells each carry
+        # their own font - see TableItem.font_targets), and media items.
+        font_sel = text_sel + table_sel + media_sel
         arrow_sel = [it for it in all_sel if isinstance(it, ArrowItem)]
         # Every other component type (Image/GIF/Video/BoardCard, ...) -
         # these only ever have a single "color" (border/fill), so the
@@ -4226,7 +4512,8 @@ class MainWindow(QMainWindow):
                 if isinstance(first, TableItem):
                     col = QColor(first.header_bg)
                 else:
-                    col = QColor(first.color) if first.color else QColor(first.DEFAULT_COLOR)
+                    default = getattr(first, "DEFAULT_COLOR", None) or "#ffffff"
+                    col = QColor(first.color) if first.color else QColor(default)
                 self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
             self.size_slider.blockSignals(True)
             self.size_slider.setValue(int(max(1, min(40, round(font.pointSizeF())))))
@@ -4525,13 +4812,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"Could not read file: {e}")
             return None
         if ext in GIF_EXTS:
-            item = GifItem(scene_pos.x() - 120, scene_pos.y() - 90, gif_bytes=data)
+            item = GifItem(scene_pos.x() - 120, scene_pos.y() - 90, gif_bytes=data,
+                            title="Title", description="description...")
         elif ext in VIDEO_EXTS:
-            item = VideoItem(scene_pos.x() - 160, scene_pos.y() - 110, video_bytes=data)
+            item = VideoItem(scene_pos.x() - 160, scene_pos.y() - 110, video_bytes=data,
+                              title="Title", description="description...")
         elif ext in IMAGE_EXTS:
             pm = QPixmap()
             pm.loadFromData(data)
-            item = ImageItem(scene_pos.x() - 120, scene_pos.y() - 90, pixmap=pm)
+            item = ImageItem(scene_pos.x() - 120, scene_pos.y() - 90, pixmap=pm,
+                              title="Title", description="description...")
         else:
             QMessageBox.information(self, "Unsupported file", f"Unsupported file type: {ext}")
             return None
@@ -4562,7 +4852,8 @@ class MainWindow(QMainWindow):
         img = cb.image()
         if img is not None and not img.isNull():
             pos = self._viewport_center_scene()
-            item = ImageItem(pos.x() - 120, pos.y() - 90, pixmap=QPixmap.fromImage(img))
+            item = ImageItem(pos.x() - 120, pos.y() - 90, pixmap=QPixmap.fromImage(img),
+                              title="Title", description="description...")
             self.scene.addItem(item)
 
     def duplicate_selection(self):
