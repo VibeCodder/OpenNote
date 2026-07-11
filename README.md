@@ -1,7 +1,7 @@
 # OpenNote
 
 A Milanote inspired app for creating mindmaps.  
-It has been written in Python and uses PySide6.  
+It has been written in Python using Claude AI.  
 
 ```
 To make app working in Windows please create shortcut to `py` file and adding `python` before filepath
