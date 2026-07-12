@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
     QToolBar, QFileDialog, QColorDialog, QMessageBox, QSlider, QComboBox,
     QPushButton, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QToolButton,
     QFontComboBox, QInputDialog, QCompleter,
-    QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QGridLayout,
+    QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QGridLayout, QLineEdit,
 )
 
 try:
@@ -90,6 +90,15 @@ def new_id():
     return uuid.uuid4().hex[:12]
 
 
+def sanitize_board_filename(name):
+    """Turn a user-typed board name into a safe file basename (without
+    extension) for a sibling board .html file in the project folder."""
+    name = (name or "").strip()
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name or "Board"
+
+
 def normalize_link_url(url):
     """A URL typed without a scheme (e.g. "google.com" or "www.x.com")
     is a relative link as far as a browser is concerned, so clicking it
@@ -127,6 +136,87 @@ def base64_to_pixmap(b64):
         except Exception:
             pass
     return pm
+
+
+# File extension -> MIME type for board-link thumbnails (raster images
+# plus SVG). Anything else is rejected by load_thumb_file() below.
+THUMB_EXTS = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+}
+
+
+def load_thumb_file(path):
+    """Read an image or SVG file picked by the user for a board-link
+    thumbnail/icon, returning (mime, base64_data) ready to be embedded
+    as a `data:` URI - both in the app's own rendering (see
+    thumb_to_pixmap) and in the exported HTML (BoardLinkItem.to_html),
+    exactly like every other embedded image in the app. Returns
+    (None, None) if the file's extension isn't a recognised image/SVG
+    type or it couldn't be read.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    mime = THUMB_EXTS.get(ext)
+    if not mime:
+        return None, None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return None, None
+    return mime, base64.b64encode(raw).decode("ascii")
+
+
+def thumb_to_pixmap(mime, b64_data, size=96):
+    """Decode a board-link thumbnail (see load_thumb_file) into a QPixmap
+    for on-canvas / dialog-preview rendering. Raster formats decode
+    directly through QPixmap; SVG is rasterized through QSvgRenderer
+    (falling back to QPixmap's own loader, which also understands SVG
+    when Qt's svg imageformat plugin is installed) so an .svg thumbnail
+    still shows up even without the QtSvg Python module available.
+    """
+    if not b64_data:
+        return None
+    try:
+        raw = base64.b64decode(b64_data)
+    except Exception:
+        return None
+    if mime == "image/svg+xml":
+        try:
+            from PySide6.QtSvg import QSvgRenderer
+            renderer = QSvgRenderer(QByteArray(raw))
+            if renderer.isValid():
+                default_size = renderer.defaultSize()
+                if default_size.width() > 0 and default_size.height() > 0:
+                    scale = min(size / default_size.width(), size / default_size.height())
+                    tw = max(1, int(default_size.width() * scale))
+                    th = max(1, int(default_size.height() * scale))
+                else:
+                    tw = th = size
+                pm = QPixmap(size, size)
+                pm.fill(Qt.transparent)
+                painter = QPainter(pm)
+                target = QRectF((size - tw) / 2.0, (size - th) / 2.0, tw, th)
+                renderer.render(painter, target)
+                painter.end()
+                return pm
+        except Exception:
+            pass
+        # Fallback: Qt's own image-format plugin can rasterize SVG too,
+        # when it's installed alongside QtSvg.
+        pm = QPixmap()
+        if pm.loadFromData(raw) and not pm.isNull():
+            return pm
+        return None
+    pm = QPixmap()
+    if pm.loadFromData(raw) and not pm.isNull():
+        return pm
+    return None
 
 
 def color_to_css(color_str):
@@ -186,6 +276,14 @@ def _make_toolbar_icon(kind, size=20, color="#e8e8e8"):
         p.drawLine(QPointF(m, m + 5.5), QPointF(size - m, m + 5.5))
         p.drawLine(QPointF(m + 3, m + 10), QPointF(size - m - 3, m + 10))
         p.drawLine(QPointF(m + 3, m + 14), QPointF(size - m - 7, m + 14))
+    elif kind == "board_link":
+        p.drawRoundedRect(QRectF(m, m, size - 2 * m, size - 2 * m), 2, 2)
+        p.drawLine(QPointF(m + 3, m + 5.5), QPointF(size - m - 3, m + 5.5))
+        cx0, cy0 = size * 0.36, size * 0.66
+        cx1, cy1 = size * 0.72, size * 0.66
+        p.drawLine(QPointF(cx0, cy0), QPointF(cx1, cy1))
+        p.drawLine(QPointF(cx1, cy1), QPointF(cx1 - 4, cy1 - 4))
+        p.drawLine(QPointF(cx1, cy1), QPointF(cx1 - 4, cy1 + 1))
     elif kind == "table":
         p.drawRoundedRect(QRectF(m, m, size - 2 * m, size - 2 * m), 2, 2)
         header_y = m + (size - 2 * m) * 0.32
@@ -3643,6 +3741,522 @@ class BoardCardItem(BaseComponentItem):
 
 
 # --------------------------------------------------------------------------
+# Board link (shortcut to another board .html file, for nested boards)
+# --------------------------------------------------------------------------
+
+class BoardLinkCreateDialog(QDialog):
+    """Dialog shown by MainWindow.add_board_link() when creating a new
+    board-shortcut card: asks for the board's name and, optionally, lets
+    the user pick a thumbnail/icon image (or an .svg file) for it right
+    away - the same thumbnail can also be set or changed later from the
+    card's own right-click menu, see BoardLinkItem._pick_thumbnail()."""
+
+    def __init__(self, parent=None, initial_name=""):
+        super().__init__(parent)
+        self.setWindowTitle("New board link")
+        self.thumb_mime = None
+        self.thumb_data = None
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit(initial_name)
+        self.name_edit.setPlaceholderText("Board name")
+        form.addRow("Board name:", self.name_edit)
+        layout.addLayout(form)
+
+        thumb_row = QHBoxLayout()
+        self.thumb_preview = QLabel("No\nthumbnail")
+        self.thumb_preview.setFixedSize(64, 64)
+        self.thumb_preview.setAlignment(Qt.AlignCenter)
+        self.thumb_preview.setStyleSheet(
+            "background:#1b1b1b; border:1px solid #444; border-radius:6px; color:#777; font-size:10px;"
+        )
+        thumb_row.addWidget(self.thumb_preview)
+
+        btn_col = QVBoxLayout()
+        choose_btn = QPushButton("Choose Image/SVG\u2026")
+        choose_btn.clicked.connect(self._choose_thumbnail)
+        btn_col.addWidget(choose_btn)
+        self.clear_btn = QPushButton("Remove Thumbnail")
+        self.clear_btn.clicked.connect(self._clear_thumbnail)
+        self.clear_btn.setEnabled(False)
+        btn_col.addWidget(self.clear_btn)
+        thumb_row.addLayout(btn_col)
+        thumb_row.addStretch(1)
+        layout.addLayout(thumb_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.name_edit.setFocus()
+
+    def _choose_thumbnail(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose thumbnail image",
+            "", "Images and SVG (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.svg)",
+        )
+        if not path:
+            return
+        mime, data = load_thumb_file(path)
+        if not mime:
+            QMessageBox.warning(
+                self, "Unsupported file",
+                "Please choose an image (PNG/JPG/BMP/WEBP/GIF) or an SVG file.",
+            )
+            return
+        self.thumb_mime, self.thumb_data = mime, data
+        pm = thumb_to_pixmap(mime, data, size=64)
+        if pm is not None and not pm.isNull():
+            self.thumb_preview.setPixmap(pm)
+        else:
+            self.thumb_preview.setText("Preview\nunavailable")
+        self.clear_btn.setEnabled(True)
+
+    def _clear_thumbnail(self):
+        self.thumb_mime = None
+        self.thumb_data = None
+        self.thumb_preview.setPixmap(QPixmap())
+        self.thumb_preview.setText("No\nthumbnail")
+        self.clear_btn.setEnabled(False)
+
+    def _on_accept(self):
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Name required", "Please enter a board name.")
+            return
+        self.accept()
+
+    def board_name(self):
+        return self.name_edit.text().strip()
+
+
+class BoardLinkItem(BaseComponentItem):
+    """A card that is a *shortcut* to another board .html file living in
+    the same project folder (as opposed to BoardCardItem, which nests
+    content directly inside the current board). Double-clicking it - or
+    picking "Open Board" from its right-click menu - navigates the whole
+    app window to that file, the same way clicking a board card in
+    Milanote drills into it. The referenced file is tracked purely by
+    its (relative) filename, since every board of a project lives flat
+    in the project's folder - see MainWindow.add_board_link().
+    """
+    TYPE_NAME = "board_link"
+    DEFAULT_COLOR = "#233047"
+
+    def __init__(self, x=0, y=0, w=220, h=120, title="Board", target_file="", item_id=None,
+                 thumb_mime=None, thumb_data=None):
+        super().__init__(x, y, w, h, item_id)
+        self.title = title or "Board"
+        self.target_file = target_file or ""
+        # Optional custom icon/thumbnail for this shortcut card - an
+        # uploaded image or SVG file, stored (and exported) as a base64
+        # `data:` URI exactly like any other embedded image. Set/changed
+        # via the "Set Thumbnail..." context-menu entry, or up front in
+        # the "New board link" dialog - see _pick_thumbnail() and
+        # MainWindow.add_board_link().
+        self.thumb_mime = thumb_mime or None
+        self.thumb_data = thumb_data or None
+        self._thumb_pixmap = None
+        self._thumb_pixmap_dirty = True
+        self.min_w, self.min_h = 140, 90
+        # Filled in lazily by _refresh_count() the first time this item is
+        # painted (and again after a rename/creation), so the card can show
+        # a Milanote-style "N cards" subtitle without re-reading the target
+        # file on every single repaint.
+        self._cached_count = None
+        self._count_stale = True
+
+    # -- helpers ----------------------------------------------------------
+    def _main_window(self):
+        scene = self.scene()
+        if scene is None:
+            return None
+        views = scene.views()
+        return views[0].window() if views else None
+
+    def _project_dir(self):
+        mw = self._main_window()
+        if mw is not None and getattr(mw, "current_file", None):
+            return os.path.dirname(mw.current_file)
+        return None
+
+    def _target_path(self):
+        proj = self._project_dir()
+        if not proj or not self.target_file:
+            return None
+        return os.path.join(proj, self.target_file)
+
+    def mark_count_stale(self):
+        self._count_stale = True
+        self.update()
+
+    # -- thumbnail/icon ---------------------------------------------------
+    def set_thumbnail(self, mime, data):
+        """Set (mime, data) to a base64 `data:` payload to give this card
+        a custom icon/thumbnail, or (None, None) to remove it and fall
+        back to the plain shortcut glyph."""
+        self.thumb_mime = mime or None
+        self.thumb_data = data or None
+        self._thumb_pixmap_dirty = True
+        self.update()
+
+    def _get_thumb_pixmap(self):
+        if self._thumb_pixmap_dirty:
+            self._thumb_pixmap_dirty = False
+            self._thumb_pixmap = (
+                thumb_to_pixmap(self.thumb_mime, self.thumb_data, size=160)
+                if self.thumb_data else None
+            )
+        return self._thumb_pixmap
+
+    def _refresh_count(self):
+        if not self._count_stale:
+            return
+        self._count_stale = False
+        path = self._target_path()
+        if not path or not os.path.exists(path):
+            self._cached_count = None
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = extract_scene_data(f.read())
+            self._cached_count = len(data.get("items", [])) if data else 0
+        except Exception:
+            self._cached_count = None
+
+    # -- painting -----------------------------------------------------
+    def paint(self, painter, option, widget=None):
+        self._refresh_count()
+        rect = self.rect()
+        painter.setRenderHint(QPainter.Antialiasing)
+        bg = QColor(self.color or self.DEFAULT_COLOR)
+        painter.setBrush(bg)
+        painter.setPen(QPen(QColor("#4c8bf5"), 2) if self.isSelected() else QPen(QColor("#111111"), 1))
+        painter.drawRoundedRect(rect, 10, 10)
+
+        missing = self.target_file and self._project_dir() and not os.path.exists(self._target_path() or "")
+        thumb = self._get_thumb_pixmap()
+
+        if thumb is not None and not thumb.isNull():
+            # Custom thumbnail: bleed it across the top of the card (clipped
+            # to the card's own rounded outline) and push the title/subtitle
+            # into the band below it.
+            img_h = max(40.0, rect.height() * 0.58)
+            img_rect = QRectF(0, 0, rect.width(), img_h)
+            painter.save()
+            clip_path = QPainterPath()
+            clip_path.addRoundedRect(rect, 10, 10)
+            painter.setClipPath(clip_path)
+            painter.setClipRect(img_rect, Qt.IntersectClip)
+            scaled = thumb.scaled(img_rect.size().toSize(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            sx = img_rect.center().x() - scaled.width() / 2.0
+            sy = img_rect.center().y() - scaled.height() / 2.0
+            painter.drawPixmap(QPointF(sx, sy), scaled)
+            painter.restore()
+
+            # small "shortcut" glyph badge, overlaid on the thumbnail
+            badge_rect = QRectF(rect.width() - 30, img_h - 22, 20, 20)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#5b9dd9") if not missing else QColor("#c0554a"))
+            painter.drawRoundedRect(badge_rect, 4, 4)
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            painter.drawLine(badge_rect.bottomLeft() + QPointF(3, -3), badge_rect.topRight() + QPointF(-3, 3))
+            painter.drawLine(badge_rect.topRight() + QPointF(-3, 3), badge_rect.topRight() + QPointF(-9, 3))
+            painter.drawLine(badge_rect.topRight() + QPointF(-3, 3), badge_rect.topRight() + QPointF(-3, 9))
+
+            painter.setPen(QColor("#ffffff"))
+            painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
+            title_rect = QRectF(12, img_h + 6, rect.width() - 24, rect.height() - img_h - 28)
+            painter.drawText(title_rect, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, self.title)
+
+            sub_rect = QRectF(12, rect.height() - 20, rect.width() - 24, 16)
+        else:
+            # small "shortcut" glyph in the top-left corner (plain layout,
+            # used whenever no custom thumbnail has been set)
+            icon_rect = QRectF(12, 12, 20, 20)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#5b9dd9") if not missing else QColor("#c0554a"))
+            painter.drawRoundedRect(icon_rect, 4, 4)
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            painter.drawLine(icon_rect.bottomLeft() + QPointF(3, -3), icon_rect.topRight() + QPointF(-3, 3))
+            painter.drawLine(icon_rect.topRight() + QPointF(-3, 3), icon_rect.topRight() + QPointF(-9, 3))
+            painter.drawLine(icon_rect.topRight() + QPointF(-3, 3), icon_rect.topRight() + QPointF(-3, 9))
+
+            painter.setPen(QColor("#ffffff"))
+            painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
+            title_rect = QRectF(12, 38, rect.width() - 24, rect.height() - 60)
+            painter.drawText(title_rect, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, self.title)
+
+            sub_rect = QRectF(12, rect.height() - 24, rect.width() - 24, 18)
+
+        painter.setFont(QFont("Segoe UI", 8))
+        if missing:
+            painter.setPen(QColor("#e08a80"))
+            painter.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter, "Board file missing")
+        else:
+            painter.setPen(QColor("#9aa4b2"))
+            count = self._cached_count
+            label = f"{count} card{'s' if count != 1 else ''}" if count is not None else "Open board \u2192"
+            painter.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
+
+        self.paint_handle(painter)
+
+    # -- navigation -----------------------------------------------------
+    def mouseDoubleClickEvent(self, event):
+        self.open_board()
+        event.accept()
+
+    def open_board(self):
+        mw = self._main_window()
+        path = self._target_path()
+        if mw is None:
+            return
+        if not self.target_file:
+            return
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(
+                mw, "Board missing",
+                f"The board file \u201c{self.target_file}\u201d could not be found in the project folder."
+            )
+            return
+        mw.navigate_to_file(path)
+
+    # -- context menu -----------------------------------------------------
+    def _build_context_menu(self, menu):
+        self._open_action = menu.addAction("Open Board")
+        menu.addSeparator()
+        self._rename_action = menu.addAction("Rename Board (File && References)\u2026")
+        self._set_thumb_action = menu.addAction(
+            "Change Thumbnail\u2026" if self.thumb_data else "Set Thumbnail\u2026"
+        )
+        self._clear_thumb_action = menu.addAction("Remove Thumbnail") if self.thumb_data else None
+        menu.addSeparator()
+        self._remove_ref_action = menu.addAction("Remove Reference (keep board file)")
+        self._remove_ref_and_file_action = menu.addAction("Remove Reference && Delete Board File\u2026")
+        menu.addSeparator()
+
+    def _handle_context_action(self, action):
+        if action == self._open_action:
+            self.open_board()
+        elif action == self._rename_action:
+            self._rename_referenced_board()
+        elif action == self._set_thumb_action:
+            self._pick_thumbnail()
+        elif self._clear_thumb_action is not None and action == self._clear_thumb_action:
+            self.set_thumbnail(None, None)
+            mw = self._main_window()
+            if mw is not None and mw.current_file:
+                mw._write_html(mw.current_file)
+        elif action == self._remove_ref_action:
+            self._remove_reference(delete_file=False)
+        elif action == self._remove_ref_and_file_action:
+            self._remove_reference(delete_file=True)
+
+    # -- thumbnail picking --------------------------------------------------
+    def _pick_thumbnail(self):
+        mw = self._main_window()
+        path, _ = QFileDialog.getOpenFileName(
+            mw, "Choose thumbnail image",
+            "", "Images and SVG (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.svg)",
+        )
+        if not path:
+            return
+        mime, data = load_thumb_file(path)
+        if not mime:
+            QMessageBox.warning(
+                mw, "Unsupported file",
+                "Please choose an image (PNG/JPG/BMP/WEBP/GIF) or an SVG file.",
+            )
+            return
+        self.set_thumbnail(mime, data)
+        if mw is not None and mw.current_file:
+            mw._write_html(mw.current_file)
+
+    # -- rename / refactor --------------------------------------------------
+    def _rename_referenced_board(self):
+        """Rename the board this shortcut points at: renames the actual
+        .html file on disk *and* rewrites every other reference to it -
+        board_link cards and breadcrumb entries - found across every
+        sibling .html file in the project folder, so nothing is left
+        pointing at the old filename."""
+        mw = self._main_window()
+        if mw is None:
+            return
+        proj = self._project_dir()
+        if not proj or not self.target_file:
+            QMessageBox.information(
+                mw, "Cannot rename", "This reference has no linked board file yet."
+            )
+            return
+        old_path = self._target_path()
+        if not old_path or not os.path.exists(old_path):
+            QMessageBox.warning(
+                mw, "Cannot rename", "The linked board file could not be found on disk."
+            )
+            return
+
+        old_target_file = self.target_file
+        old_name_no_ext = os.path.splitext(old_target_file)[0]
+        new_name, ok = QInputDialog.getText(
+            mw, "Rename board", "New board name:", text=old_name_no_ext
+        )
+        if not ok or not new_name.strip():
+            return
+        safe_new_name = sanitize_board_filename(new_name)
+        new_target_file = safe_new_name + ".html"
+        if new_target_file == old_target_file:
+            return
+        new_path = os.path.join(proj, new_target_file)
+        if os.path.exists(new_path):
+            QMessageBox.warning(
+                mw, "Rename failed",
+                f"A file named \u201c{new_target_file}\u201d already exists in the project folder.",
+            )
+            return
+
+        # 1. Rename the actual board file on disk.
+        try:
+            os.rename(old_path, new_path)
+        except Exception as e:
+            QMessageBox.critical(mw, "Rename failed", str(e))
+            return
+
+        # 2. Fix up the renamed file's own breadcrumb (its last segment is
+        #    itself), then walk every *other* sibling .html file in the
+        #    project folder and update any board_link item or breadcrumb
+        #    segment that still points at the old filename/name.
+        def _retarget(data):
+            changed = False
+            for it in data.get("items", []):
+                if it.get("type") == "board_link" and it.get("target_file") == old_target_file:
+                    it["target_file"] = new_target_file
+                    if it.get("title") == old_name_no_ext:
+                        it["title"] = safe_new_name
+                    changed = True
+            for seg in (data.get("breadcrumb") or []):
+                if seg.get("file") == old_target_file:
+                    seg["file"] = new_target_file
+                    if seg.get("name") == old_name_no_ext:
+                        seg["name"] = safe_new_name
+                    changed = True
+            return changed
+
+        try:
+            with open(new_path, "r", encoding="utf-8") as f:
+                data = extract_scene_data(f.read()) or {"items": []}
+            breadcrumb = data.get("breadcrumb") or []
+            if breadcrumb:
+                breadcrumb[-1] = {"name": safe_new_name, "file": new_target_file}
+            data["breadcrumb"] = breadcrumb
+            with open(new_path, "w", encoding="utf-8") as f:
+                f.write(build_html_document(data))
+        except Exception:
+            pass
+
+        updated = 0
+        for fname in os.listdir(proj):
+            if not fname.lower().endswith(".html"):
+                continue
+            fpath = os.path.join(proj, fname)
+            if os.path.normpath(fpath) == os.path.normpath(new_path):
+                continue
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    data = extract_scene_data(f.read())
+            except Exception:
+                continue
+            if data is None:
+                continue
+            if _retarget(data):
+                try:
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        f.write(build_html_document(data))
+                    updated += 1
+                except Exception:
+                    pass
+
+        # 3. Update this card, and - if this board is the one currently on
+        #    screen - every other in-memory BoardLinkItem/breadcrumb entry
+        #    pointing at the old name, so the rename shows up immediately
+        #    without needing a reload, then persist that board too.
+        self.target_file = new_target_file
+        self.title = safe_new_name
+        self._count_stale = True
+        self.update()
+
+        if mw.scene is self.scene():
+            for it in mw.scene.items():
+                if isinstance(it, BoardLinkItem) and it is not self and it.target_file == old_target_file:
+                    it.target_file = new_target_file
+                    if it.title == old_name_no_ext:
+                        it.title = safe_new_name
+                    it.mark_count_stale()
+            for i, seg in enumerate(mw.breadcrumb):
+                if seg.get("file") == old_target_file:
+                    mw.breadcrumb[i] = {"name": safe_new_name, "file": new_target_file}
+            mw._update_breadcrumb_bar()
+            if mw.current_file:
+                mw._write_html(mw.current_file)
+
+        mw.statusBar().showMessage(
+            f"Renamed board to \u201c{new_target_file}\u201d ({updated} other file(s) updated)", 5000
+        )
+
+    def _remove_reference(self, delete_file):
+        mw = self._main_window()
+        if delete_file:
+            path = self._target_path()
+            msg = (
+                f"Delete the board \u201c{self.title}\u201d ({self.target_file}) from disk?\n\n"
+                "This removes this shortcut AND permanently deletes the board file "
+                "itself. Any other shortcuts elsewhere that point to the same file "
+                "will stop working."
+            )
+            if QMessageBox.question(
+                mw, "Delete board file", msg,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    QMessageBox.critical(mw, "Delete failed", str(e))
+                    return
+        if self.scene():
+            self.scene().removeItem(self)
+
+    # -- serialization --------------------------------------------------
+    def serialize(self):
+        d = super().serialize()
+        d["title"] = self.title
+        d["target_file"] = self.target_file
+        if self.thumb_data:
+            d["thumb_mime"] = self.thumb_mime
+            d["thumb_data"] = self.thumb_data
+        return d
+
+    def to_html(self):
+        title = self.title.replace("&", "&amp;").replace("<", "&lt;")
+        href = (self.target_file or "#").replace('"', "&quot;")
+        thumb_html = ""
+        if self.thumb_data:
+            # Embedded exactly like any other image in the app - a plain
+            # base64 `data:` URI, self-contained inside the exported HTML.
+            thumb_html = f'<img class="board-link-thumb" src="data:{self.thumb_mime};base64,{self.thumb_data}"/>'
+        return (
+            f'<a class="comp board-link-card" href="{href}" '
+            f'style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
+            f'width:{self._w}px;height:{self._h}px;">'
+            f'{thumb_html}'
+            f'<div class="board-link-title">{title}</div>'
+            f'<div class="board-link-sub">Open board \u2192</div></a>'
+        )
+
+
+# --------------------------------------------------------------------------
 # Component <-> subitem conversion, and deserialization factory
 # --------------------------------------------------------------------------
 
@@ -3849,6 +4463,11 @@ def deserialize_component(d):
         )
     elif t == "board":
         item = BoardCardItem(x, y, w, h, title=d.get("title", "Board"), subitems=d.get("subitems", []), item_id=item_id)
+    elif t == "board_link":
+        item = BoardLinkItem(
+            x, y, w, h, title=d.get("title", "Board"), target_file=d.get("target_file", ""),
+            item_id=item_id, thumb_mime=d.get("thumb_mime"), thumb_data=d.get("thumb_data"),
+        )
     elif t == "table":
         item = TableItem(
             x, y, w, h, rows=d.get("rows", 3), cols=d.get("cols", 3), item_id=item_id,
@@ -4202,6 +4821,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <style>
   html,body {{ margin:0; padding:0; background:#141414; overflow:hidden; font-family:'Segoe UI',Arial,sans-serif; height:100%; }}
   #viewport {{ width:100%; height:100vh; overflow:hidden; position:relative; cursor:grab; }}
+  body.has-breadcrumb #viewport {{ height:calc(100vh - 37px); margin-top:37px; }}
   #canvas {{ position:absolute; top:0; left:0; transform-origin:0 0; }}
   .comp {{ position:absolute; box-sizing:border-box; }}
   .text-note {{ border-radius:8px; padding:10px; color:#222; box-shadow:0 2px 6px rgba(0,0,0,.4); white-space:pre-wrap; overflow:auto; }}
@@ -4224,10 +4844,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .sub-text {{ margin-bottom:8px; font-size:13px; color:#ddd; }}
   .sub-checklist {{ list-style:none; padding:0; margin:0 0 8px 0; font-size:13px; color:#ddd; }}
   .sub-checklist li {{ margin-bottom:4px; }}
+  .board-link-card {{ display:flex; flex-direction:column; justify-content:flex-end; background:#233047; border:1px solid #111; border-radius:10px; color:#eee; padding:12px; box-shadow:0 4px 10px rgba(0,0,0,.5); text-decoration:none; box-sizing:border-box; overflow:hidden; }}
+  .board-link-thumb {{ display:block; flex:0 0 auto; width:calc(100% + 24px); height:55%; object-fit:cover; margin:-12px -12px 8px -12px; }}
+  .board-link-title {{ font-weight:700; font-size:15px; color:#fff; }}
+  .board-link-sub {{ font-size:11px; color:#9aa4b2; margin-top:4px; }}
+  #breadcrumb {{ position:fixed; top:0; left:0; right:0; z-index:20; background:#1b1b1b; border-bottom:1px solid #000; padding:8px 14px; font-size:13px; color:#aaa; }}
+  #breadcrumb a {{ color:#8ab4ff; text-decoration:none; }}
+  #breadcrumb a:hover {{ text-decoration:underline; }}
+  #breadcrumb .crumb-sep {{ margin:0 6px; color:#555; }}
+  #breadcrumb .crumb-current {{ color:#eee; font-weight:600; }}
   #hint {{ position:fixed; bottom:10px; left:10px; color:#888; font-size:12px; z-index:10; }}
 </style>
 </head>
 <body>
+{breadcrumb_html}
 <div id="viewport">
   <div id="canvas">
     {components}
@@ -4336,10 +4966,32 @@ def build_html_document(data):
     json_data = json.dumps(data).replace("</script>", "<\\/script>")
     bounds_json = json.dumps(bounds)
     view_json = json.dumps(data.get("view"))
-    return HTML_TEMPLATE.format(
+    breadcrumb = data.get("breadcrumb") or []
+    if breadcrumb:
+        parts = []
+        for i, seg in enumerate(breadcrumb):
+            name = (seg.get("name") or "").replace("&", "&amp;").replace("<", "&lt;")
+            is_last = i == len(breadcrumb) - 1
+            if i > 0:
+                parts.append('<span class="crumb-sep">&rsaquo;</span>')
+            if is_last or not seg.get("file"):
+                cls = "crumb-current" if is_last else ""
+                parts.append(f'<span class="{cls}">{name}</span>')
+            else:
+                href = seg["file"].replace('"', "&quot;")
+                parts.append(f'<a href="{href}">{name}</a>')
+        breadcrumb_html = f'<div id="breadcrumb">{"".join(parts)}</div>'
+        body_class = ' class="has-breadcrumb"'
+    else:
+        breadcrumb_html = ""
+        body_class = ""
+    html = HTML_TEMPLATE.format(
         components="\n".join(comps_html), json_data=json_data, bounds_json=bounds_json,
-        view_json=view_json,
+        view_json=view_json, breadcrumb_html=breadcrumb_html,
     )
+    if body_class:
+        html = html.replace("<body>", f"<body{body_class}>", 1)
+    return html
 
 
 def extract_scene_data(html):
@@ -4386,9 +5038,42 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
         self.scene = MindMapScene(self)
         self.view = MindMapView(self.scene, self, self)
-        self.setCentralWidget(self.view)
+
+        # -- breadcrumb bar (nested-boards navigation) -----------------
+        # Shows the current board's full logical path, e.g.
+        # "Game > Weapons > Firearms", mirroring the path embedded in the
+        # board's own HTML (see save/open below). Every segment but the
+        # last is a clickable button that jumps straight to that ancestor
+        # board file - the other way to navigate besides double-clicking
+        # a BoardLinkItem shortcut card on the canvas itself.
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        self.breadcrumb_bar = QWidget()
+        self.breadcrumb_bar.setStyleSheet("background:#1b1b1b; border-bottom:1px solid #000;")
+        self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_bar)
+        self.breadcrumb_layout.setContentsMargins(10, 4, 10, 4)
+        self.breadcrumb_layout.setSpacing(2)
+        self.breadcrumb_layout.addStretch(1)
+        central_layout.addWidget(self.breadcrumb_bar)
+        central_layout.addWidget(self.view)
+        self.setCentralWidget(central)
+
         self.clipboard_data = []
         self.current_file = None
+        # The folder holding the current project's board .html files (every
+        # board in a project lives flat inside one shared folder - see
+        # BoardLinkItem and _ensure_project_and_file). Kept in sync with
+        # os.path.dirname(self.current_file) whenever a board is
+        # saved/opened, but tracked separately so it survives being asked
+        # for explicitly (see choose_or_create_project_folder/new_project)
+        # even before the very first save.
+        self.project_dir = None
+        # Full logical path (list of {"name","file"} dicts, self inclusive)
+        # of whatever board is currently open - see _update_breadcrumb_bar,
+        # navigate_to_file, and _write_html.
+        self.breadcrumb = [{"name": "Untitled", "file": None}]
         self._editing_selection = None  # drawing/arrow items currently selected for restyling
         self._text_selection = None     # text-note/plain-text items currently selected for restyling
         self._font_selection = None     # text-note/plain-text/table items, for Font/B/I/U/Size
@@ -4421,12 +5106,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Ready \u2014 Middle-mouse drag to pan \u00b7 Ctrl+Wheel to zoom \u00b7 Ctrl+D duplicate \u00b7 Drag a card onto a Board to nest it"
         )
+        self._update_breadcrumb_bar()
 
     # -- UI construction --------------------------------------------------
     def _build_menu(self):
         m = self.menuBar()
         file_menu = m.addMenu("&File")
         file_menu.addAction("New Board", self.new_board, QKeySequence.New)
+        file_menu.addAction("New Project (Choose Folder)...", self.new_project)
         file_menu.addAction("Open...", self.open_board, QKeySequence.Open)
         file_menu.addAction("Save", self.save_board, QKeySequence.Save)
         file_menu.addAction("Save As...", self.save_board_as, QKeySequence.SaveAs)
@@ -4469,6 +5156,7 @@ class MainWindow(QMainWindow):
         add_action("Text Note", self.add_text_note, icon_kind="text")
         add_action("Text", self.add_text, icon_kind="plaintext")
         add_action("Board Card", self.add_board_card, icon_kind="board")
+        add_action("Board Link", self.add_board_link, icon_kind="board_link")
         add_action("Table", self.add_table, icon_kind="table")
         tb.addSeparator()
         add_action("Add Image", self.add_image, icon_kind="image")
@@ -5051,6 +5739,72 @@ class MainWindow(QMainWindow):
         item = BoardCardItem(pos.x() - 140, pos.y() - 160)
         self.scene.addItem(item)
 
+    def add_board_link(self):
+        """Create a shortcut card on the current board pointing at another
+        board .html file in the same project folder (creating that file
+        if it doesn't exist yet, or wiring up to it if it does) - see
+        BoardLinkItem for the resulting card and its right-click menu."""
+        if not self._ensure_project_and_file():
+            return
+
+        dlg = BoardLinkCreateDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        safe_name = sanitize_board_filename(dlg.board_name())
+        target_file = safe_name + ".html"
+        project_dir = os.path.dirname(self.current_file)
+        target_path = os.path.join(project_dir, target_file)
+        new_breadcrumb = self.breadcrumb + [{"name": safe_name, "file": target_file}]
+
+        if os.path.exists(target_path):
+            box = QMessageBox(self)
+            box.setWindowTitle("Board already exists")
+            box.setText(
+                f"A board file named \u201c{target_file}\u201d already exists in this "
+                "project folder.\n\nOverwrite it with a brand-new empty board, or "
+                "use the existing board as the target of this shortcut?"
+            )
+            overwrite_btn = box.addButton("Overwrite", QMessageBox.DestructiveRole)
+            use_existing_btn = box.addButton("Use Existing", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == overwrite_btn:
+                self._write_board_file(target_path, {"items": []}, new_breadcrumb)
+            elif clicked == use_existing_btn:
+                try:
+                    with open(target_path, "r", encoding="utf-8") as f:
+                        existing_data = extract_scene_data(f.read()) or {"items": []}
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Could not read existing board: {e}")
+                    return
+                # Re-parent the existing board under this board's path -
+                # "its path inside will be updated", per spec.
+                self._write_board_file(target_path, existing_data, new_breadcrumb)
+            else:
+                return
+        else:
+            self._write_board_file(target_path, {"items": []}, new_breadcrumb)
+
+        pos = self._viewport_center_scene()
+        item = BoardLinkItem(
+            pos.x() - 110, pos.y() - 60, title=safe_name, target_file=target_file,
+            thumb_mime=dlg.thumb_mime, thumb_data=dlg.thumb_data,
+        )
+        self.scene.addItem(item)
+        self.statusBar().showMessage(f"Linked board: {target_file}", 4000)
+
+    def _write_board_file(self, path, data, breadcrumb):
+        """Write a board's JSON `data` out to `path` as a standalone HTML
+        file, stamping it with `breadcrumb` (its own full nested-boards
+        path) - used both for the currently-open board (_write_html) and
+        for sibling board files created/re-parented by add_board_link."""
+        data = dict(data)
+        data["breadcrumb"] = breadcrumb
+        html = build_html_document(data)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+
     def add_table(self):
         pos = self._viewport_center_scene()
         item = TableItem(pos.x() - 180, pos.y() - 100)
@@ -5167,7 +5921,97 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "New board", "Clear the current board?") == QMessageBox.Yes:
             self.scene.clear_board()
             self.current_file = None
+            self.breadcrumb = [{"name": "Untitled", "file": None}]
+            self._update_breadcrumb_bar()
             self.setWindowTitle("OpenNote \u2014 Milanote-style Mind Map")
+
+    def new_project(self):
+        """Start a brand-new project: clear the board, then immediately
+        ask for a project folder (existing or newly created) and a name
+        for this first board file inside it - see
+        choose_or_create_project_folder/_ensure_project_and_file, and
+        BoardLinkItem for how sibling boards later attach to that same
+        folder."""
+        if self.scene.items() and QMessageBox.question(
+            self, "New project", "Clear the current board and start a new project?"
+        ) != QMessageBox.Yes:
+            return
+        self.scene.clear_board()
+        self.current_file = None
+        self.project_dir = None
+        self.breadcrumb = [{"name": "Untitled", "file": None}]
+        self._update_breadcrumb_bar()
+        self._ensure_project_and_file()
+
+    def choose_or_create_project_folder(self, title="Choose Project Folder"):
+        """Ask the user to pick an existing folder - or create a new one -
+        to hold a project's board .html files (every board of a project
+        lives flat inside one shared folder, see BoardLinkItem). Returns
+        the chosen absolute path, or None if the user cancelled. The
+        native directory-picker dialog already has its own "Create New
+        Folder" control, so creating a not-yet-existing folder and
+        selecting it happens in the same step."""
+        dlg = QFileDialog(self, title)
+        dlg.setFileMode(QFileDialog.Directory)
+        dlg.setOption(QFileDialog.ShowDirsOnly, True)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        selected = dlg.selectedFiles()
+        folder = selected[0] if selected else None
+        if folder and not os.path.isdir(folder):
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except Exception as e:
+                QMessageBox.critical(self, "Could not create folder", str(e))
+                return None
+        return folder
+
+    def _ensure_project_and_file(self):
+        """Make sure the board currently on screen is saved somewhere
+        inside a project folder, prompting the user to choose or create
+        that folder - and then a file name inside it - if it isn't
+        already saved. Every other board .html file belonging to this
+        project (created via Board Link cards) will live flat alongside
+        this one, in that same folder. Returns True once self.current_file
+        points at a real saved file, False if the user cancelled at any
+        point."""
+        if self.current_file:
+            return True
+        QMessageBox.information(
+            self, "Choose a project folder",
+            "Boards are saved as .html files inside a single project "
+            "folder (board shortcuts link to sibling files there), so "
+            "pick or create that folder now to save this board."
+        )
+        folder = self.choose_or_create_project_folder("Choose or Create Project Folder")
+        if not folder:
+            return False
+        default_name = (self.breadcrumb[-1].get("name") if self.breadcrumb else None) or "Main"
+        name, ok = QInputDialog.getText(
+            self, "Board file name", "File name for this board:", text=default_name
+        )
+        if not ok or not name.strip():
+            return False
+        safe_name = sanitize_board_filename(name)
+        basename = safe_name + ".html"
+        path = os.path.join(folder, basename)
+        if os.path.exists(path) and QMessageBox.question(
+            self, "File exists",
+            f"\u201c{basename}\u201d already exists in this folder. Overwrite it?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return False
+
+        if self.breadcrumb:
+            self.breadcrumb[-1] = {"name": safe_name, "file": basename}
+        else:
+            self.breadcrumb = [{"name": safe_name, "file": basename}]
+        self.project_dir = folder
+        self._write_html(path)
+        self.current_file = path
+        self.setWindowTitle(f"OpenNote \u2014 {basename}")
+        self._update_breadcrumb_bar()
+        return True
 
     def save_board(self):
         if self.current_file:
@@ -5176,17 +6020,31 @@ class MainWindow(QMainWindow):
             self.save_board_as()
 
     def save_board_as(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save board as HTML", "board.html", "HTML files (*.html)")
+        start_dir = self.project_dir or (os.path.dirname(self.current_file) if self.current_file else "")
+        start_path = os.path.join(start_dir, "board.html") if start_dir else "board.html"
+        path, _ = QFileDialog.getSaveFileName(self, "Save board as HTML", start_path, "HTML files (*.html)")
         if path:
             if not path.lower().endswith(".html"):
                 path += ".html"
+            basename = os.path.basename(path)
+            # Keep this board's own breadcrumb segment (the last one) in
+            # sync with wherever it's actually being saved - matters most
+            # for the very first save, where it still says "Untitled".
+            name = os.path.splitext(basename)[0]
+            if self.breadcrumb:
+                self.breadcrumb[-1] = {"name": name, "file": basename}
+            else:
+                self.breadcrumb = [{"name": name, "file": basename}]
             self._write_html(path)
             self.current_file = path
-            self.setWindowTitle(f"OpenNote \u2014 {os.path.basename(path)}")
+            self.project_dir = os.path.dirname(path)
+            self.setWindowTitle(f"OpenNote \u2014 {basename}")
+            self._update_breadcrumb_bar()
 
     def _write_html(self, path):
         data = self.scene.serialize()
         data["view"] = self.view.current_view_state()
+        data["breadcrumb"] = self.breadcrumb
         html = build_html_document(data)
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -5199,20 +6057,80 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open board", "", "HTML files (*.html)")
         if not path:
             return
+        self._load_board_file(path, error_title="Open failed")
+
+    def navigate_to_file(self, path):
+        """Switch the whole window to display a different board .html
+        file - used by BoardLinkItem (double-click / "Open Board") and by
+        clicking an ancestor segment in the breadcrumb bar. Unsaved
+        changes on the current board are not auto-saved first (consistent
+        with the rest of the app - Ctrl+S / the Save action is what
+        persists changes), so the user is asked if there's anything to
+        lose."""
+        path = os.path.normpath(path)
+        if self.current_file and os.path.normpath(self.current_file) == path:
+            return
+        self._load_board_file(path, error_title="Navigation failed")
+
+    def _load_board_file(self, path, error_title="Open failed"):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 html = f.read()
             data = extract_scene_data(html)
             if data is None:
-                QMessageBox.warning(self, "Open failed", "No board data found in this HTML file.")
+                QMessageBox.warning(self, error_title, "No board data found in this HTML file.")
                 return
             self.scene.load(data)
             self.view.apply_view_state(data.get("view"))
             self.current_file = path
-            self.setWindowTitle(f"OpenNote \u2014 {os.path.basename(path)}")
+            self.project_dir = os.path.dirname(path)
+            basename = os.path.basename(path)
+            self.breadcrumb = data.get("breadcrumb") or [
+                {"name": os.path.splitext(basename)[0], "file": basename}
+            ]
+            self.setWindowTitle(f"OpenNote \u2014 {basename}")
             self.statusBar().showMessage(f"Opened: {path}", 4000)
+            self._update_breadcrumb_bar()
         except Exception as e:
-            QMessageBox.critical(self, "Open failed", str(e))
+            QMessageBox.critical(self, error_title, str(e))
+
+    # -- breadcrumb bar (nested-boards navigation) -----------------------
+    def _update_breadcrumb_bar(self):
+        layout = self.breadcrumb_layout
+        while layout.count() > 0:
+            child = layout.takeAt(0)
+            w = child.widget()
+            if w is not None:
+                w.deleteLater()
+
+        project_dir = os.path.dirname(self.current_file) if self.current_file else None
+        for i, seg in enumerate(self.breadcrumb):
+            if i > 0:
+                sep = QLabel(" \u203a ")
+                sep.setStyleSheet("color:#555;")
+                layout.addWidget(sep)
+            is_last = i == len(self.breadcrumb) - 1
+            name = seg.get("name") or "Untitled"
+            btn = QToolButton()
+            btn.setText(name)
+            btn.setAutoRaise(True)
+            btn.setFocusPolicy(Qt.NoFocus)
+            if is_last:
+                btn.setEnabled(False)
+                btn.setStyleSheet("QToolButton { color:#eee; font-weight:600; }")
+            else:
+                target_file = seg.get("file")
+                target_path = os.path.join(project_dir, target_file) if (project_dir and target_file) else None
+                enabled = bool(target_path and os.path.exists(target_path))
+                btn.setEnabled(enabled)
+                btn.setStyleSheet(
+                    "QToolButton { color:#8ab4ff; } QToolButton:hover { text-decoration:underline; }"
+                    if enabled else "QToolButton { color:#666; }"
+                )
+                if enabled:
+                    btn.clicked.connect(lambda checked=False, p=target_path: self.navigate_to_file(p))
+            layout.addWidget(btn)
+        layout.addStretch(1)
 
 
 # --------------------------------------------------------------------------
