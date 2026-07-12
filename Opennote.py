@@ -353,6 +353,9 @@ def _apply_text_font(item, family=None, bold=None, italic=None, underline=None, 
     if hasattr(item, "_on_title_desc_text_changed"):
         item._on_title_desc_text_changed()
         item.update()
+    if hasattr(item, "_on_label_text_changed"):
+        item._on_label_text_changed()
+        item.update()
     if isinstance(item, TextNoteItem):
         item._on_text_changed()
         item.update()
@@ -398,11 +401,51 @@ class EditableTextItem(QGraphicsTextItem):
     checklist items made via TextNoteItem's context menu get checked off
     without entering text-edit mode."""
 
+    # Set once by MainWindow to the toolbar's font-family combo, so every
+    # EditableTextItem (Text Note, plain Text, table cells, arrow labels,
+    # media titles/descriptions, ...) can recognize when it's only
+    # losing focus *to that combo* (see focusOutEvent below).
+    _font_combo = None
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFlag(QGraphicsItem.ItemIsFocusable, True)
 
+    def _losing_focus_to_font_combo(self):
+        """True while focus is moving to the toolbar's font-family combo
+        (its line edit, or its dropdown/completer popup), as opposed to
+        moving away to something else entirely (another item, the
+        canvas, a different window, ...).
+
+        While the combo's dropdown (or its type-to-search completer's
+        popup) is open, Qt reports it via activePopupWidget() regardless
+        of which of its internal sub-widgets technically holds focus, so
+        that check alone is what actually matters here - enumerating the
+        combo's own child widgets by identity is fragile (e.g. the
+        popup/container can be set up lazily and not compare equal to
+        what's read beforehand)."""
+        fc = EditableTextItem._font_combo
+        if fc is None:
+            return False
+        if QApplication.activePopupWidget() is not None:
+            return True
+        fw = QApplication.focusWidget()
+        if fw is None:
+            return False
+        return fw is fc or fw is fc.lineEdit()
+
     def focusOutEvent(self, event):
+        if self._losing_focus_to_font_combo():
+            # The font-family combo needs real keyboard focus to let the
+            # user type/search or use its dropdown list - momentarily
+            # taking focus away from whatever text is being edited. Don't
+            # actually drop out of edit mode for that: it just makes the
+            # cursor/selection blink out and back for no reason. The
+            # combo hands focus straight back (see MainWindow's
+            # _restore_text_edit_focus / font_combo.hidePopup) once it's
+            # done, so editing simply resumes as if nothing happened.
+            super().focusOutEvent(event)
+            return
         self.setTextInteractionFlags(Qt.NoTextInteraction)
         cursor = self.textCursor()
         cursor.clearSelection()
@@ -1818,9 +1861,11 @@ class ArrowItem(BaseComponentItem):
     LINE_STYLE_LABELS = {"solid": "Solid Line", "dashed": "Dashed Line", "dashdot": "Dash-Dot Line"}
     ENDPOINT_R = 7
     PAD = 14
+    LABEL_MAX_W = 220  # label wraps and stops growing wider past this
 
     def __init__(self, x=0, y=0, w=160, h=90, p1=None, p2=None, color=None,
-                 stroke_width=4, style="single", line_style="solid", item_id=None):
+                 stroke_width=4, style="single", line_style="solid", item_id=None,
+                 label="", show_label=False, label_font=None, label_color=None):
         super().__init__(x, y, max(1.0, w), max(1.0, h), item_id)
         self.color = color or self.DEFAULT_COLOR
         self.stroke_width = stroke_width
@@ -1830,6 +1875,28 @@ class ArrowItem(BaseComponentItem):
         self.p1 = QPointF(*p1) if p1 else QPointF(self.PAD, self._h - self.PAD)
         self.p2 = QPointF(*p2) if p2 else QPointF(self._w - self.PAD, self.PAD)
         self._drag_endpoint = None  # 1, 2, or None while dragging an end
+
+        # An optional pill-shaped label centered on the line's midpoint,
+        # toggled from the context menu (see _build_context_menu /
+        # _toggle_show_label). It gets the exact same Font/B/I/U/Size
+        # toolbar treatment as Text Note while its text is being edited
+        # (see ArrowItem.font_targets and MainWindow.on_selection_changed).
+        self.show_label = bool(show_label)
+        self.label_item = EditableTextItem(self)
+        self.label_item.setDefaultTextColor(QColor(label_color) if label_color else QColor("#000000"))
+        self.label_item.setFont(
+            _font_from_dict(label_font, base_family="Segoe UI", base_size=10.0, base_bold=True)
+            if label_font else QFont("Segoe UI", 10, QFont.Bold)
+        )
+        self.label_item.setPlainText(label)
+        self.label_item.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.label_item.document().setDocumentMargin(5)
+        self.label_item.setVisible(self.show_label)
+        self._label_w = 0.0
+        self._label_h = 0.0
+        self._autosizing_label = False
+        self.label_item.document().contentsChanged.connect(self._on_label_text_changed)
+        self._layout_label()
 
     @classmethod
     def from_scene_points(cls, p1_scene, p2_scene, color=None, stroke_width=4, style="single"):
@@ -1890,7 +1957,11 @@ class ArrowItem(BaseComponentItem):
         # the head size keeps the whole head inside the bounding rect no
         # matter the stroke width.
         m = max(4, self._head_margin() * 0.6)
-        return QRectF(-m, -m, self._w + 2 * m, self._h + 2 * m)
+        rect = QRectF(-m, -m, self._w + 2 * m, self._h + 2 * m)
+        label_rect = self._label_rect()
+        if label_rect is not None:
+            rect = rect.united(label_rect)
+        return rect
 
     def set_stroke_width(self, width):
         """Use this (rather than setting stroke_width directly) so the
@@ -1965,6 +2036,7 @@ class ArrowItem(BaseComponentItem):
         self._h = max(1.0, y1 - y0)
         self.p1 = QPointF(p1_scene.x() - x0, p1_scene.y() - y0)
         self.p2 = QPointF(p2_scene.x() - x0, p2_scene.y() - y0)
+        self._layout_label()
         self.update()
 
     def hoverMoveEvent(self, event):
@@ -1994,6 +2066,58 @@ class ArrowItem(BaseComponentItem):
         degrees off-axis, so the *on-axis* distance is size*cos(spread))."""
         size = max(8, self.stroke_width * 3)
         return size * math.cos(math.radians(28))
+
+    # -- label (optional text pill centered on the line) ----------------
+    def _recalc_label_size(self):
+        doc = self.label_item.document()
+        self.label_item.setTextWidth(-1)
+        natural_w = doc.idealWidth()
+        if natural_w > self.LABEL_MAX_W:
+            self.label_item.setTextWidth(self.LABEL_MAX_W)
+        br = self.label_item.boundingRect()
+        self._label_w = max(20.0, br.width())
+        self._label_h = max(18.0, br.height())
+
+    def _layout_label(self):
+        """Recompute the label bubble's size to fit its current text/font
+        (growing OR shrinking, same as Text Note) and re-center it on the
+        line's midpoint."""
+        if not self.show_label:
+            return
+        self._recalc_label_size()
+        mid = QPointF((self.p1.x() + self.p2.x()) / 2.0, (self.p1.y() + self.p2.y()) / 2.0)
+        self.label_item.setPos(mid.x() - self._label_w / 2.0, mid.y() - self._label_h / 2.0)
+
+    def _label_rect(self):
+        if not self.show_label:
+            return None
+        return QRectF(self.label_item.pos(), QSizeF(self._label_w, self._label_h))
+
+    def _on_label_text_changed(self):
+        """Wired to the label's contentsChanged signal, and also called
+        directly as the relayout hook after a toolbar font/size change
+        (see _apply_text_font) - either way, the bubble resizes to fit."""
+        if self._autosizing_label:
+            return
+        self._autosizing_label = True
+        try:
+            self.prepareGeometryChange()
+            self._layout_label()
+        finally:
+            self._autosizing_label = False
+        self.update()
+
+    def font_targets(self, editing_item=None):
+        return [self.label_item]
+
+    def _toggle_show_label(self):
+        self.prepareGeometryChange()
+        self.show_label = not self.show_label
+        if self.show_label and not self.label_item.toPlainText().strip():
+            self.label_item.setPlainText("Label")
+        self.label_item.setVisible(self.show_label)
+        self._layout_label()
+        self.update()
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.Antialiasing)
@@ -2040,6 +2164,27 @@ class ArrowItem(BaseComponentItem):
             painter.drawEllipse(self.p1, self.ENDPOINT_R, self.ENDPOINT_R)
             painter.drawEllipse(self.p2, self.ENDPOINT_R, self.ENDPOINT_R)
 
+        label_rect = self._label_rect()
+        if label_rect is not None:
+            # Painted last (on top of the shaft/heads) and opaque, so the
+            # line visually passes "behind" the label the same way it
+            # does in a diagram tool. Uses the arrow's own color so the
+            # pill always matches the line/head it's attached to.
+            path = QPainterPath()
+            path.addRoundedRect(label_rect, 6, 6)
+            painter.setPen(QPen(QColor(0, 0, 0, 70), 1))
+            painter.setBrush(col)
+            painter.drawPath(path)
+
+    def mouseDoubleClickEvent(self, event):
+        label_rect = self._label_rect()
+        if label_rect is not None and label_rect.contains(event.pos()):
+            self.label_item.setTextInteractionFlags(Qt.TextEditorInteraction)
+            self.label_item.setFocus()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def _build_context_menu(self, menu):
         self._style_actions = {}
         style_menu = menu.addMenu("Arrow Style")
@@ -2055,6 +2200,9 @@ class ArrowItem(BaseComponentItem):
             act.setCheckable(True)
             act.setChecked(self.line_style == ls)
             self._line_style_actions[act] = ls
+        self._label_action = menu.addAction("Show Label")
+        self._label_action.setCheckable(True)
+        self._label_action.setChecked(self.show_label)
         menu.addSeparator()
 
     def _handle_context_action(self, action):
@@ -2064,6 +2212,8 @@ class ArrowItem(BaseComponentItem):
         elif action in getattr(self, "_line_style_actions", {}):
             self.line_style = self._line_style_actions[action]
             self.update()
+        elif action is getattr(self, "_label_action", None):
+            self._toggle_show_label()
 
     def serialize(self):
         d = super().serialize()
@@ -2072,6 +2222,10 @@ class ArrowItem(BaseComponentItem):
         d["stroke_width"] = self.stroke_width
         d["style"] = self.style
         d["line_style"] = self.line_style
+        d["label"] = self.label_item.toPlainText()
+        d["show_label"] = self.show_label
+        d["label_font"] = _font_to_dict(self.label_item.font())
+        d["label_color"] = self.label_item.defaultTextColor().name()
         return d
 
     def to_html(self):
@@ -2117,9 +2271,25 @@ class ArrowItem(BaseComponentItem):
             f'stroke="{css_color}" stroke-width="{self.stroke_width}" stroke-linecap="square"{dash_attr}/>'
             f'{"".join(heads)}</svg>'
         )
+        label_html = ""
+        if self.show_label and self.label_item.toPlainText().strip():
+            text = (
+                self.label_item.toPlainText()
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+            mid_x = (self.p1.x() + self.p2.x()) / 2.0
+            mid_y = (self.p1.y() + self.p2.y()) / 2.0
+            label_html = (
+                f'<div class="arrow-label" style="position:absolute;left:{mid_x}px;top:{mid_y}px;'
+                f'transform:translate(-50%,-50%);background:{css_color};'
+                f'color:{color_to_css(self.label_item.defaultTextColor().name())};'
+                f'padding:3px 8px;border-radius:6px;font-family:Segoe UI,sans-serif;'
+                f'font-size:{self.label_item.font().pointSizeF():.0f}px;white-space:nowrap;">'
+                f'{text}</div>'
+            )
         return (
-            f'<div class="comp arrow-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
-            f'width:{self._w}px;height:{self._h}px;">{svg}</div>'
+            f'<div class="comp arrow-note" style="position:relative;left:{self.pos().x()}px;'
+            f'top:{self.pos().y()}px;width:{self._w}px;height:{self._h}px;">{svg}{label_html}</div>'
         )
 
 
@@ -3672,6 +3842,10 @@ def deserialize_component(d):
             style=d.get("style", "single"),
             line_style=d.get("line_style", "solid"),
             item_id=item_id,
+            label=d.get("label", ""),
+            show_label=d.get("show_label", False),
+            label_font=d.get("label_font"),
+            label_color=d.get("label_color"),
         )
     elif t == "board":
         item = BoardCardItem(x, y, w, h, title=d.get("title", "Board"), subitems=d.get("subitems", []), item_id=item_id)
@@ -4185,6 +4359,26 @@ def extract_scene_data(html):
 # Main window
 # --------------------------------------------------------------------------
 
+class _FontFamilyCombo(QFontComboBox):
+    """QFontComboBox that always hands text-edit focus back to whatever
+    item was being edited once its dropdown closes - whether the user
+    picked a new font, re-picked the one already showing, or just hit
+    Escape. A plain instance-attribute monkeypatch of hidePopup does NOT
+    work for this: closing the popup by clicking an item or pressing
+    Escape/Enter happens through Qt's internal C++ call to the virtual
+    hidePopup(), which bypasses a Python-side instance attribute -  only
+    a real (sub)class override participates in that virtual dispatch."""
+
+    def __init__(self, restore_focus_cb, parent=None):
+        super().__init__(parent)
+        self._restore_focus_cb = restore_focus_cb
+
+    def hidePopup(self):
+        super().hidePopup()
+        if self._restore_focus_cb:
+            self._restore_focus_cb()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4200,6 +4394,21 @@ class MainWindow(QMainWindow):
         self._font_selection = None     # text-note/plain-text/table items, for Font/B/I/U/Size
         self._arrow_selection = None    # arrow items currently selected, for the Line style combo
         self._other_selection = None    # image/gif/video/board-card items selected, for restyling
+        # Which arrow's label is the "active" text-edit target, for the
+        # Font/B/I/U/Size panel. Deliberately stickier than a live
+        # scene.focusItem() check: some toolbar widgets (the font combo,
+        # in particular) legitimately need real keyboard focus to work,
+        # which knocks the label out of Qt's/the scene's focus without
+        # the user ever "clicking away" from the arrow - see
+        # on_selection_changed for where this gets updated/cleared.
+        self._active_label_arrow = None
+        # The most recent text item that was genuinely in edit mode -
+        # kept around (independent of _active_label_arrow's narrower
+        # "is this arrow's label the font-panel target" bookkeeping) so
+        # a toolbar widget that must grab real keyboard focus (the font
+        # combo, to let you type/search) can hand focus back afterward -
+        # see _restore_text_edit_focus.
+        self._last_edited_text_item = None
 
         self._build_toolbar()
         self.scene.selectionChanged.connect(self.on_selection_changed)
@@ -4333,6 +4542,13 @@ class MainWindow(QMainWindow):
         self.size_slider.setRange(1, 40)
         self.size_slider.setValue(4)
         self.size_slider.setFixedWidth(140)
+        # Same reasoning as color_btn's NoFocus above: a QSlider grabs
+        # keyboard focus by default, which would end whatever text item
+        # is currently being edited (its focusOutEvent drops edit mode)
+        # the instant the slider is touched - most visibly breaking an
+        # Arrow's label, whose font controls only show up while it's
+        # actively focused/being edited.
+        self.size_slider.setFocusPolicy(Qt.NoFocus)
         self.size_slider.valueChanged.connect(self.on_size_changed)
         draw_tb.addWidget(self.size_slider)
 
@@ -4341,6 +4557,7 @@ class MainWindow(QMainWindow):
         self.opacity_slider.setRange(5, 100)
         self.opacity_slider.setValue(100)
         self.opacity_slider.setFixedWidth(120)
+        self.opacity_slider.setFocusPolicy(Qt.NoFocus)
         self.opacity_slider.valueChanged.connect(self.on_opacity_changed)
         draw_tb.addWidget(self.opacity_slider)
 
@@ -4368,17 +4585,29 @@ class MainWindow(QMainWindow):
         self.text_format_sep = draw_tb.addSeparator()
 
         draw_tb.addWidget(QLabel("  Font: "))
-        self.font_combo = QFontComboBox()
+        self.font_combo = _FontFamilyCombo(self._restore_text_edit_focus)
         self.font_combo.setEditable(True)
         self.font_combo.setInsertPolicy(QComboBox.NoInsert)
         self.font_combo.setFixedWidth(180)
         self.font_combo.lineEdit().setPlaceholderText("Search font\u2026")
-        # NoFocus on the Color button (above) keeps text-edit focus alive
-        # for that button, but this combo is the opposite case: it's
-        # *meant* to take focus so the user can type to search/filter the
-        # font list. Give it a completer that matches anywhere in the
-        # name (not just the start), case-insensitively, so e.g. typing
-        # "mono" surfaces "DejaVu Sans Mono" too.
+        # Why Size/Opacity/B/I/U never interrupt the label being edited
+        # but this combo did: those all sit on Qt.NoFocus, so clicking
+        # them never moves keyboard focus away from the canvas in the
+        # first place - there's nothing for the text item's focusOutEvent
+        # to react to. This combo genuinely needs focus for one thing
+        # only: typing into its search field. Clicking the dropdown arrow
+        # to pick a font with the mouse - the common case - doesn't need
+        # focus at all. So: NoFocus on the combo itself (arrow clicks stay
+        # mouse-only, exactly like the other controls), while the
+        # embedded line edit below keeps its own normal focus policy, so
+        # clicking directly into the text field to type a search still
+        # works (and still is the one case where focus - and the
+        # transient interruption that comes with it - is expected).
+        self.font_combo.setFocusPolicy(Qt.NoFocus)
+        self.font_combo.lineEdit().setFocusPolicy(Qt.StrongFocus)
+        # Give it a completer that matches anywhere in the name (not just
+        # the start), case-insensitively, so e.g. typing "mono" surfaces
+        # "DejaVu Sans Mono" too.
         font_completer = self.font_combo.completer()
         font_completer.setCompletionMode(QCompleter.PopupCompletion)
         font_completer.setFilterMode(Qt.MatchContains)
@@ -4386,12 +4615,22 @@ class MainWindow(QMainWindow):
         self.font_combo.setCompleter(font_completer)
         self.font_combo.currentFontChanged.connect(self.on_font_family_changed)
         self.font_action = draw_tb.addWidget(self.font_combo)
+        # Let every EditableTextItem recognize this specific combo (see
+        # EditableTextItem._losing_focus_to_font_combo) so on the rare
+        # occasions this combo *does* end up taking real focus (typing to
+        # search), losing focus to it doesn't visibly knock the text
+        # being edited out of edit mode. Restoring focus itself (on
+        # selection *and* on the dropdown simply closing, e.g. Escape or
+        # re-picking the same font) is handled by _FontFamilyCombo's
+        # hidePopup override and on_font_family_changed.
+        EditableTextItem._font_combo = self.font_combo
 
         self.bold_btn = QToolButton()
         self.bold_btn.setText("B")
         self.bold_btn.setCheckable(True)
         self.bold_btn.setToolTip("Bold")
         self.bold_btn.setStyleSheet("font-weight:bold;")
+        self.bold_btn.setFocusPolicy(Qt.NoFocus)
         self.bold_btn.toggled.connect(self.on_bold_toggled)
         self.bold_action = draw_tb.addWidget(self.bold_btn)
 
@@ -4400,6 +4639,7 @@ class MainWindow(QMainWindow):
         self.italic_btn.setCheckable(True)
         self.italic_btn.setToolTip("Italic")
         self.italic_btn.setStyleSheet("font-style:italic;")
+        self.italic_btn.setFocusPolicy(Qt.NoFocus)
         self.italic_btn.toggled.connect(self.on_italic_toggled)
         self.italic_action = draw_tb.addWidget(self.italic_btn)
 
@@ -4408,12 +4648,14 @@ class MainWindow(QMainWindow):
         self.underline_btn.setCheckable(True)
         self.underline_btn.setToolTip("Underline")
         self.underline_btn.setStyleSheet("text-decoration:underline;")
+        self.underline_btn.setFocusPolicy(Qt.NoFocus)
         self.underline_btn.toggled.connect(self.on_underline_toggled)
         self.underline_action = draw_tb.addWidget(self.underline_btn)
 
         self.link_btn = QToolButton()
         self.link_btn.setText("Link")
         self.link_btn.setToolTip("Add / edit hyperlink")
+        self.link_btn.setFocusPolicy(Qt.NoFocus)
         self.link_btn.clicked.connect(self.on_hyperlink_clicked)
         self.link_action = draw_tb.addWidget(self.link_btn)
 
@@ -4459,11 +4701,33 @@ class MainWindow(QMainWindow):
         # text pair (see MediaCardMixin.font_targets) that should get the
         # exact same Font/B/I/U/Size toolbar treatment as a Text Note.
         media_sel = [it for it in all_sel if isinstance(it, MediaCardMixin)]
+        editing_item = self._focused_text_item()
+        if editing_item is not None:
+            self._last_edited_text_item = editing_item
+        elif self._last_edited_text_item is not None:
+            parent = self._last_edited_text_item.parentItem()
+            if parent not in all_sel:
+                self._last_edited_text_item = None
+        arrow_sel = [it for it in all_sel if isinstance(it, ArrowItem)]
+        # An arrow's label joins the font-toolbar selection while its text
+        # is being edited - otherwise the Size slider means stroke width,
+        # not font size (see the `elif sel:` branch below). This is kept
+        # "sticky" via _active_label_arrow rather than re-checking live
+        # focus every time: the font-family combo legitimately needs real
+        # keyboard focus to work, which would otherwise knock the label
+        # out of edit mode (and this whole panel out of view) the instant
+        # it's clicked, well before the user is done with it. It only
+        # actually clears once the arrow itself is no longer selected.
+        if editing_item is not None and isinstance(editing_item.parentItem(), ArrowItem):
+            self._active_label_arrow = editing_item.parentItem()
+        elif self._active_label_arrow not in arrow_sel:
+            self._active_label_arrow = None
+        arrow_label_sel = [it for it in arrow_sel if it is self._active_label_arrow]
         # Anything with a font to edit via the toolbar's Font/B/I/U/Size
         # controls - Text Note, plain Text, Table (whose cells each carry
-        # their own font - see TableItem.font_targets), and media items.
-        font_sel = text_sel + table_sel + media_sel
-        arrow_sel = [it for it in all_sel if isinstance(it, ArrowItem)]
+        # their own font - see TableItem.font_targets), media items, and
+        # an arrow's label while it's being edited.
+        font_sel = text_sel + table_sel + media_sel + arrow_label_sel
         # Every other component type (Image/GIF/Video/BoardCard, ...) -
         # these only ever have a single "color" (border/fill), so the
         # Color button can restyle them directly whenever one is the
@@ -4473,7 +4737,6 @@ class MainWindow(QMainWindow):
             if isinstance(it, BaseComponentItem)
             and not isinstance(it, (DrawingItem, ArrowItem, TextNoteItem, PlainTextItem))
         ]
-        editing_item = self._focused_text_item()
         self._editing_selection = sel or None
         self._text_selection = text_sel or None
         self._font_selection = font_sel or None
@@ -4647,17 +4910,17 @@ class MainWindow(QMainWindow):
         self.scene.brush_type = text.lower()
 
     def on_size_changed(self, val):
+        if self._font_selection:
+            editing_item = self._focused_text_item()
+            for it in self._font_selection:
+                _apply_text_font(it, point_size=val, editing_item=editing_item)
+            return
         if self._editing_selection:
             for it in self._editing_selection:
                 if isinstance(it, DrawingItem):
                     it.set_stroke_style(width=val)
                 elif isinstance(it, ArrowItem):
                     it.set_stroke_width(val)
-            return
-        if self._font_selection:
-            editing_item = self._focused_text_item()
-            for it in self._font_selection:
-                _apply_text_font(it, point_size=val, editing_item=editing_item)
             return
         self.scene.brush_width = val
 
@@ -4686,6 +4949,25 @@ class MainWindow(QMainWindow):
         editing_item = self._focused_text_item()
         for it in self._font_selection:
             _apply_text_font(it, family=font.family(), editing_item=editing_item)
+        self._restore_text_edit_focus()
+
+    def _restore_text_edit_focus(self):
+        """The font-family combo needs real keyboard focus to let you
+        type/search, which silently knocks whatever text item was being
+        edited out of edit mode (no click-away needed) - misleadingly
+        making it look like nothing is being edited anymore, even though
+        _last_edited_text_item/_font_selection still target it correctly.
+        Call after such a toolbar action to hand focus straight back."""
+        item = self._last_edited_text_item
+        if item is None:
+            return
+        try:
+            item.setTextInteractionFlags(Qt.TextEditorInteraction)
+            item.setFocus()
+        except RuntimeError:
+            # The underlying Qt object was already deleted (e.g. its
+            # component got removed while the combo had focus).
+            self._last_edited_text_item = None
 
     def on_bold_toggled(self, checked):
         if not self._font_selection:
