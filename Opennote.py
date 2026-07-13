@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsTextItem, QGraphicsPathItem, QGraphicsProxyWidget,
     QToolBar, QFileDialog, QColorDialog, QMessageBox, QSlider, QComboBox,
     QPushButton, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QToolButton,
-    QFontComboBox, QInputDialog, QCompleter,
+    QFontComboBox, QInputDialog, QCompleter, QCheckBox,
     QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QGridLayout, QLineEdit,
 )
 
@@ -827,9 +827,11 @@ class TextNoteItem(BaseComponentItem):
     DEFAULT_COLOR = "#1e1e1e"
     DEFAULT_TEXT_COLOR = "#e8e8e8"
 
+    TITLE_H = 28
+
     def __init__(self, x=0, y=0, w=220, h=140, text="New note", color=None, item_id=None,
                  font_family=None, font_size=None, bold=False, italic=False, underline=False,
-                 link_url=None, text_color=None):
+                 link_url=None, text_color=None, title="Title", show_title=False):
         super().__init__(x, y, w, h, item_id)
         self.color = color or self.DEFAULT_COLOR
         # The note's fill/background is self.color (inherited from
@@ -839,8 +841,25 @@ class TextNoteItem(BaseComponentItem):
         # selected/being edited (see MainWindow.pick_color).
         self.text_color = text_color or self.DEFAULT_TEXT_COLOR
         self.list_mode = None  # None, "bullet" or "checklist" - drives auto-continue on Enter
+        # Optional bold header above the body text, off by default -
+        # toggled via the "Title" toolbar checkbox / context menu entry.
+        self.show_title = bool(show_title)
+        # Actual height reserved for the title bar - starts at TITLE_H but
+        # grows (see _recalc_title_height) when the title text wraps onto
+        # more than one line, so a multi-line title never overlaps the
+        # body text below it.
+        self._title_h = self.TITLE_H
+        self.title_item = EditableTextItem(self)
+        self.title_item.setPos(10, 6)
+        self.title_item.setTextWidth(max(10, w - 20))
+        self.title_item.setDefaultTextColor(QColor(self.text_color))
+        self.title_item.setPlainText(title)
+        self.title_item.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.title_item.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        self.title_item.setVisible(self.show_title)
+        self.title_item.document().contentsChanged.connect(self._on_text_changed)
         self.text_item = EditableTextItem(self)
-        self.text_item.setPos(10, 10)
+        self.text_item.setPos(10, self._title_bar_h() + 10)
         self.text_item.setTextWidth(max(10, w - 20))
         self.text_item.setDefaultTextColor(QColor(self.text_color))
         self.text_item.setPlainText(text)
@@ -866,9 +885,33 @@ class TextNoteItem(BaseComponentItem):
     def set_text_color(self, color):
         self.text_color = color.name() if isinstance(color, QColor) else color
         self.text_item.setDefaultTextColor(QColor(self.text_color))
+        self.title_item.setDefaultTextColor(QColor(self.text_color))
+        self.update()
+
+    def _title_bar_h(self):
+        return self._title_h if self.show_title else 0
+
+    def _recalc_title_height(self):
+        """Grow (or shrink back) the title bar to fit however many lines
+        the title text currently wraps onto, so a two-or-more-line title
+        gets the room it needs instead of being clipped/overlapped by
+        the body text underneath it."""
+        if not self.show_title:
+            self._title_h = self.TITLE_H
+            return
+        doc_h = self.title_item.document().size().height()
+        self._title_h = max(self.TITLE_H, doc_h + 12)
+
+    def _toggle_show_title(self):
+        self.show_title = not self.show_title
+        self.title_item.setVisible(self.show_title)
+        self._on_text_changed()
         self.update()
 
     def on_resized(self):
+        self.title_item.setTextWidth(max(10, self._w - 20))
+        self._recalc_title_height()
+        self.text_item.setPos(10, self._title_bar_h() + 10)
         self.text_item.setTextWidth(max(10, self._w - 20))
 
     def _on_text_changed(self):
@@ -878,11 +921,13 @@ class TextNoteItem(BaseComponentItem):
         # leave a big empty note behind. Never shrinks below min_h.
         if self._autosizing:
             return
+        self._recalc_title_height()
         doc_h = self.text_item.document().size().height()
-        needed_h = doc_h + 20
+        needed_h = doc_h + self._title_bar_h() + 20
         self._autosizing = True
         try:
             self.set_size(self._w, needed_h)
+            self.text_item.setPos(10, self._title_bar_h() + 10)
         finally:
             self._autosizing = False
 
@@ -898,9 +943,27 @@ class TextNoteItem(BaseComponentItem):
         self.paint_handle(painter)
 
     def mouseDoubleClickEvent(self, event):
+        if self.show_title and event.pos().y() < self._title_bar_h():
+            self.title_item.setTextInteractionFlags(Qt.TextEditorInteraction)
+            self.title_item.setFocus()
+            cursor = self.title_item.textCursor()
+            cursor.select(QTextCursor.Document)
+            self.title_item.setTextCursor(cursor)
+            event.accept()
+            return
         self.text_item.setTextInteractionFlags(Qt.TextEditorInteraction)
         self.text_item.setFocus()
         super().mouseDoubleClickEvent(event)
+
+    def font_targets(self, editing_item=None):
+        """What the toolbar's Font/B/I/U/Size controls should restyle:
+        just the title while it's the one focused/being edited, otherwise
+        the body text - without this, those controls always fall back to
+        text_item even while the title is focused (see _apply_text_font's
+        default of `[item.text_item]` for items with no font_targets)."""
+        if editing_item is self.title_item:
+            return [self.title_item]
+        return [self.text_item]
 
     # -- bullet list / checklist formatting -----------------------------
     # Implemented as plain-text line prefixes (rather than Qt's native
@@ -908,12 +971,18 @@ class TextNoteItem(BaseComponentItem):
     # export without any extra serialization work - it's just characters
     # in the text.
     def _build_context_menu(self, menu):
+        self._title_menu_action = menu.addAction("Title")
+        self._title_menu_action.setCheckable(True)
+        self._title_menu_action.setChecked(self.show_title)
+        menu.addSeparator()
         self._bullet_menu_action = menu.addAction("Toggle Bullet List")
         self._check_menu_action = menu.addAction("Toggle Checklist")
         menu.addSeparator()
 
     def _handle_context_action(self, action):
-        if action == self._bullet_menu_action:
+        if action == self._title_menu_action:
+            self._toggle_show_title()
+        elif action == self._bullet_menu_action:
             self.toggle_bullet_list()
         elif action == self._check_menu_action:
             self.toggle_checklist()
@@ -957,6 +1026,8 @@ class TextNoteItem(BaseComponentItem):
     def serialize(self):
         d = super().serialize()
         d["text"] = self.text_item.toPlainText()
+        d["title"] = self.title_item.toPlainText()
+        d["show_title"] = self.show_title
         d["color"] = self.color
         d["text_color"] = self.text_color
         f = self.text_item.font()
@@ -991,10 +1062,17 @@ class TextNoteItem(BaseComponentItem):
         else:
             text = f'<span style="{text_style}">{text}</span>'
         bg_css = color_to_css(self.color)
+        title_html = ""
+        if self.show_title:
+            title_text = (
+                self.title_item.toPlainText()
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+            title_html = f'<div style="font-weight:bold;margin-bottom:4px;">{title_text}</div>'
         return (
             f'<div class="comp text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;background:{bg_css};'
-            f'opacity:{self.opacity():.2f}">{text}</div>'
+            f'opacity:{self.opacity():.2f}">{title_html}{text}</div>'
         )
 
 
@@ -4413,6 +4491,7 @@ def deserialize_component(d):
             bold=d.get("bold", False), italic=d.get("italic", False),
             underline=d.get("underline", False), link_url=d.get("link_url"),
             text_color=d.get("text_color"),
+            title=d.get("title", "Title"), show_title=d.get("show_title", False),
         )
     elif t == "plaintext":
         item = PlainTextItem(
@@ -5264,6 +5343,44 @@ class MainWindow(QMainWindow):
         self.line_style_label_action.setVisible(False)
         self.line_style_action.setVisible(False)
 
+        # -- per-component checkboxes (Title / Show label / Show Title /
+        # Show Description) - each hidden by default; on_selection_changed
+        # shows the relevant one(s) depending on what's selected. A
+        # leading separator plus extra left/right padding (via the
+        # checkbox stylesheet) keeps this little group from crowding up
+        # against the slider/combo controls on either side of it.
+        checkbox_style = "QCheckBox { padding-left: 6px; padding-right: 10px; }"
+
+        self.checkbox_group_sep = draw_tb.addSeparator()
+
+        self.title_checkbox = QCheckBox("  Title")
+        self.title_checkbox.setStyleSheet(checkbox_style)
+        self.title_checkbox.setFocusPolicy(Qt.NoFocus)
+        self.title_checkbox_action = draw_tb.addWidget(self.title_checkbox)
+        self.title_checkbox.toggled.connect(self.on_title_toggled)
+        self.title_checkbox_action.setVisible(False)
+
+        self.arrow_label_checkbox = QCheckBox("  Show label")
+        self.arrow_label_checkbox.setStyleSheet(checkbox_style)
+        self.arrow_label_checkbox.setFocusPolicy(Qt.NoFocus)
+        self.arrow_label_checkbox_action = draw_tb.addWidget(self.arrow_label_checkbox)
+        self.arrow_label_checkbox.toggled.connect(self.on_arrow_label_toggled)
+        self.arrow_label_checkbox_action.setVisible(False)
+
+        self.media_title_checkbox = QCheckBox("  Show Title")
+        self.media_title_checkbox.setStyleSheet(checkbox_style)
+        self.media_title_checkbox.setFocusPolicy(Qt.NoFocus)
+        self.media_title_checkbox_action = draw_tb.addWidget(self.media_title_checkbox)
+        self.media_title_checkbox.toggled.connect(self.on_media_title_toggled)
+        self.media_title_checkbox_action.setVisible(False)
+
+        self.media_desc_checkbox = QCheckBox("  Show Description")
+        self.media_desc_checkbox.setStyleSheet(checkbox_style)
+        self.media_desc_checkbox.setFocusPolicy(Qt.NoFocus)
+        self.media_desc_checkbox_action = draw_tb.addWidget(self.media_desc_checkbox)
+        self.media_desc_checkbox.toggled.connect(self.on_media_desc_toggled)
+        self.media_desc_checkbox_action.setVisible(False)
+
         # -- text formatting controls (Text Note / Text only) -----------
         # Hidden by default; on_selection_changed shows them only while a
         # text component is selected, so they don't clutter the toolbar
@@ -5389,6 +5506,7 @@ class MainWindow(QMainWindow):
         # text pair (see MediaCardMixin.font_targets) that should get the
         # exact same Font/B/I/U/Size toolbar treatment as a Text Note.
         media_sel = [it for it in all_sel if isinstance(it, MediaCardMixin)]
+        text_note_sel = [it for it in all_sel if isinstance(it, TextNoteItem)]
         editing_item = self._focused_text_item()
         if editing_item is not None:
             self._last_edited_text_item = editing_item
@@ -5444,6 +5562,36 @@ class MainWindow(QMainWindow):
             idx = self.line_style_combo.findData(arrow_sel[0].line_style)
             self.line_style_combo.setCurrentIndex(max(0, idx))
             self.line_style_combo.blockSignals(False)
+
+        self._text_note_selection = text_note_sel or None
+        self.title_checkbox_action.setVisible(bool(text_note_sel))
+        if text_note_sel:
+            self.title_checkbox.blockSignals(True)
+            self.title_checkbox.setChecked(text_note_sel[0].show_title)
+            self.title_checkbox.blockSignals(False)
+
+        self.arrow_label_checkbox_action.setVisible(bool(arrow_sel))
+        if arrow_sel:
+            self.arrow_label_checkbox.blockSignals(True)
+            self.arrow_label_checkbox.setChecked(arrow_sel[0].show_label)
+            self.arrow_label_checkbox.blockSignals(False)
+
+        self._media_selection = media_sel or None
+        self.media_title_checkbox_action.setVisible(bool(media_sel))
+        self.media_desc_checkbox_action.setVisible(bool(media_sel))
+        if media_sel:
+            self.media_title_checkbox.blockSignals(True)
+            self.media_title_checkbox.setChecked(media_sel[0].show_title)
+            self.media_title_checkbox.blockSignals(False)
+            self.media_desc_checkbox.blockSignals(True)
+            self.media_desc_checkbox.setChecked(media_sel[0].show_description)
+            self.media_desc_checkbox.blockSignals(False)
+
+        # Only show the leading separator (and its extra spacing) when at
+        # least one of the checkboxes it introduces is actually visible -
+        # otherwise it'd leave a stray divider mark on the toolbar even
+        # with nothing selected.
+        self.checkbox_group_sep.setVisible(bool(text_note_sel or arrow_sel or media_sel))
 
         if editing_item is not None:
             # In-place text editing (or a text selection within it) takes
@@ -5712,6 +5860,34 @@ class MainWindow(QMainWindow):
         for it in self._arrow_selection:
             it.line_style = ls
             it.update()
+
+    def on_title_toggled(self, checked):
+        if not getattr(self, "_text_note_selection", None):
+            return
+        for it in self._text_note_selection:
+            if it.show_title != checked:
+                it._toggle_show_title()
+
+    def on_arrow_label_toggled(self, checked):
+        if not self._arrow_selection:
+            return
+        for it in self._arrow_selection:
+            if it.show_label != checked:
+                it._toggle_show_label()
+
+    def on_media_title_toggled(self, checked):
+        if not getattr(self, "_media_selection", None):
+            return
+        for it in self._media_selection:
+            if it.show_title != checked:
+                it._toggle_show_title()
+
+    def on_media_desc_toggled(self, checked):
+        if not getattr(self, "_media_selection", None):
+            return
+        for it in self._media_selection:
+            if it.show_description != checked:
+                it._toggle_show_description()
 
     def toggle_draw_mode(self, checked):
         self.scene.draw_mode = checked
