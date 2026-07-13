@@ -12,7 +12,8 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 
 <img width="1920" height="1020" alt="new presentation-1" src="https://github.com/user-attachments/assets/78fc8b41-b7a3-4d3e-8b67-dcc995844ea4" />
 
-<img width="1920" height="1020" alt="new presentation-2" src="https://github.com/user-attachments/assets/12dc1d4a-e608-4d7f-a67d-a8ff431a2056" />
+<img width="1920" height="1020" alt="new presentation-2" src="https://github.com/user-attachments/assets/070a0626-c6a2-4bf6-aa3c-3e739bc8df6c" />
+
 
 
 ## Notes are saved to `html` files and can be viewed in browser as single files.
@@ -20,7 +21,8 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 
 <img width="1920" height="1020" alt="new presentation-3" src="https://github.com/user-attachments/assets/dabf720b-ac74-40e6-980a-2053a317e1e0" />
 
-<img width="1920" height="1020" alt="new presentation-4" src="https://github.com/user-attachments/assets/77c6e7f5-a52d-437b-97be-24430e1791f8" />
+<img width="1920" height="1020" alt="new presentation-4" src="https://github.com/user-attachments/assets/263a37e3-17e8-46af-994e-edf5992847a2" />
+
 
 
 
