@@ -831,7 +831,7 @@ class TextNoteItem(BaseComponentItem):
 
     def __init__(self, x=0, y=0, w=220, h=140, text="New note", color=None, item_id=None,
                  font_family=None, font_size=None, bold=False, italic=False, underline=False,
-                 link_url=None, text_color=None, title="Title", show_title=False):
+                 link_url=None, text_color=None, title="Title", show_title=False, title_font=None):
         super().__init__(x, y, w, h, item_id)
         self.color = color or self.DEFAULT_COLOR
         # The note's fill/background is self.color (inherited from
@@ -855,7 +855,10 @@ class TextNoteItem(BaseComponentItem):
         self.title_item.setDefaultTextColor(QColor(self.text_color))
         self.title_item.setPlainText(title)
         self.title_item.setTextInteractionFlags(Qt.NoTextInteraction)
-        self.title_item.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        self.title_item.setFont(
+            _font_from_dict(title_font, base_family="Segoe UI", base_size=12.0, base_bold=True)
+            if title_font else QFont("Segoe UI", 12, QFont.Bold)
+        )
         self.title_item.setVisible(self.show_title)
         self.title_item.document().contentsChanged.connect(self._on_text_changed)
         self.text_item = EditableTextItem(self)
@@ -1036,6 +1039,7 @@ class TextNoteItem(BaseComponentItem):
         d["bold"] = f.bold()
         d["italic"] = f.italic()
         d["underline"] = f.underline()
+        d["title_font"] = _font_to_dict(self.title_item.font())
         d["link_url"] = self.link_url
         return d
 
@@ -1047,7 +1051,14 @@ class TextNoteItem(BaseComponentItem):
         )
         f = self.text_item.font()
         text_color = self.text_item.defaultTextColor().name()
-        style_bits = [f"font-family:'{f.family()}',sans-serif", f"color:{text_color}"]
+        # pointSizeF() is a point size, not a pixel size - tagging it "pt"
+        # (rather than "px") keeps the exported size in sync with the app,
+        # the same fix already applied to the Arrow label's font-size.
+        style_bits = [
+            f"font-family:'{f.family()}',sans-serif",
+            f"font-size:{f.pointSizeF():.1f}pt",
+            f"color:{text_color}",
+        ]
         if f.bold():
             style_bits.append("font-weight:bold")
         if f.italic():
@@ -1067,9 +1078,22 @@ class TextNoteItem(BaseComponentItem):
             title_text = (
                 self.title_item.toPlainText()
                 .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\n", "<br>")
             )
+            tf = self.title_item.font()
             title_color = color_to_css(self.title_item.defaultTextColor().name())
-            title_html = f'<div style="font-weight:bold;margin-bottom:4px;color:{title_color};">{title_text}</div>'
+            title_bits = [
+                f"font-family:'{tf.family()}',sans-serif",
+                f"font-size:{tf.pointSizeF():.1f}pt",
+                "margin-bottom:4px",
+                f"color:{title_color}",
+            ]
+            title_bits.append("font-weight:bold" if tf.bold() else "font-weight:normal")
+            if tf.italic():
+                title_bits.append("font-style:italic")
+            if tf.underline():
+                title_bits.append("text-decoration:underline")
+            title_html = f'<div style="{";".join(title_bits)}">{title_text}</div>'
         return (
             f'<div class="comp text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;background:{bg_css};'
@@ -1183,7 +1207,11 @@ class PlainTextItem(BaseComponentItem):
         )
         f = self.text_item.font()
         text_color = QColor(self.color).name()
-        style_bits = [f"font-family:'{f.family()}',sans-serif", f"color:{text_color}"]
+        style_bits = [
+            f"font-family:'{f.family()}',sans-serif",
+            f"font-size:{f.pointSizeF():.1f}pt",
+            f"color:{text_color}",
+        ]
         if f.bold():
             style_bits.append("font-weight:bold")
         if f.italic():
@@ -1379,14 +1407,38 @@ class MediaCardMixin:
 
     @staticmethod
     def _escape_html(text):
-        return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return (
+            (text or "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
+
+    @staticmethod
+    def _font_style_css(font, color):
+        # pointSizeF() is a point size, not a pixel size - tagging it "pt"
+        # (rather than "px") keeps the exported size in sync with the app,
+        # the same fix already applied to the Arrow label's font-size.
+        bits = [
+            f"font-family:'{font.family()}',sans-serif",
+            f"font-size:{font.pointSizeF():.1f}pt",
+            f"color:{color}",
+        ]
+        if font.bold():
+            bits.append("font-weight:bold")
+        if font.italic():
+            bits.append("font-style:italic")
+        if font.underline():
+            bits.append("text-decoration:underline")
+        return ";".join(bits)
 
     def _title_desc_html(self):
         title = self._escape_html(self.title_item.toPlainText()) if self.show_title else ""
         desc = self._escape_html(self.description_item.toPlainText()) if self.show_description else ""
+        title_style = self._font_style_css(self.title_item.font(), self.title_item.defaultTextColor().name())
+        desc_style = self._font_style_css(self.description_item.font(), self.description_item.defaultTextColor().name())
         return (
-            f'<div class="media-title">{title}</div>' if title else "",
-            f'<div class="media-desc">{desc}</div>' if desc else "",
+            f'<div class="media-title" style="{title_style}">{title}</div>' if title else "",
+            f'<div class="media-desc" style="{desc_style}">{desc}</div>' if desc else "",
         )
 
     # -- toggling title/description on/off, wired up through each media
@@ -2453,15 +2505,32 @@ class ArrowItem(BaseComponentItem):
             text = (
                 self.label_item.toPlainText()
                 .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\n", "<br>")
             )
             mid_x = (self.p1.x() + self.p2.x()) / 2.0
             mid_y = (self.p1.y() + self.p2.y()) / 2.0
+            lf = self.label_item.font()
+            label_style_bits = [
+                f"font-family:'{lf.family()}',sans-serif",
+                # pointSizeF() is a point size, not a pixel size - tagging
+                # it "px" here made every exported label render ~25%
+                # smaller than in the app (1pt = 1.33px at the standard
+                # 96 DPI most desktops/browsers assume). "pt" is a real
+                # CSS unit and keeps the two in sync.
+                f"font-size:{lf.pointSizeF():.1f}pt",
+            ]
+            if lf.bold():
+                label_style_bits.append("font-weight:bold")
+            if lf.italic():
+                label_style_bits.append("font-style:italic")
+            if lf.underline():
+                label_style_bits.append("text-decoration:underline")
+            label_font_style = ";".join(label_style_bits)
             label_html = (
                 f'<div class="arrow-label" style="position:absolute;left:{mid_x}px;top:{mid_y}px;'
                 f'transform:translate(-50%,-50%);background:{css_color};'
                 f'color:{color_to_css(self.label_item.defaultTextColor().name())};'
-                f'padding:3px 8px;border-radius:6px;font-family:Segoe UI,sans-serif;'
-                f'font-size:{self.label_item.font().pointSizeF():.0f}px;white-space:nowrap;">'
+                f'padding:5px;border-radius:6px;{label_font_style};white-space:nowrap;">'
                 f'{text}</div>'
             )
         return (
@@ -2982,7 +3051,11 @@ class TableItem(BaseComponentItem):
 
     def to_html(self):
         def esc(s):
-            return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            return (
+                (s or "")
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\n", "<br>")
+            )
 
         def font_style_bits(font_dict):
             bits = []
@@ -2991,6 +3064,9 @@ class TableItem(BaseComponentItem):
             fam = font_dict.get("font_family")
             if fam:
                 bits.append(f"font-family:'{fam}',sans-serif")
+            size = font_dict.get("font_size")
+            if size:
+                bits.append(f"font-size:{float(size):.1f}pt")
             if font_dict.get("bold"):
                 bits.append("font-weight:bold")
             if font_dict.get("italic"):
@@ -3809,7 +3885,11 @@ class BoardCardItem(BaseComponentItem):
             elif kind == "checklist":
                 lis = "".join(f'<li><input type="checkbox" disabled> {x}</li>' for x in item.get("items", []))
                 rows.append(f'<ul class="sub-checklist">{lis}</ul>')
-        title = self.title_item.toPlainText().replace("&", "&amp;").replace("<", "&lt;")
+        title = (
+            self.title_item.toPlainText()
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
         bg_css = color_to_css(self.color or self.DEFAULT_COLOR)
         return (
             f'<div class="comp board-card" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
@@ -4493,6 +4573,7 @@ def deserialize_component(d):
             underline=d.get("underline", False), link_url=d.get("link_url"),
             text_color=d.get("text_color"),
             title=d.get("title", "Title"), show_title=d.get("show_title", False),
+            title_font=d.get("title_font"),
         )
     elif t == "plaintext":
         item = PlainTextItem(
