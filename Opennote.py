@@ -1068,7 +1068,8 @@ class TextNoteItem(BaseComponentItem):
                 self.title_item.toPlainText()
                 .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             )
-            title_html = f'<div style="font-weight:bold;margin-bottom:4px;">{title_text}</div>'
+            title_color = color_to_css(self.title_item.defaultTextColor().name())
+            title_html = f'<div style="font-weight:bold;margin-bottom:4px;color:{title_color};">{title_text}</div>'
         return (
             f'<div class="comp text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;background:{bg_css};'
@@ -2464,7 +2465,7 @@ class ArrowItem(BaseComponentItem):
                 f'{text}</div>'
             )
         return (
-            f'<div class="comp arrow-note" style="position:relative;left:{self.pos().x()}px;'
+            f'<div class="comp arrow-note" style="left:{self.pos().x()}px;'
             f'top:{self.pos().y()}px;width:{self._w}px;height:{self._h}px;">{svg}{label_html}</div>'
         )
 
@@ -5279,11 +5280,16 @@ class MainWindow(QMainWindow):
         draw_tb = QToolBar("Drawing Options")
         self.addToolBar(Qt.TopToolBarArea, draw_tb)
 
-        draw_tb.addWidget(QLabel(" Brush: "))
+        self.brush_label_action = draw_tb.addWidget(QLabel(" Brush: "))
         self.brush_combo = QComboBox()
         self.brush_combo.addItems(["Pen", "Marker", "Highlighter"])
         self.brush_combo.currentTextChanged.connect(self.on_brush_type_changed)
-        draw_tb.addWidget(self.brush_combo)
+        self.brush_combo_action = draw_tb.addWidget(self.brush_combo)
+        # Only meaningful while actively drawing - hidden the rest of the
+        # time (see toggle_draw_mode) so it doesn't clutter the toolbar
+        # when e.g. Select is the active tool.
+        self.brush_label_action.setVisible(False)
+        self.brush_combo_action.setVisible(False)
 
         draw_tb.addWidget(QLabel("  Color: "))
         self.color_btn = QPushButton()
@@ -5892,6 +5898,8 @@ class MainWindow(QMainWindow):
     def toggle_draw_mode(self, checked):
         self.scene.draw_mode = checked
         self.view.setDragMode(QGraphicsView.NoDrag if checked else QGraphicsView.RubberBandDrag)
+        self.brush_label_action.setVisible(checked)
+        self.brush_combo_action.setVisible(checked)
         self.statusBar().showMessage(
             "Draw mode ON \u2014 click and drag on the canvas to sketch" if checked else "Ready"
         )
