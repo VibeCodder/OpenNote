@@ -5803,7 +5803,7 @@ class MainWindow(QMainWindow):
         # they already double up for drawings/arrows.
         self.text_format_sep = draw_tb.addSeparator()
 
-        draw_tb.addWidget(QLabel("  Font: "))
+        self.font_label_action = draw_tb.addWidget(QLabel("  Font: "))
         self.font_combo = _FontFamilyCombo(self._restore_text_edit_focus)
         self.font_combo.setEditable(True)
         self.font_combo.setInsertPolicy(QComboBox.NoInsert)
@@ -5879,7 +5879,7 @@ class MainWindow(QMainWindow):
         self.link_action = draw_tb.addWidget(self.link_btn)
 
         self._font_format_actions = [
-            self.text_format_sep, self.font_action,
+            self.text_format_sep, self.font_label_action, self.font_action,
             self.bold_action, self.italic_action, self.underline_action,
         ]
         self._text_format_actions = self._font_format_actions + [self.link_action]
