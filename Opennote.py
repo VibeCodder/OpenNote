@@ -5113,6 +5113,20 @@ class MindMapView(QGraphicsView):
                 comp.dropEvent(event)
                 event.acceptProposedAction()
                 return
+            # A dropped .html file is a board, not a media file to embed -
+            # open it the same way File > Open... would, rather than
+            # falling through to create_item_from_file (which would just
+            # reject it as an unsupported type).
+            html_path = None
+            for url in event.mimeData().urls():
+                p = url.toLocalFile()
+                if p.lower().endswith(".html"):
+                    html_path = p
+                    break
+            if html_path is not None:
+                event.acceptProposedAction()
+                self.main_window.open_dropped_board(html_path)
+                return
             for url in event.mimeData().urls():
                 path = url.toLocalFile()
                 self.main_window.create_item_from_file(path, scene_pos)
@@ -5484,6 +5498,10 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(self.breadcrumb_bar)
         central_layout.addWidget(self.view)
         self.setCentralWidget(central)
+
+        # Let dropping an .html board file anywhere on the window open it,
+        # the same as File > Open... (see dragEnterEvent/dropEvent below).
+        self.setAcceptDrops(True)
 
         self.clipboard_data = []
         self.current_file = None
@@ -6722,6 +6740,51 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._load_board_file(path, error_title="Open failed")
+
+    def open_dropped_board(self, path):
+        """Open an .html board file dropped onto the window - same
+        behavior as File > Open... (confirms discarding unsaved changes,
+        then loads it). Shared by MainWindow's own dropEvent (drops
+        landing on the toolbar/breadcrumb bar) and MindMapView's
+        dropEvent (drops landing on the canvas itself)."""
+        if not self._confirm_discard_changes(title="Open board"):
+            return
+        self._load_board_file(path, error_title="Open failed")
+
+    # -- drag & drop (dropping an .html board file opens it, same as
+    # File > Open...) ---------------------------------------------------
+    def _dropped_html_path(self, event):
+        """Return the local path of the first .html file among the
+        event's dropped URLs, or None if there isn't one."""
+        if not event.mimeData().hasUrls():
+            return None
+        for url in event.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if path.lower().endswith(".html"):
+                return path
+        return None
+
+    def dragEnterEvent(self, event):
+        if self._dropped_html_path(event) is not None:
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._dropped_html_path(event) is not None:
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        path = self._dropped_html_path(event)
+        if path is None:
+            super().dropEvent(event)
+            return
+        event.acceptProposedAction()
+        self.open_dropped_board(path)
 
     def navigate_to_file(self, path):
         """Switch the whole window to display a different board .html
