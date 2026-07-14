@@ -29,12 +29,12 @@ import uuid
 import time
 
 from PySide6.QtCore import (
-    Qt, QRectF, QPointF, QPoint, QSize, QSizeF, QByteArray, QBuffer, QIODevice, QUrl,
+    Qt, QRectF, QPointF, QPoint, QSize, QSizeF, QByteArray, QBuffer, QIODevice, QUrl, Signal, QTimer,
 )
 from PySide6.QtGui import (
     QColor, QPen, QPainter, QPainterPath, QPixmap, QImage, QFont, QFontMetrics,
     QMovie, QPalette, QKeySequence, QAction, QGuiApplication,
-    QIcon, QActionGroup, QTextCursor,
+    QIcon, QActionGroup, QTextCursor, QIntValidator,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsObject,
@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QToolButton,
     QFontComboBox, QInputDialog, QCompleter, QCheckBox,
     QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QGridLayout, QLineEdit,
+    QSizePolicy,
 )
 
 try:
@@ -66,7 +67,7 @@ except Exception:
 # --------------------------------------------------------------------------
 
 HANDLE_SIZE = 12
-
+ARROW_Z_OFFSET = 1_000_000  # arrows always stack above every other component
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 GIF_EXTS = {".gif"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
@@ -676,6 +677,9 @@ class BaseComponentItem(QGraphicsObject):
 
     # -- mouse: resize / drag-drop-onto-board notification ------------
     def mousePressEvent(self, event):
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "bring_to_front"):
+            scene.bring_to_front(self)
         if self.isSelected() and self.handle_rect().contains(event.pos()):
             self._resizing = True
             self._resize_start = event.scenePos()
@@ -2208,6 +2212,9 @@ class ArrowItem(BaseComponentItem):
         return None
 
     def mousePressEvent(self, event):
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "bring_to_front"):
+            scene.bring_to_front(self)
         if self.isSelected():
             idx = self._endpoint_at(event.pos())
             if idx is not None:
@@ -3227,7 +3234,16 @@ class BoardCardItem(BaseComponentItem):
         # -- in-place text-subitem editing state -------------------------
         self._sub_edit_item = None    # the _SubitemTextEdit overlay, while editing
         self._sub_edit_index = None   # index of the subitem being edited
+        self._sub_edit_field = None   # which field is being edited: "text" (kind=="text")
+                                       # or "title"/"description" (kind in image/gif/video)
         self._subitem_font = QFont()  # font used for text subitems, captured in paint()
+        self._subitem_td_click_rects = {}  # idx -> (title_rect, desc_rect) in item coords,
+                                            # for image/gif/video subitems - always reserved
+                                            # at the top/bottom of the row (even when the bar
+                                            # itself is currently collapsed because it has no
+                                            # text yet) so double-clicking there can start
+                                            # adding a title/description, not just editing an
+                                            # existing one.
 
         # -- insertion preview while a component is dragged over this card
         self._insert_preview_y = None  # local y of the pending drop, or None
@@ -3264,8 +3280,18 @@ class BoardCardItem(BaseComponentItem):
             self.title_item.setFocus()
         else:
             idx = self._subitem_index_at(event.pos())
-            if idx is not None and self.subitems[idx].get("kind") == "text":
-                self._begin_edit_subitem(idx)
+            if idx is not None:
+                kind = self.subitems[idx].get("kind")
+                if kind == "text":
+                    self._begin_edit_subitem(idx)
+                elif kind in ("image", "gif", "video"):
+                    rects = self._subitem_td_click_rects.get(idx)
+                    if rects:
+                        title_rect, desc_rect = rects
+                        if title_rect.contains(event.pos()):
+                            self._begin_edit_subitem_field(idx, "title")
+                        elif desc_rect.contains(event.pos()):
+                            self._begin_edit_subitem_field(idx, "description")
         super().mouseDoubleClickEvent(event)
 
     # -- in-place editing of a "text" subitem ----------------------------
@@ -3292,6 +3318,7 @@ class BoardCardItem(BaseComponentItem):
         edit.setZValue(10)
         self._sub_edit_item = edit
         self._sub_edit_index = idx
+        self._sub_edit_field = "text"
         edit.setTextInteractionFlags(Qt.TextEditorInteraction)
         edit.setFocus()
         cursor = edit.textCursor()
@@ -3306,18 +3333,63 @@ class BoardCardItem(BaseComponentItem):
         self._autogrow_to_fit()
         self.update()
 
+    # -- in-place editing of an image/gif/video subitem's title/description
+    def _begin_edit_subitem_field(self, idx, field):
+        if idx is None or idx >= len(self.subitems):
+            return
+        item = self.subitems[idx]
+        if item.get("kind") not in ("image", "gif", "video"):
+            return
+        self._end_edit_subitem()
+        rects = self._subitem_td_click_rects.get(idx)
+        if not rects:
+            return
+        rect = rects[0] if field == "title" else rects[1]
+        edit = _SubitemTextEdit(self, on_finish=self._end_edit_subitem)
+        edit.setPos(rect.x() + 6, rect.y())
+        edit.setTextWidth(max(10, rect.width() - 12))
+        if field == "title":
+            edit.setDefaultTextColor(QColor("#ffffff"))
+            edit.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        else:
+            edit.setDefaultTextColor(QColor("#aaaaaa"))
+            edit.setFont(QFont("Segoe UI", 8))
+        edit.setPlainText(item.get(field, ""))
+        edit.document().contentsChanged.connect(lambda: self._sync_subitem_field(idx, field))
+        edit.setZValue(10)
+        self._sub_edit_item = edit
+        self._sub_edit_index = idx
+        self._sub_edit_field = field
+        edit.setTextInteractionFlags(Qt.TextEditorInteraction)
+        edit.setFocus()
+        cursor = edit.textCursor()
+        cursor.select(QTextCursor.Document)
+        edit.setTextCursor(cursor)
+        self.update()
+
+    def _sync_subitem_field(self, idx, field):
+        if (self._sub_edit_item is None or self._sub_edit_index != idx
+                or self._sub_edit_field != field or idx >= len(self.subitems)):
+            return
+        self.subitems[idx][field] = self._sub_edit_item.toPlainText()
+        self._autogrow_to_fit()
+        self.update()
+
     def _end_edit_subitem(self):
         edit = self._sub_edit_item
         if edit is None:
             return
         idx = self._sub_edit_index
+        field = self._sub_edit_field or "text"
         if idx is not None and idx < len(self.subitems):
-            self.subitems[idx]["text"] = edit.toPlainText()
+            self.subitems[idx][field] = edit.toPlainText()
         self._sub_edit_item = None
         self._sub_edit_index = None
+        self._sub_edit_field = None
         edit.setParentItem(None)
         if edit.scene() is not None:
             edit.scene().removeItem(edit)
+        self._autogrow_to_fit()
         self.update()
 
     def add_subitem(self, subitem, index=None):
@@ -3354,6 +3426,23 @@ class BoardCardItem(BaseComponentItem):
             if local_y < r.center().y():
                 return idx
         return len(self.subitems)
+
+    def _sub_text_title_height(self, item, avail_w):
+        """Height (and font) needed for a "text" subitem's bold title
+        line, if it's a Text Note with show_title on and non-empty text -
+        shared by paint() and _estimate_content_height() so the two never
+        disagree about how much vertical space a subitem needs."""
+        if item.get("note_type") != "text" or not item.get("show_title") or not item.get("title"):
+            return 0, None
+        title_font = (
+            _font_from_dict(item.get("title_font"), base_family="Segoe UI", base_size=11.0, base_bold=True)
+            if item.get("title_font") else QFont("Segoe UI", 11, QFont.Bold)
+        )
+        fm = QFontMetrics(title_font)
+        h = fm.boundingRect(
+            QRectF(0, 0, avail_w, 10000).toRect(), Qt.TextWordWrap, item.get("title", "")
+        ).height() + 4
+        return max(18, h), title_font
 
     def _sub_media_chrome(self, item):
         """For an image/gif/video subitem, decide whether its title/desc
@@ -3416,7 +3505,8 @@ class BoardCardItem(BaseComponentItem):
                 needed_h = fm.boundingRect(
                     QRectF(0, 0, avail_w, 10000).toRect(), Qt.TextWordWrap, item.get("text", "")
                 ).height() + 4
-                y += max(20, needed_h) + 8
+                title_h, _ = self._sub_text_title_height(item, avail_w)
+                y += max(20, needed_h) + title_h + 8
             elif kind == "checklist":
                 y += 22 * len(item.get("items", [])) + 6
         return y + pad
@@ -3537,6 +3627,9 @@ class BoardCardItem(BaseComponentItem):
         QGraphicsObject.hoverMoveEvent(self, event)
 
     def mousePressEvent(self, event):
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "bring_to_front"):
+            scene.bring_to_front(self)
         if event.button() == Qt.LeftButton and not (
             self.isSelected() and self.handle_rect().contains(event.pos())
         ):
@@ -3628,6 +3721,7 @@ class BoardCardItem(BaseComponentItem):
         pad = 8
         avail_w = self._w - pad * 2
         self._subitem_rects = []
+        self._subitem_td_click_rects = {}
         for idx, item in enumerate(self.subitems):
             remaining_h = self._h - y - pad
             if remaining_h < 18:
@@ -3657,8 +3751,11 @@ class BoardCardItem(BaseComponentItem):
                 # matter how the card gets resized afterwards.
                 show_title, show_desc, title_h, desc_h = self._sub_media_chrome(item)
                 media_h = self._subitem_media_height(pm, avail_w, remaining_h - title_h - desc_h)
-                if show_title:
+                title_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_TITLE_H)
+                editing_title = idx == self._sub_edit_index and self._sub_edit_field == "title"
+                if show_title and not editing_title:
                     self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item.get("title", ""))
+                if show_title:
                     y += title_h
                 r = QRectF(pad, y, avail_w, media_h)
                 painter.setBrush(QColor("#111111"))
@@ -3670,9 +3767,13 @@ class BoardCardItem(BaseComponentItem):
                     py = r.y() + (r.height() - scaled.height()) / 2
                     painter.drawPixmap(int(px), int(py), scaled)
                 y += media_h
-                if show_desc:
+                desc_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_DESC_H)
+                editing_desc = idx == self._sub_edit_index and self._sub_edit_field == "description"
+                if show_desc and not editing_desc:
                     self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item.get("description", ""))
+                if show_desc:
                     y += desc_h
+                self._subitem_td_click_rects[idx] = (title_click_rect, desc_click_rect)
                 y += self.MEDIA_GAP
                 self._subitem_rects.append((idx, QRectF(pad, row_top, avail_w, y - row_top)))
             elif kind == "video":
@@ -3688,8 +3789,11 @@ class BoardCardItem(BaseComponentItem):
                 # "\u25B6 video" placeholder that had no playback at all.
                 aspect = item.get("aspect") or (9 / 16)
                 show_title, show_desc, title_h, desc_h = self._sub_media_chrome(item)
-                if show_title:
+                title_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_TITLE_H)
+                editing_title = idx == self._sub_edit_index and self._sub_edit_field == "title"
+                if show_title and not editing_title:
                     self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item.get("title", ""))
+                if show_title:
                     y += title_h
                 media_h = self._subitem_media_height(
                     None, avail_w, remaining_h - self.VIDEO_HANDLE_H - title_h - desc_h, aspect=aspect)
@@ -3707,9 +3811,13 @@ class BoardCardItem(BaseComponentItem):
                 proxy.resize(avail_w, media_h)
                 proxy.show()
                 y += self.VIDEO_HANDLE_H + media_h
-                if show_desc:
+                desc_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_DESC_H)
+                editing_desc = idx == self._sub_edit_index and self._sub_edit_field == "description"
+                if show_desc and not editing_desc:
                     self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item.get("description", ""))
+                if show_desc:
                     y += desc_h
+                self._subitem_td_click_rects[idx] = (title_click_rect, desc_click_rect)
                 y += self.MEDIA_GAP
                 self._subitem_rects.append((idx, QRectF(pad, row_top, avail_w, y - row_top)))
             elif kind == "text":
@@ -3745,18 +3853,24 @@ class BoardCardItem(BaseComponentItem):
                 # overflowing text just kept drawing past its row height
                 # with nothing clipping it, so it visually bled underneath
                 # whatever subitem (e.g. an image) got painted after it.
+                title_h, title_font = self._sub_text_title_height(item, avail_w)
                 fm = QFontMetrics(sub_font)
                 needed_h = fm.boundingRect(
                     QRectF(0, 0, avail_w, 10000).toRect(), Qt.TextWordWrap, text
                 ).height() + 4
-                h = min(max(20, needed_h), remaining_h)
+                h = min(max(20, needed_h) + title_h, remaining_h)
                 r = QRectF(pad, y, avail_w, h)
                 if idx != self._sub_edit_index:
                     painter.save()
                     painter.setClipRect(r)
+                    if title_h:
+                        title_color = QColor(item.get("title_color")) if item.get("title_color") else text_color
+                        painter.setFont(title_font)
+                        painter.setPen(title_color)
+                        painter.drawText(QRectF(pad, y, avail_w, title_h), Qt.TextWordWrap, item.get("title", ""))
                     painter.setFont(sub_font)
                     painter.setPen(text_color)
-                    painter.drawText(r, Qt.TextWordWrap, text)
+                    painter.drawText(QRectF(pad, y + title_h, avail_w, h - title_h), Qt.TextWordWrap, text)
                     painter.restore()
                 y += h + 8
                 self._subitem_rects.append((idx, QRectF(pad, row_top, avail_w, y - row_top)))
@@ -3853,6 +3967,14 @@ class BoardCardItem(BaseComponentItem):
                     css_class = "sub-video"
                 rows.append(f'<div class="{css_class}">{t_html}{media}{d_html}</div>')
             elif kind == "text":
+                title_html = ""
+                if item.get("note_type") == "text" and item.get("show_title") and item.get("title"):
+                    title_text = (
+                        item.get("title", "")
+                        .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                        .replace("\n", "<br>")
+                    )
+                    title_html = f'<div style="font-weight:bold;margin-bottom:2px;">{title_text}</div>'
                 t = (
                     item.get("text", "")
                     .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -3881,7 +4003,7 @@ class BoardCardItem(BaseComponentItem):
                         style_bits.append(f"color:{color_to_css(item.get('color'))}")
                     style = ";".join(style_bits)
                     t = f'<span style="{style}">{t}</span>'
-                rows.append(f'<div class="sub-text">{t}</div>')
+                rows.append(f'<div class="sub-text">{title_html}{t}</div>')
             elif kind == "checklist":
                 lis = "".join(f'<li><input type="checkbox" disabled> {x}</li>' for x in item.get("items", []))
                 rows.append(f'<ul class="sub-checklist">{lis}</ul>')
@@ -4470,7 +4592,7 @@ def component_to_subitem(item):
         }
     if isinstance(item, (TextNoteItem, PlainTextItem)):
         f = item.text_item.font()
-        return {
+        d = {
             "kind": "text",
             "text": item.text_item.toPlainText(),
             # Which standalone component this came from, so dragging it
@@ -4487,6 +4609,14 @@ def component_to_subitem(item):
             "italic": f.italic(),
             "underline": f.underline(),
         }
+        if isinstance(item, TextNoteItem):
+            # A Text Note's own title (and whether it's shown) used to be
+            # dropped here entirely - dragging the note into a card, then
+            # back out, silently reset it to a hidden default "Title".
+            d["title"] = item.title_item.toPlainText()
+            d["show_title"] = item.show_title
+            d["title_font"] = _font_to_dict(item.title_item.font())
+        return d
     if isinstance(item, DrawingItem):
         img = QImage(max(1, int(item._w)), max(1, int(item._h)), QImage.Format_ARGB32)
         img.fill(Qt.transparent)
@@ -4552,6 +4682,9 @@ def subitem_to_component(subitem, x, y):
         )
         if cls is TextNoteItem:
             kwargs["text_color"] = subitem.get("text_color")
+            kwargs["title"] = subitem.get("title", "Title")
+            kwargs["show_title"] = subitem.get("show_title", False)
+            kwargs["title_font"] = subitem.get("title_font")
         return cls(x, y, **kwargs)
     if kind == "checklist":
         # No standalone checklist component exists yet, so fall back to a
@@ -4672,6 +4805,24 @@ class MindMapScene(QGraphicsScene):
         self.brush_opacity = 1.0  # 0..1, set via the opacity slider
         self._current_stroke_points = []
         self._current_preview_item = None
+    def bring_to_front(self, item):
+        """Raise `item` above every other component in its own "band" so
+        clicking/dragging it always brings it visually to the front,
+        instead of leaving it stuck at whatever z-order it happened to be
+        created in. Arrows use their own band, offset well above every
+        normal component (see ARROW_Z_OFFSET), so an arrow always stacks
+        over every other component type - even one that was JUST brought
+        to front - matching Arrow's "always on top" behavior. Computed
+        fresh from the scene's actual current z-values (rather than a
+        stored counter) so it stays correct across load/delete/undo."""
+        others = [it for it in self.items() if isinstance(it, BaseComponentItem) and it is not item]
+        if isinstance(item, ArrowItem):
+            band = [it.zValue() for it in others if isinstance(it, ArrowItem)]
+            floor = ARROW_Z_OFFSET
+        else:
+            band = [it.zValue() for it in others if not isinstance(it, ArrowItem)]
+            floor = 0
+        item.setZValue(max(band, default=floor - 1) + 1)
 
     # -- background dot grid ------------------------------------------
     # Dots are drawn in *scene* coordinates with a non-cosmetic pen, so
@@ -5110,7 +5261,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 def build_html_document(data):
     comps_html = []
     xs0, ys0, xs1, ys1 = [], [], [], []
-    for d in data.get("items", []):
+    # Render components in ascending z-order (lowest first) so the DOM
+    # order alone reproduces the same stacking as the app - browsers
+    # paint later-in-DOM elements on top of earlier ones by default (no
+    # z-index needed), so the item with the highest zValue() simply needs
+    # to be the LAST <div> emitted. Without this, exported HTML always
+    # stacked components in whatever order they happened to appear in
+    # `data["items"]`, ignoring each component's actual z position (e.g.
+    # an Arrow brought to front in the app, or any component moved/
+    # clicked to raise it) - see BaseComponentItem/ArrowItem/BoardCardItem
+    # mousePressEvent -> MindMapScene.bring_to_front.
+    items_sorted = sorted(data.get("items", []), key=lambda d: d.get("z", 0))
+    for d in items_sorted:
         item = deserialize_component(d)
         if item:
             comps_html.append(item.to_html())
@@ -5192,10 +5354,112 @@ class _FontFamilyCombo(QFontComboBox):
             self._restore_focus_cb()
 
 
+class NumberStepper(QWidget):
+    """Compact dark spinbox control that sits next to a QSlider, showing
+    its exact current value and letting it be nudged by exactly 1 (the
+    stacked up/down arrow buttons) or set directly by typing a number,
+    instead of only being draggable on the slider itself."""
+
+    valueChanged = Signal(int)
+
+    def __init__(self, minimum=0, maximum=100, parent=None):
+        super().__init__(parent)
+        self._min = minimum
+        self._max = maximum
+        self._value = minimum
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setObjectName("NumberStepper")
+        # Hard-fixed policy: without this, a parent layout with leftover
+        # space (like the toolbar here) can stretch this widget wider
+        # than its contents, which then get pinned to opposite edges -
+        # the number on the left, the arrows way off on the right.
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.edit = QLineEdit()
+        self.edit.setAlignment(Qt.AlignCenter)
+        self.edit.setValidator(QIntValidator(minimum, maximum, self))
+        self.edit.setFixedSize(38, 26)
+        self.edit.setFocusPolicy(Qt.ClickFocus)
+
+        # Up/down arrows stacked in their own thin column to the right of
+        # the number field, mimicking a native spinbox instead of the
+        # previous side-by-side '- [number] +' pill.
+        arrows = QWidget()
+        arrows.setFixedSize(16, 26)
+        arrows_layout = QVBoxLayout(arrows)
+        arrows_layout.setContentsMargins(0, 0, 0, 0)
+        arrows_layout.setSpacing(0)
+
+        self.up_btn = QPushButton("\u25B2")
+        self.down_btn = QPushButton("\u25BC")
+
+        for btn in (self.up_btn, self.down_btn):
+            btn.setFixedSize(16, 13)
+            # Same NoFocus reasoning as the sliders/color button elsewhere
+            # in the toolbar: keeps whatever text item is being edited
+            # (e.g. an Arrow's label) from losing focus/edit-mode the
+            # instant one of these is clicked.
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setCursor(Qt.PointingHandCursor)
+            arrows_layout.addWidget(btn)
+
+        layout.addWidget(self.edit)
+        layout.addWidget(arrows)
+
+        self.setStyleSheet("""
+            #NumberStepper { background:#2a2a2a; border:1px solid #3d3d3d; border-radius:5px; }
+            QLineEdit { background:transparent; color:#eaeaea; border:none; font-size:13px; padding-left:6px; }
+            QPushButton { background:#333333; color:#a8a8a8; border:none; font-size:7px; }
+            QPushButton:hover { color:#ffffff; background:#3d3d3d; }
+            QPushButton:pressed { background:#4a4a4a; }
+        """)
+        self.up_btn.setStyleSheet(self.up_btn.styleSheet() + "QPushButton { border-top-right-radius:4px; }")
+        self.down_btn.setStyleSheet(self.down_btn.styleSheet() + "QPushButton { border-bottom-right-radius:4px; }")
+
+        self.up_btn.clicked.connect(lambda: self.setValue(self._value + 1))
+        self.down_btn.clicked.connect(lambda: self.setValue(self._value - 1))
+        self.edit.editingFinished.connect(self._on_edit_finished)
+        self._sync_text()
+        self.setFixedSize(self.edit.width() + arrows.width(), 26)
+
+    def _sync_text(self):
+        self.edit.blockSignals(True)
+        self.edit.setText(str(self._value))
+        self.edit.blockSignals(False)
+
+    def _on_edit_finished(self):
+        try:
+            v = int(self.edit.text())
+        except ValueError:
+            v = self._value
+        self.setValue(v)
+
+    def setRange(self, minimum, maximum):
+        self._min, self._max = minimum, maximum
+        self.edit.setValidator(QIntValidator(minimum, maximum, self))
+        self.setValue(self._value)
+
+    def value(self):
+        return self._value
+
+    def setValue(self, v):
+        v = max(self._min, min(self._max, int(round(v))))
+        changed = v != self._value
+        self._value = v
+        self._sync_text()
+        if changed:
+            self.valueChanged.emit(v)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OpenNote \u2014 Milanote-style Mind Map")
+        self._title_base = "OpenNote \u2014 Milanote-style Mind Map"
+        self.setWindowTitle(self._title_base)
         self.resize(1440, 900)
         self.scene = MindMapScene(self)
         self.view = MindMapView(self.scene, self, self)
@@ -5268,6 +5532,29 @@ class MainWindow(QMainWindow):
             "Ready \u2014 Middle-mouse drag to pan \u00b7 Ctrl+Wheel to zoom \u00b7 Ctrl+D duplicate \u00b7 Drag a card onto a Board to nest it"
         )
         self._update_breadcrumb_bar()
+        # -- unsaved-changes tracking -------------------------------------
+        # A snapshot of the last saved (or freshly loaded/started) state,
+        # compared against the live scene on demand (_has_unsaved_changes)
+        # instead of trying to flag "dirty" from every individual edit
+        # site (move/resize/type/delete/...) - see _current_snapshot,
+        # _confirm_discard_changes, and closeEvent below.
+        self._saved_snapshot = None
+        self._update_saved_snapshot()
+        # Polls once a second rather than hooking every single mutation
+        # site (move/resize/type/delete/...) - cheap enough for this
+        # app's scale, and keeps the "*" prefix in sync without having to
+        # thread a dirty-flag update through every edit path.
+        self._title_timer = QTimer(self)
+        self._title_timer.timeout.connect(self._refresh_title_bar)
+        self._title_timer.start(1000)
+    def _set_base_title(self, title):
+        self._title_base = title
+        self._refresh_title_bar()
+    def _refresh_title_bar(self):
+        base = getattr(self, "_title_base", "OpenNote")
+        prefix = "*" if self._has_unsaved_changes() else ""
+        self.setWindowTitle(prefix + base)
+    # -- UI construction --------------------------------------------------
 
     # -- UI construction --------------------------------------------------
     def _build_menu(self):
@@ -5391,11 +5678,28 @@ class MainWindow(QMainWindow):
         self.color_btn.clicked.connect(self.pick_color)
         draw_tb.addWidget(self.color_btn)
 
-        draw_tb.addWidget(QLabel("  Size: "))
+        # -- Size group (label + slider + spinbox) -----------------------
+        # All three live in one small container with a fixed 8px gap
+        # between them, instead of being added to the toolbar as three
+        # separate widgets - the toolbar's own layout hands leftover
+        # horizontal space to whichever of its widgets can take it
+        # (sliders included), which was stretching them kilometers apart.
+        size_group = QWidget()
+        size_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        size_group_layout = QHBoxLayout(size_group)
+        size_group_layout.setContentsMargins(0, 0, 0, 0)
+        size_group_layout.setSpacing(8)
+        size_group_layout.addWidget(QLabel("  Size: "))
+
         self.size_slider = QSlider(Qt.Horizontal)
         self.size_slider.setRange(1, 40)
         self.size_slider.setValue(4)
         self.size_slider.setFixedWidth(140)
+        # QSlider defaults to an Expanding horizontal size policy - even
+        # capped at 140px above, that flag alone was enough for the
+        # surrounding layout to hand this group extra space it couldn't
+        # actually use, showing up as a gap. Pin it down explicitly.
+        self.size_slider.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         # Same reasoning as color_btn's NoFocus above: a QSlider grabs
         # keyboard focus by default, which would end whatever text item
         # is currently being edited (its focusOutEvent drops edit mode)
@@ -5404,16 +5708,39 @@ class MainWindow(QMainWindow):
         # actively focused/being edited.
         self.size_slider.setFocusPolicy(Qt.NoFocus)
         self.size_slider.valueChanged.connect(self.on_size_changed)
-        draw_tb.addWidget(self.size_slider)
+        size_group_layout.addWidget(self.size_slider)
 
-        draw_tb.addWidget(QLabel("  Opacity: "))
+        self.size_stepper = NumberStepper(1, 40)
+        self.size_stepper.setValue(4)
+        self.size_slider.valueChanged.connect(self.size_stepper.setValue)
+        self.size_stepper.valueChanged.connect(self.size_slider.setValue)
+        size_group_layout.addWidget(self.size_stepper)
+        draw_tb.addWidget(size_group)
+
+        # -- Opacity group (label + slider + spinbox) --------------------
+        opacity_group = QWidget()
+        opacity_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        opacity_group_layout = QHBoxLayout(opacity_group)
+        opacity_group_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_group_layout.setSpacing(8)
+        opacity_group_layout.addWidget(QLabel("  Opacity: "))
+
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(5, 100)
         self.opacity_slider.setValue(100)
         self.opacity_slider.setFixedWidth(120)
+        self.opacity_slider.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.opacity_slider.setFocusPolicy(Qt.NoFocus)
         self.opacity_slider.valueChanged.connect(self.on_opacity_changed)
-        draw_tb.addWidget(self.opacity_slider)
+        opacity_group_layout.addWidget(self.opacity_slider)
+
+        self.opacity_stepper = NumberStepper(5, 100)
+        self.opacity_stepper.setValue(100)
+        self.opacity_slider.valueChanged.connect(self.opacity_stepper.setValue)
+        self.opacity_stepper.valueChanged.connect(self.opacity_slider.setValue)
+        opacity_group_layout.addWidget(self.opacity_stepper)
+        draw_tb.addWidget(opacity_group)
+
 
         # -- line style control (Arrow only) -----------------------------
         # Hidden by default; on_selection_changed shows it only while at
@@ -5704,9 +6031,11 @@ class MainWindow(QMainWindow):
             self.size_slider.blockSignals(True)
             self.size_slider.setValue(int(max(1, min(40, round(font.pointSizeF())))))
             self.size_slider.blockSignals(False)
+            self.size_stepper.setValue(self.size_slider.value())
             self.opacity_slider.blockSignals(True)
             self.opacity_slider.setValue(int(max(5, min(100, round(first.opacity() * 100)))))
             self.opacity_slider.blockSignals(False)
+            self.opacity_stepper.setValue(self.opacity_slider.value())
             self.font_combo.blockSignals(True)
             self.font_combo.setCurrentFont(font)
             self.font_combo.blockSignals(False)
@@ -5734,9 +6063,11 @@ class MainWindow(QMainWindow):
             self.size_slider.blockSignals(True)
             self.size_slider.setValue(int(max(1, min(40, round(width)))))
             self.size_slider.blockSignals(False)
+            self.size_stepper.setValue(self.size_slider.value())
             self.opacity_slider.blockSignals(True)
             self.opacity_slider.setValue(int(max(5, min(100, round(col.alphaF() * 100)))))
             self.opacity_slider.blockSignals(False)
+            self.opacity_stepper.setValue(self.opacity_slider.value())
         elif other_sel:
             first = other_sel[0]
             col = QColor(first.color) if getattr(first, "color", None) else QColor(getattr(first, "DEFAULT_COLOR", None) or "#ffffff")
@@ -5746,9 +6077,11 @@ class MainWindow(QMainWindow):
             self.size_slider.blockSignals(True)
             self.size_slider.setValue(self.scene.brush_width)
             self.size_slider.blockSignals(False)
+            self.size_stepper.setValue(self.size_slider.value())
             self.opacity_slider.blockSignals(True)
             self.opacity_slider.setValue(int(self.scene.brush_opacity * 100))
             self.opacity_slider.blockSignals(False)
+            self.opacity_stepper.setValue(self.opacity_slider.value())
 
     def pick_color(self):
         editing_item = self._focused_text_item()
@@ -6181,14 +6514,74 @@ class MainWindow(QMainWindow):
                 self.delete_selection()
         super().keyPressEvent(event)
 
+    # -- unsaved-changes tracking -----------------------------------------
+    def _current_snapshot(self):
+        """A JSON snapshot of the board's actual content - used only for
+        comparing against _saved_snapshot, never actually written
+        anywhere itself. Deliberately excludes the view (pan/zoom) state
+        that _write_html also saves: just scrolling or zooming the canvas
+        isn't a "change" worth nagging the user to save."""
+        try:
+            return json.dumps(self.scene.serialize(), sort_keys=True)
+        except Exception:
+            # If anything about the scene is in a state that can't be
+            # serialized (shouldn't normally happen), don't let that
+            # crash the app or block closing over it - just treat it as
+            # "can't tell", which _has_unsaved_changes below reads as
+            # "nothing to warn about".
+            return None
+
+    def _update_saved_snapshot(self):
+        self._saved_snapshot = self._current_snapshot()
+        self._refresh_title_bar()
+
+    def _has_unsaved_changes(self):
+        current = self._current_snapshot()
+        if current is None or self._saved_snapshot is None:
+            return False
+        return current != self._saved_snapshot
+
+    def _confirm_discard_changes(self, title="Unsaved changes"):
+        """Ask whether to save, discard, or cancel before an action that
+        would lose the current board's unsaved changes (closing the
+        window, opening/navigating to a different board, clearing the
+        board for a new one). Returns True if it's safe to proceed."""
+        if not self._has_unsaved_changes():
+            return True
+        resp = QMessageBox.question(
+            self, title,
+            "This board has unsaved changes. Save them before continuing?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if resp == QMessageBox.Cancel:
+            return False
+        if resp == QMessageBox.Save:
+            self.save_board()
+            # save_board() falls back to Save As when there's no
+            # current_file yet - if the user then cancels *that* dialog,
+            # nothing actually got saved, so treat it the same as Cancel
+            # rather than continuing to lose the changes.
+            return not self._has_unsaved_changes()
+        return True  # Discard
+
+    def closeEvent(self, event):
+        if self._confirm_discard_changes(title="Quit OpenNote"):
+            event.accept()
+        else:
+            event.ignore()
+
     # -- file save / load -----------------------------------------------
     def new_board(self):
+        if not self._confirm_discard_changes(title="New board"):
+            return
         if QMessageBox.question(self, "New board", "Clear the current board?") == QMessageBox.Yes:
             self.scene.clear_board()
             self.current_file = None
             self.breadcrumb = [{"name": "Untitled", "file": None}]
             self._update_breadcrumb_bar()
-            self.setWindowTitle("OpenNote \u2014 Milanote-style Mind Map")
+            self._set_base_title("OpenNote \u2014 Milanote-style Mind Map")
+            self._update_saved_snapshot()
 
     def new_project(self):
         """Start a brand-new project: clear the board, then immediately
@@ -6197,6 +6590,8 @@ class MainWindow(QMainWindow):
         choose_or_create_project_folder/_ensure_project_and_file, and
         BoardLinkItem for how sibling boards later attach to that same
         folder."""
+        if not self._confirm_discard_changes(title="New project"):
+            return
         if self.scene.items() and QMessageBox.question(
             self, "New project", "Clear the current board and start a new project?"
         ) != QMessageBox.Yes:
@@ -6207,6 +6602,7 @@ class MainWindow(QMainWindow):
         self.breadcrumb = [{"name": "Untitled", "file": None}]
         self._update_breadcrumb_bar()
         self._ensure_project_and_file()
+        self._update_saved_snapshot()
 
     def choose_or_create_project_folder(self, title="Choose Project Folder"):
         """Ask the user to pick an existing folder - or create a new one -
@@ -6274,7 +6670,7 @@ class MainWindow(QMainWindow):
         self.project_dir = folder
         self._write_html(path)
         self.current_file = path
-        self.setWindowTitle(f"OpenNote \u2014 {basename}")
+        self._set_base_title(f"OpenNote \u2014 {basename}")
         self._update_breadcrumb_bar()
         return True
 
@@ -6303,7 +6699,7 @@ class MainWindow(QMainWindow):
             self._write_html(path)
             self.current_file = path
             self.project_dir = os.path.dirname(path)
-            self.setWindowTitle(f"OpenNote \u2014 {basename}")
+            self._set_base_title(f"OpenNote \u2014 {basename}")
             self._update_breadcrumb_bar()
 
     def _write_html(self, path):
@@ -6315,10 +6711,13 @@ class MainWindow(QMainWindow):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(html)
             self.statusBar().showMessage(f"Saved: {path}", 4000)
+            self._update_saved_snapshot()
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))
 
     def open_board(self):
+        if not self._confirm_discard_changes(title="Open board"):
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Open board", "", "HTML files (*.html)")
         if not path:
             return
@@ -6334,6 +6733,8 @@ class MainWindow(QMainWindow):
         lose."""
         path = os.path.normpath(path)
         if self.current_file and os.path.normpath(self.current_file) == path:
+            return
+        if not self._confirm_discard_changes(title="Navigate away"):
             return
         self._load_board_file(path, error_title="Navigation failed")
 
@@ -6353,9 +6754,10 @@ class MainWindow(QMainWindow):
             self.breadcrumb = data.get("breadcrumb") or [
                 {"name": os.path.splitext(basename)[0], "file": basename}
             ]
-            self.setWindowTitle(f"OpenNote \u2014 {basename}")
+            self._set_base_title(f"OpenNote \u2014 {basename}")
             self.statusBar().showMessage(f"Opened: {path}", 4000)
             self._update_breadcrumb_bar()
+            self._update_saved_snapshot()
         except Exception as e:
             QMessageBox.critical(self, error_title, str(e))
 
