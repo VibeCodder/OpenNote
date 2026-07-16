@@ -38,7 +38,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsObject,
-    QGraphicsItem, QGraphicsTextItem, QGraphicsPathItem, QGraphicsProxyWidget,
+    QGraphicsItem, QGraphicsTextItem, QGraphicsPathItem, QGraphicsRectItem, QGraphicsProxyWidget,
     QToolBar, QFileDialog, QColorDialog, QMessageBox, QSlider, QComboBox,
     QPushButton, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QToolButton,
     QFontComboBox, QInputDialog, QCompleter, QCheckBox,
@@ -626,6 +626,7 @@ class BaseComponentItem(QGraphicsObject):
         self.setFlags(
             QGraphicsItem.ItemIsMovable
             | QGraphicsItem.ItemIsSelectable
+            | QGraphicsItem.ItemSendsGeometryChanges
         )
         self.setAcceptHoverEvents(True)
         self.min_w, self.min_h = 80, 60
@@ -645,12 +646,27 @@ class BaseComponentItem(QGraphicsObject):
     def rect(self):
         return QRectF(0, 0, self._w, self._h)
 
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionHasChanged:
+            self._notify_arrows_moved()
+        return super().itemChange(change, value)
+
+    def _notify_arrows_moved(self):
+        """Tell the scene to re-position any arrow endpoint anchored to
+        this item - called whenever this item moves (itemChange above)
+        or is resized (set_size below), so an anchored arrow tracks the
+        component live instead of only updating on the next drag."""
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "refresh_anchored_arrows"):
+            scene.refresh_anchored_arrows()
+
     def set_size(self, w, h):
         self.prepareGeometryChange()
         self._w = max(self.min_w, w)
         self._h = max(self.min_h, h)
         self.on_resized()
         self.update()
+        self._notify_arrows_moved()
 
     def on_resized(self):
         pass
@@ -2098,7 +2114,8 @@ class ArrowItem(BaseComponentItem):
 
     def __init__(self, x=0, y=0, w=160, h=90, p1=None, p2=None, color=None,
                  stroke_width=4, style="single", line_style="solid", item_id=None,
-                 label="", show_label=False, label_font=None, label_color=None):
+                 label="", show_label=False, label_font=None, label_color=None,
+                 anchor1=None, anchor2=None):
         super().__init__(x, y, max(1.0, w), max(1.0, h), item_id)
         self.color = color or self.DEFAULT_COLOR
         self.stroke_width = stroke_width
@@ -2108,6 +2125,20 @@ class ArrowItem(BaseComponentItem):
         self.p1 = QPointF(*p1) if p1 else QPointF(self.PAD, self._h - self.PAD)
         self.p2 = QPointF(*p2) if p2 else QPointF(self._w - self.PAD, self.PAD)
         self._drag_endpoint = None  # 1, 2, or None while dragging an end
+        # Anchors let an endpoint stick to (and follow) a Board Card,
+        # Text Note, or media component instead of a fixed scene point.
+        # Each is None or {"item": <component>, "rx": 0..1, "ry": 0..1}
+        # (rx/ry are the anchor point as a fraction of the target's own
+        # width/height, so it keeps tracking correctly across both moves
+        # and resizes of the target - see refresh_anchors()). Raw
+        # {"item_id","rx","ry"} dicts loaded from disk are held in the
+        # _pending_* attrs until resolve_pending_anchors() can look up
+        # the actual item objects (which may not exist yet mid-load).
+        self.anchor1 = None
+        self.anchor2 = None
+        self._pending_anchor1 = anchor1
+        self._pending_anchor2 = anchor2
+        self._drag_hover_target = None
 
         # An optional pill-shaped label centered on the line's midpoint,
         # toggled from the context menu (see _build_context_menu /
@@ -2245,6 +2276,24 @@ class ArrowItem(BaseComponentItem):
                 # snapping every 45 degrees.
                 pivot = self.mapToScene(self.p2 if self._drag_endpoint == 1 else self.p1)
                 scene_pt = self._snap_to_angle(pivot, scene_pt)
+            target = self._find_anchor_target(scene_pt)
+            self._drag_hover_target = target
+            scene = self.scene()
+            if scene is not None and hasattr(scene, "show_anchor_highlight"):
+                scene.show_anchor_highlight(target)
+            if target is not None:
+                # Preview the edge point it would snap to if dropped here
+                # (see _anchor_scene_point). This must face the *current
+                # cursor position*, not the arrow's other, still-fixed
+                # endpoint - using the far endpoint here made the preview
+                # only ever land on whichever edge happened to face that
+                # fixed point (e.g. always bottom/right), no matter which
+                # side of the target the cursor was actually hovering
+                # over. The far endpoint is still what's used afterwards,
+                # once anchored, to keep the point facing the other end
+                # as things move (see refresh_anchors).
+                preview_anchor = {"item": target, "rx": 0.5, "ry": 0.5}
+                scene_pt = self._anchor_scene_point(preview_anchor, scene_pt)
             if self._drag_endpoint == 1:
                 self._sync_geometry(scene_pt, self.mapToScene(self.p2))
             else:
@@ -2253,9 +2302,165 @@ class ArrowItem(BaseComponentItem):
             return
         super().mouseMoveEvent(event)
 
+    # How far outside a component's own rectangle an endpoint can still
+    # be dragged and have that component detected as the anchor target
+    # (see _find_anchor_target). Without this margin, only literal
+    # containment counted - and since you naturally drift *into* a
+    # component while approaching its bottom/right side but tend to stop
+    # just *outside* it while approaching from the top/left, snapping
+    # only ever seemed to work for the bottom/right edges.
+    ANCHOR_HOVER_MARGIN = 40
+
+    def _find_anchor_target(self, scene_pt):
+        """Return the topmost Board Card / Text Note / media component
+        whose rectangle - expanded by ANCHOR_HOVER_MARGIN on every side -
+        contains `scene_pt`, or None. Used while dragging an endpoint to
+        decide what it would anchor to if dropped here."""
+        scene = self.scene()
+        if scene is None:
+            return None
+        best, best_z = None, None
+        for it in scene.items():
+            if it is self or it is self.label_item:
+                continue
+            if not isinstance(it, ANCHOR_TARGET_TYPES):
+                continue
+            rect = it.sceneBoundingRect().adjusted(
+                -self.ANCHOR_HOVER_MARGIN, -self.ANCHOR_HOVER_MARGIN,
+                self.ANCHOR_HOVER_MARGIN, self.ANCHOR_HOVER_MARGIN,
+            )
+            if rect.contains(scene_pt) and (best is None or it.zValue() > best_z):
+                best, best_z = it, it.zValue()
+        return best
+
+    def _set_anchor(self, endpoint, target, scene_pt):
+        local = target.mapFromScene(scene_pt)
+        w = max(1.0, target._w)
+        h = max(1.0, target._h)
+        rx = max(0.0, min(1.0, local.x() / w))
+        ry = max(0.0, min(1.0, local.y() / h))
+        anchor = {"item": target, "rx": rx, "ry": ry}
+        if endpoint == 1:
+            self.anchor1 = anchor
+        else:
+            self.anchor2 = anchor
+
+    def _anchor_center_scene(self, anchor):
+        """Scene-space center of an anchor's target - used as the
+        "other end" reference when both of an arrow's endpoints are
+        anchored (see refresh_anchors)."""
+        target = anchor["item"]
+        w = max(1.0, target._w)
+        h = max(1.0, target._h)
+        return target.mapToScene(QPointF(w / 2.0, h / 2.0))
+
+    def _anchor_scene_point(self, anchor, other_scene_pt):
+        """Where an anchored endpoint actually sits: the point on the
+        *outer border* of the target's rectangle, in the direction from
+        the target's center towards `other_scene_pt` (the arrow's other
+        endpoint, or its target's center if that end is anchored too).
+
+        This is what makes an anchored endpoint "orbit" the target
+        correctly - as the other end moves around, this point slides
+        along the target's edge to keep facing it - and always hugs the
+        border instead of sitting at a fixed spot that can end up buried
+        inside the component. rx/ry (still stored on the anchor for the
+        save file) are no longer used to place the point; they're only
+        the drop location recorded when the anchor was created.
+        """
+        target = anchor["item"]
+        w = max(1.0, target._w)
+        h = max(1.0, target._h)
+        local_other = target.mapFromScene(other_scene_pt)
+        cx, cy = w / 2.0, h / 2.0
+        dx, dy = local_other.x() - cx, local_other.y() - cy
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            dx, dy = 0.0, -1.0  # other point sits on the center: pick a default facing
+        tx = (w / 2.0) / abs(dx) if abs(dx) > 1e-9 else float("inf")
+        ty = (h / 2.0) / abs(dy) if abs(dy) > 1e-9 else float("inf")
+        t = min(tx, ty)
+        local_edge = QPointF(cx + dx * t, cy + dy * t)
+        return target.mapToScene(local_edge)
+
+    def refresh_anchors(self):
+        """Recompute this arrow's geometry from whichever endpoints are
+        anchored, so it keeps following its target(s) - hugging their
+        outer edge - after they move or resize. Called by the scene (see
+        MindMapScene.refresh_anchored_arrows) whenever any component
+        changes, and also right after an endpoint is (dis)connected in
+        mouseReleaseEvent - a no-op if neither end is anchored."""
+        if self.anchor1 is None and self.anchor2 is None:
+            return
+        p1_scene = self.mapToScene(self.p1)
+        p2_scene = self.mapToScene(self.p2)
+        # The reference each anchor orbits toward is the opposite end's
+        # current point - or, if that end is anchored too, its target's
+        # center, so two anchored components stay correctly edge-clamped
+        # against each other rather than drifting toward last frame's
+        # raw point.
+        ref_for_1 = self._anchor_center_scene(self.anchor2) if self.anchor2 else p2_scene
+        ref_for_2 = self._anchor_center_scene(self.anchor1) if self.anchor1 else p1_scene
+        changed = False
+        # While the user is actively dragging one of this arrow's own
+        # endpoints, leave that endpoint alone here. This method also
+        # runs *reentrantly* mid-drag - moving the arrow (via the drag's
+        # own _sync_geometry call) triggers setPos(), which triggers this
+        # same refresh via the scene - and if the endpoint being dragged
+        # is itself the anchored one, recomputing it here would instantly
+        # snap it back onto the target, making it look impossible to pull
+        # the anchored endpoint away at all.
+        if self.anchor1 is not None and self._drag_endpoint != 1:
+            target = self.anchor1.get("item")
+            if target is None or target.scene() is None:
+                self.anchor1 = None
+            else:
+                p1_scene = self._anchor_scene_point(self.anchor1, ref_for_1)
+                changed = True
+        if self.anchor2 is not None and self._drag_endpoint != 2:
+            target = self.anchor2.get("item")
+            if target is None or target.scene() is None:
+                self.anchor2 = None
+            else:
+                p2_scene = self._anchor_scene_point(self.anchor2, ref_for_2)
+                changed = True
+        if changed:
+            self._sync_geometry(p1_scene, p2_scene)
+
+    def resolve_pending_anchors(self, id_map):
+        """Turn the {"item_id","rx","ry"} dicts loaded from disk into
+        real anchor1/anchor2 references - called once after every item
+        in the board has been created (see MindMapScene.load), since the
+        anchor's target may not have existed yet at this arrow's own
+        construction time."""
+        pending1 = self._pending_anchor1
+        if pending1:
+            target = id_map.get(pending1.get("item_id"))
+            if target is not None:
+                self.anchor1 = {"item": target, "rx": pending1.get("rx", 0.5), "ry": pending1.get("ry", 0.5)}
+        self._pending_anchor1 = None
+        pending2 = self._pending_anchor2
+        if pending2:
+            target = id_map.get(pending2.get("item_id"))
+            if target is not None:
+                self.anchor2 = {"item": target, "rx": pending2.get("rx", 0.5), "ry": pending2.get("ry", 0.5)}
+        self._pending_anchor2 = None
+
     def mouseReleaseEvent(self, event):
         if self._drag_endpoint is not None:
+            endpoint = self._drag_endpoint
+            target = self._drag_hover_target
+            scene = self.scene()
+            if scene is not None and hasattr(scene, "hide_anchor_highlight"):
+                scene.hide_anchor_highlight()
+            if target is not None:
+                self._set_anchor(endpoint, target, event.scenePos())
+            elif endpoint == 1:
+                self.anchor1 = None
+            else:
+                self.anchor2 = None
+            self._drag_hover_target = None
             self._drag_endpoint = None
+            self.refresh_anchors()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -2267,11 +2472,21 @@ class ArrowItem(BaseComponentItem):
         x1 = max(p1_scene.x(), p2_scene.x()) + pad
         y1 = max(p1_scene.y(), p2_scene.y()) + pad
         self.prepareGeometryChange()
-        self.setPos(x0, y0)
+        # Update the local fields *before* setPos(). setPos() synchronously
+        # triggers itemChange -> _notify_arrows_moved -> the scene's
+        # anchored-arrow refresh, which includes THIS arrow (an anchored
+        # endpoint always re-syncs whenever the arrow itself moves, so it
+        # keeps facing its target). If p1/p2 were still their old values
+        # at that point, that nested refresh would read stale local
+        # points paired with the item's already-new position - a mismatch
+        # that computes a bogus scene point, which showed up as the
+        # anchored endpoint jumping into the middle of its target or off
+        # to an unrelated spot while the other endpoint was being dragged.
         self._w = max(1.0, x1 - x0)
         self._h = max(1.0, y1 - y0)
         self.p1 = QPointF(p1_scene.x() - x0, p1_scene.y() - y0)
         self.p2 = QPointF(p2_scene.x() - x0, p2_scene.y() - y0)
+        self.setPos(x0, y0)
         self._layout_label()
         self.update()
 
@@ -2395,10 +2610,24 @@ class ArrowItem(BaseComponentItem):
             painter.drawPath(self._arrow_head_path(self.p1, -ux, -uy))
 
         if self.isSelected():
-            painter.setPen(QPen(QColor("#4c8bf5"), 1.5))
-            painter.setBrush(QColor("#4c8bf5"))
-            painter.drawEllipse(self.p1, self.ENDPOINT_R, self.ENDPOINT_R)
-            painter.drawEllipse(self.p2, self.ENDPOINT_R, self.ENDPOINT_R)
+            # Anchored endpoints are drawn differently from free ones (a
+            # green core plus an outer ring, vs. plain blue) so it's
+            # obvious at a glance which end is stuck to a component - and
+            # therefore that dragging it away is how you detach it. With
+            # both endpoints looking identical there was no visual cue
+            # that an anchor existed at all.
+            for pt, anchor in ((self.p1, self.anchor1), (self.p2, self.anchor2)):
+                if anchor is not None:
+                    painter.setPen(QPen(QColor("#ffffff"), 2))
+                    painter.setBrush(QColor("#34c759"))
+                    painter.drawEllipse(pt, self.ENDPOINT_R, self.ENDPOINT_R)
+                    painter.setPen(QPen(QColor("#34c759"), 1.5))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawEllipse(pt, self.ENDPOINT_R + 3, self.ENDPOINT_R + 3)
+                else:
+                    painter.setPen(QPen(QColor("#4c8bf5"), 1.5))
+                    painter.setBrush(QColor("#4c8bf5"))
+                    painter.drawEllipse(pt, self.ENDPOINT_R, self.ENDPOINT_R)
 
         label_rect = self._label_rect()
         if label_rect is not None:
@@ -2462,6 +2691,14 @@ class ArrowItem(BaseComponentItem):
         d["show_label"] = self.show_label
         d["label_font"] = _font_to_dict(self.label_item.font())
         d["label_color"] = self.label_item.defaultTextColor().name()
+        d["anchor1"] = (
+            {"item_id": self.anchor1["item"].id, "rx": self.anchor1["rx"], "ry": self.anchor1["ry"]}
+            if self.anchor1 else None
+        )
+        d["anchor2"] = (
+            {"item_id": self.anchor2["item"].id, "rx": self.anchor2["rx"], "ry": self.anchor2["ry"]}
+            if self.anchor2 else None
+        )
         return d
 
     def to_html(self):
@@ -4694,6 +4931,9 @@ def subitem_to_component(subitem, x, y):
     return None
 
 
+ANCHOR_TARGET_TYPES = (TextNoteItem, ImageItem, GifItem, VideoItem, BoardCardItem)
+
+
 def deserialize_component(d):
     t = d.get("type")
     x, y, w, h = d.get("x", 0), d.get("y", 0), d.get("w", 200), d.get("h", 150)
@@ -4754,6 +4994,8 @@ def deserialize_component(d):
             show_label=d.get("show_label", False),
             label_font=d.get("label_font"),
             label_color=d.get("label_color"),
+            anchor1=d.get("anchor1"),
+            anchor2=d.get("anchor2"),
         )
     elif t == "board":
         item = BoardCardItem(x, y, w, h, title=d.get("title", "Board"), subitems=d.get("subitems", []), item_id=item_id)
@@ -4803,8 +5045,12 @@ class MindMapScene(QGraphicsScene):
         self.brush_width = 4
         self.brush_type = "pen"  # pen, marker, highlighter
         self.brush_opacity = 1.0  # 0..1, set via the opacity slider
+        self.erase_mode = False  # toggled by the Draw toolbar's Eraser checkbox
+        self._erasing = False
         self._current_stroke_points = []
         self._current_preview_item = None
+        self._anchor_highlight_item = None
+        self._anchors_refreshing = False
     def bring_to_front(self, item):
         """Raise `item` above every other component in its own "band" so
         clicking/dragging it always brings it visually to the front,
@@ -4823,6 +5069,59 @@ class MindMapScene(QGraphicsScene):
             band = [it.zValue() for it in others if not isinstance(it, ArrowItem)]
             floor = 0
         item.setZValue(max(band, default=floor - 1) + 1)
+
+    # -- arrow endpoint anchoring (Board Card / Text Note / media) ------
+    def _ensure_anchor_highlight(self):
+        hl = self._anchor_highlight_item
+        if hl is None:
+            hl = QGraphicsRectItem()
+            hl.setPen(QPen(QColor("#ffffff"), 2))
+            hl.setBrush(Qt.NoBrush)
+            hl.setZValue(ARROW_Z_OFFSET + 1)
+            hl.setVisible(False)
+            self.addItem(hl)
+            self._anchor_highlight_item = hl
+        return hl
+
+    def show_anchor_highlight(self, target_item):
+        """Draw (or hide, if target_item is None) a white outline over a
+        component while an arrow endpoint is being dragged over it - the
+        visual cue that releasing here will anchor the endpoint to it."""
+        hl = self._ensure_anchor_highlight()
+        if target_item is None:
+            hl.setVisible(False)
+            return
+        rect = target_item.mapToScene(target_item.rect()).boundingRect()
+        hl.setRect(rect)
+        hl.setVisible(True)
+
+    def hide_anchor_highlight(self):
+        self.show_anchor_highlight(None)
+
+    def refresh_anchored_arrows(self):
+        """Re-sync every arrow that has an anchored endpoint - called by
+        BaseComponentItem whenever a component moves or resizes, so
+        anchored arrows keep following it live. Guarded against
+        reentrancy since an arrow repositioning itself also triggers
+        this same notification."""
+        if self._anchors_refreshing:
+            return
+        self._anchors_refreshing = True
+        try:
+            for it in self.items():
+                if isinstance(it, ArrowItem):
+                    it.refresh_anchors()
+        finally:
+            self._anchors_refreshing = False
+
+    def removeItem(self, item):
+        for it in self.items():
+            if isinstance(it, ArrowItem) and it is not item:
+                if it.anchor1 is not None and it.anchor1.get("item") is item:
+                    it.anchor1 = None
+                if it.anchor2 is not None and it.anchor2.get("item") is item:
+                    it.anchor2 = None
+        super().removeItem(item)
 
     # -- background dot grid ------------------------------------------
     # Dots are drawn in *scene* coordinates with a non-cosmetic pen, so
@@ -4871,7 +5170,78 @@ class MindMapScene(QGraphicsScene):
         pen.setJoinStyle(Qt.RoundJoin)
         return pen
 
+    # -- eraser (Draw mode's Eraser checkbox) ----------------------------
+    ERASER_RADIUS = 16
+
+    def _erase_at(self, scene_pt):
+        """Remove whatever part of any DrawingItem's strokes fall within
+        ERASER_RADIUS of `scene_pt` - splitting a stroke into separate
+        pieces around the erased gap rather than deleting the whole
+        stroke, so only the part the cursor actually passed over
+        disappears."""
+        radius = self.ERASER_RADIUS
+        margin = radius + 60
+        search_rect = QRectF(scene_pt.x() - margin, scene_pt.y() - margin, margin * 2, margin * 2)
+        for it in list(self.items(search_rect)):
+            if not isinstance(it, DrawingItem):
+                continue
+            local_pt = scene_pt - it.pos()
+            new_strokes = []
+            changed = False
+            for s in it.strokes:
+                pts = s.get("points", [])
+                pieces = self._split_stroke_by_eraser(pts, local_pt, radius)
+                if len(pieces) != 1 or pieces[0] is not pts:
+                    changed = True
+                for piece in pieces:
+                    if len(piece) >= 2:
+                        new_strokes.append({
+                            "color": s.get("color", "#ffffff"),
+                            "width": s.get("width", 3),
+                            "points": piece,
+                        })
+            if changed:
+                it.prepareGeometryChange()
+                it.strokes = new_strokes
+                if not it.strokes:
+                    self.removeItem(it)
+                else:
+                    it.update()
+
+    @staticmethod
+    def _split_stroke_by_eraser(points, center, radius):
+        """Cut `points` (a stroke's polyline, in the item's own local
+        coordinates) into however many pieces remain once every point
+        within `radius` of `center` is removed. Returns [points]
+        unchanged (same list object) if nothing was actually touched, so
+        the caller can cheaply tell whether anything changed."""
+        if not points:
+            return [points]
+        r2 = radius * radius
+        pieces = []
+        current = []
+        touched = False
+        for p in points:
+            dx, dy = p[0] - center.x(), p[1] - center.y()
+            if dx * dx + dy * dy <= r2:
+                touched = True
+                if len(current) >= 2:
+                    pieces.append(current)
+                current = []
+            else:
+                current.append(p)
+        if len(current) >= 2:
+            pieces.append(current)
+        if not touched:
+            return [points]
+        return pieces
+
     def mousePressEvent(self, event):
+        if self.draw_mode and self.erase_mode and event.button() == Qt.LeftButton:
+            self._erasing = True
+            self._erase_at(event.scenePos())
+            event.accept()
+            return
         if self.draw_mode and event.button() == Qt.LeftButton:
             pos = event.scenePos()
             self._current_stroke_points = [pos]
@@ -4890,6 +5260,10 @@ class MindMapScene(QGraphicsScene):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self.draw_mode and self.erase_mode and self._erasing:
+            self._erase_at(event.scenePos())
+            event.accept()
+            return
         if self.draw_mode and self._current_preview_item is not None:
             self._current_stroke_points.append(event.scenePos())
             path = QPainterPath()
@@ -4902,6 +5276,10 @@ class MindMapScene(QGraphicsScene):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self.draw_mode and self.erase_mode:
+            self._erasing = False
+            event.accept()
+            return
         if self.draw_mode and self._current_preview_item is not None:
             pts = self._current_stroke_points
             self.removeItem(self._current_preview_item)
@@ -5001,10 +5379,16 @@ class MindMapScene(QGraphicsScene):
 
     def load(self, data):
         self.clear_board()
+        items = []
         for d in data.get("items", []):
             item = deserialize_component(d)
             if item:
                 self.addItem(item)
+                items.append(item)
+        id_map = {it.id: it for it in items}
+        for it in items:
+            if isinstance(it, ArrowItem):
+                it.resolve_pending_anchors(id_map)
 
 
 # --------------------------------------------------------------------------
@@ -5538,6 +5922,25 @@ class MainWindow(QMainWindow):
         # see _restore_text_edit_focus.
         self._last_edited_text_item = None
 
+        # -- undo / redo -----------------------------------------------
+        # Coarse but reliable: rather than a QUndoCommand per interaction
+        # (every move/resize/text-edit/table-edit/property-change site
+        # would need its own hook), we lean on the serialize()/load()
+        # round-trip the app already has for save/open. Every settled
+        # change to the scene gets captured as one more full-board JSON
+        # snapshot in _undo_stack; undo/redo just swaps to the
+        # neighboring snapshot. See _commit_undo_checkpoint for how
+        # "settled" is decided.
+        self.MAX_UNDO_STEPS = 100
+        self._undo_stack = []       # past snapshots (JSON strings), oldest first
+        self._redo_stack = []       # snapshots undone away from, most recent last
+        self._undo_baseline = None  # JSON snapshot of the current committed state
+        self._undo_restoring = False  # True while undo()/redo() itself is loading a snapshot
+        self._undo_commit_timer = QTimer(self)
+        self._undo_commit_timer.setSingleShot(True)
+        self._undo_commit_timer.setInterval(600)
+        self._undo_commit_timer.timeout.connect(self._commit_undo_checkpoint)
+
         self._build_toolbar()
         self.scene.selectionChanged.connect(self.on_selection_changed)
         # Entering/leaving in-place text edit mode doesn't change the
@@ -5545,6 +5948,16 @@ class MainWindow(QMainWindow):
         # needs to know about it too (it targets text color while editing,
         # component color otherwise), so refresh on focus changes as well.
         self.scene.focusItemChanged.connect(self.on_selection_changed)
+        # scene.changed fires for every visual change (move/resize/type/
+        # draw/delete/property edits alike) - debounced via the timer
+        # above so a whole drag or typing burst becomes one undo step
+        # instead of one per pixel/keystroke. selectionChanged/
+        # focusItemChanged additionally flush right away when there IS a
+        # pending change, so e.g. finishing a text edit by clicking
+        # another item doesn't wait out the full debounce.
+        self.scene.changed.connect(self._on_scene_changed_for_undo)
+        self.scene.selectionChanged.connect(self._flush_pending_undo_checkpoint)
+        self.scene.focusItemChanged.connect(self._flush_pending_undo_checkpoint)
         self._build_menu()
         self.statusBar().showMessage(
             "Ready \u2014 Middle-mouse drag to pan \u00b7 Ctrl+Wheel to zoom \u00b7 Ctrl+D duplicate \u00b7 Drag a card onto a Board to nest it"
@@ -5565,6 +5978,7 @@ class MainWindow(QMainWindow):
         self._title_timer = QTimer(self)
         self._title_timer.timeout.connect(self._refresh_title_bar)
         self._title_timer.start(1000)
+        self._reset_undo_history()
     def _set_base_title(self, title):
         self._title_base = title
         self._refresh_title_bar()
@@ -5587,6 +6001,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction("Exit", self.close)
 
         edit_menu = m.addMenu("&Edit")
+        self.undo_action = edit_menu.addAction("Undo", self.undo, QKeySequence("Ctrl+Z"))
+        self.redo_action = edit_menu.addAction("Redo", self.redo)
+        self.redo_action.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+        self.undo_action.setEnabled(False)
+        self.redo_action.setEnabled(False)
+        edit_menu.addSeparator()
         edit_menu.addAction("Copy", self.copy_selection, QKeySequence.Copy)
         edit_menu.addAction("Paste", self.paste_clipboard, QKeySequence.Paste)
         edit_menu.addAction("Duplicate", self.duplicate_selection, QKeySequence("Ctrl+D"))
@@ -5760,6 +6180,20 @@ class MainWindow(QMainWindow):
         draw_tb.addWidget(opacity_group)
 
 
+        # -- arrow style control (Arrow only) -----------------------------
+        # Same idea as Line style below, but for the arrowhead kind
+        # itself (single/double head, or a plain line with no head) -
+        # previously only reachable via the right-click "Arrow Style"
+        # submenu.
+        self.arrow_style_label_action = draw_tb.addWidget(QLabel("  Arrow: "))
+        self.arrow_style_combo = QComboBox()
+        for st in ArrowItem.STYLES:
+            self.arrow_style_combo.addItem(ArrowItem.STYLE_LABELS[st], st)
+        self.arrow_style_combo.currentIndexChanged.connect(self.on_arrow_style_changed)
+        self.arrow_style_action = draw_tb.addWidget(self.arrow_style_combo)
+        self.arrow_style_label_action.setVisible(False)
+        self.arrow_style_action.setVisible(False)
+
         # -- line style control (Arrow only) -----------------------------
         # Hidden by default; on_selection_changed shows it only while at
         # least one arrow is selected, so choosing solid/dashed/dash-dot
@@ -5896,6 +6330,17 @@ class MainWindow(QMainWindow):
         self.link_btn.clicked.connect(self.on_hyperlink_clicked)
         self.link_action = draw_tb.addWidget(self.link_btn)
 
+        # Placed last on the toolbar (rather than beside Brush, where it
+        # used to live) so it always sits at the far end of the bar.
+        self.eraser_checkbox = QCheckBox("  Eraser")
+        self.eraser_checkbox.setFocusPolicy(Qt.NoFocus)
+        self.eraser_checkbox.setStyleSheet("margin-left: 8px;")
+        self.eraser_checkbox.toggled.connect(self.on_eraser_toggled)
+        self.eraser_checkbox_action = draw_tb.addWidget(self.eraser_checkbox)
+        # Only meaningful while actively drawing - hidden the rest of the
+        # time (see toggle_draw_mode), same as the Brush combo above.
+        self.eraser_checkbox_action.setVisible(False)
+
         self._font_format_actions = [
             self.text_format_sep, self.font_label_action, self.font_action,
             self.bold_action, self.italic_action, self.underline_action,
@@ -5989,11 +6434,17 @@ class MainWindow(QMainWindow):
 
         self.line_style_label_action.setVisible(bool(arrow_sel))
         self.line_style_action.setVisible(bool(arrow_sel))
+        self.arrow_style_label_action.setVisible(bool(arrow_sel))
+        self.arrow_style_action.setVisible(bool(arrow_sel))
         if arrow_sel:
             self.line_style_combo.blockSignals(True)
             idx = self.line_style_combo.findData(arrow_sel[0].line_style)
             self.line_style_combo.setCurrentIndex(max(0, idx))
             self.line_style_combo.blockSignals(False)
+            self.arrow_style_combo.blockSignals(True)
+            idx = self.arrow_style_combo.findData(arrow_sel[0].style)
+            self.arrow_style_combo.setCurrentIndex(max(0, idx))
+            self.arrow_style_combo.blockSignals(False)
 
         self._text_note_selection = text_note_sel or None
         self.title_checkbox_action.setVisible(bool(text_note_sel))
@@ -6299,6 +6750,16 @@ class MainWindow(QMainWindow):
             it.line_style = ls
             it.update()
 
+    def on_arrow_style_changed(self, index):
+        if not self._arrow_selection:
+            return
+        st = self.arrow_style_combo.itemData(index)
+        if not st:
+            return
+        for it in self._arrow_selection:
+            it.style = st
+            it.update()
+
     def on_title_toggled(self, checked):
         if not getattr(self, "_text_note_selection", None):
             return
@@ -6332,8 +6793,18 @@ class MainWindow(QMainWindow):
         self.view.setDragMode(QGraphicsView.NoDrag if checked else QGraphicsView.RubberBandDrag)
         self.brush_label_action.setVisible(checked)
         self.brush_combo_action.setVisible(checked)
+        self.eraser_checkbox_action.setVisible(checked)
+        if not checked:
+            self.eraser_checkbox.setChecked(False)
         self.statusBar().showMessage(
             "Draw mode ON \u2014 click and drag on the canvas to sketch" if checked else "Ready"
+        )
+
+    def on_eraser_toggled(self, checked):
+        self.scene.erase_mode = checked
+        self.statusBar().showMessage(
+            "Eraser ON \u2014 drag over a sketch to erase it" if checked
+            else "Draw mode ON \u2014 click and drag on the canvas to sketch"
         )
 
     # -- component creation ---------------------------------------------
@@ -6533,6 +7004,97 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     # -- unsaved-changes tracking -----------------------------------------
+    # -- undo / redo -------------------------------------------------
+    def _on_scene_changed_for_undo(self, *args):
+        """Any visual change to the scene (move/resize/type/draw/delete/
+        property edit) lands here. Restarting the single-shot timer on
+        every call is the debounce: a burst of changes (a drag, a
+        typing run, a freehand stroke) keeps pushing the commit back
+        until things go quiet for MAX_UNDO_STEPS's sibling interval, at
+        which point _commit_undo_checkpoint turns it into one undo
+        step. Ignored while undo()/redo() itself is loading a snapshot,
+        so restoring history doesn't recursively add to it."""
+        if self._undo_restoring:
+            return
+        self._undo_commit_timer.start()
+
+    def _flush_pending_undo_checkpoint(self):
+        """Commit right away if a checkpoint is already pending, instead
+        of waiting out the rest of the debounce - called on selection/
+        focus changes so e.g. clicking off a just-edited text note or
+        onto a different item commits that edit immediately. A no-op
+        (and cheap) when nothing is pending, e.g. a plain click that
+        didn't change anything."""
+        if self._undo_commit_timer.isActive():
+            self._commit_undo_checkpoint()
+
+    def _commit_undo_checkpoint(self):
+        if self._undo_restoring:
+            return
+        self._undo_commit_timer.stop()
+        snapshot = self._current_snapshot()
+        if snapshot is None:
+            return
+        if self._undo_baseline is None:
+            self._undo_baseline = snapshot
+            return
+        if snapshot == self._undo_baseline:
+            return  # nothing actually changed (e.g. just a hover/selection repaint)
+        self._undo_stack.append(self._undo_baseline)
+        if len(self._undo_stack) > self.MAX_UNDO_STEPS:
+            self._undo_stack.pop(0)
+        self._undo_baseline = snapshot
+        self._redo_stack.clear()
+        self._update_undo_redo_actions()
+
+    def _reset_undo_history(self):
+        """Start a fresh undo timeline at the current board state - used
+        at startup and whenever the board content is replaced wholesale
+        (New Board, New Project, Open, navigating to another board)
+        rather than edited in place."""
+        self._undo_commit_timer.stop()
+        self._undo_stack = []
+        self._redo_stack = []
+        self._undo_baseline = self._current_snapshot()
+        self._update_undo_redo_actions()
+
+    def _update_undo_redo_actions(self):
+        self.undo_action.setEnabled(bool(self._undo_stack))
+        self.redo_action.setEnabled(bool(self._redo_stack))
+
+    def _restore_undo_snapshot(self, snapshot_json):
+        self._undo_restoring = True
+        try:
+            data = json.loads(snapshot_json)
+            self.scene.clearSelection()
+            self.scene.load(data)
+        finally:
+            self._undo_restoring = False
+        self._undo_baseline = snapshot_json
+        self._update_undo_redo_actions()
+        self._refresh_title_bar()
+
+    def undo(self):
+        # Flush any not-yet-committed change first, so e.g. pressing
+        # Ctrl+Z right after finishing a drag (before the debounce timer
+        # has fired) undoes that drag rather than skipping straight past
+        # it to whatever came before.
+        self._flush_pending_undo_checkpoint()
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._undo_baseline)
+        prev = self._undo_stack.pop()
+        self._restore_undo_snapshot(prev)
+        self.statusBar().showMessage("Undo", 2000)
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._undo_baseline)
+        nxt = self._redo_stack.pop()
+        self._restore_undo_snapshot(nxt)
+        self.statusBar().showMessage("Redo", 2000)
+
     def _current_snapshot(self):
         """A JSON snapshot of the board's actual content - used only for
         comparing against _saved_snapshot, never actually written
@@ -6600,6 +7162,7 @@ class MainWindow(QMainWindow):
             self._update_breadcrumb_bar()
             self._set_base_title("OpenNote \u2014 Milanote-style Mind Map")
             self._update_saved_snapshot()
+            self._reset_undo_history()
 
     def new_project(self):
         """Start a brand-new project: clear the board, then immediately
@@ -6621,6 +7184,7 @@ class MainWindow(QMainWindow):
         self._update_breadcrumb_bar()
         self._ensure_project_and_file()
         self._update_saved_snapshot()
+        self._reset_undo_history()
 
     def choose_or_create_project_folder(self, title="Choose Project Folder"):
         """Ask the user to pick an existing folder - or create a new one -
@@ -6821,6 +7385,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Opened: {path}", 4000)
             self._update_breadcrumb_bar()
             self._update_saved_snapshot()
+            self._reset_undo_history()
         except Exception as e:
             QMessageBox.critical(self, error_title, str(e))
 
