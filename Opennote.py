@@ -34,7 +34,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor, QPen, QPainter, QPainterPath, QPixmap, QImage, QFont, QFontMetrics,
     QMovie, QPalette, QKeySequence, QAction, QGuiApplication,
-    QIcon, QActionGroup, QTextCursor, QIntValidator,
+    QIcon, QActionGroup, QTextCursor, QIntValidator, QTextCharFormat,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsObject,
@@ -424,21 +424,43 @@ def _apply_text_font(item, family=None, bold=None, italic=None, underline=None, 
     exposes `font_targets(editing_item)`, returning either just the one
     cell currently being edited (if `editing_item` belongs to it) or
     every cell in the table (so a whole-table selection restyles every
-    cell at once, the same way this restyles a whole Text Note)."""
+    cell at once, the same way this restyles a whole Text Note).
+
+    Selection-aware: while `editing_item` is one of the returned targets
+    AND that target currently has an actual text selection (a
+    highlighted range, not just a blinking caret), the change is applied
+    to just that selected run of characters - real per-character rich
+    text, like any ordinary text editor's toolbar. With no selection
+    (including whenever nothing at all is being edited, i.e. a whole
+    component is simply selected on the canvas) the same change is
+    instead applied uniformly across the entire text field, matching the
+    original whole-item-only behavior."""
     targets = item.font_targets(editing_item) if hasattr(item, "font_targets") else [item.text_item]
     for t in targets:
-        f = t.font()
-        if family is not None:
-            f.setFamily(family)
-        if bold is not None:
-            f.setBold(bold)
-        if italic is not None:
-            f.setItalic(italic)
-        if underline is not None:
-            f.setUnderline(underline)
-        if point_size is not None:
-            f.setPointSizeF(max(1.0, float(point_size)))
-        t.setFont(f)
+        has_sel = (t is editing_item) and t.textCursor().hasSelection()
+
+        # Only mutate the item's whole-field default font when the change
+        # is meant to apply to the whole field. QGraphicsTextItem.setFont()
+        # rewrites the document's ambient/default char format - if called
+        # even while there's a real selection, it silently changes what
+        # format *new* text picks up anywhere in the field, which is how
+        # "bold" used to leak onto text the user never selected.
+        if not has_sel:
+            f = t.font()
+            if family is not None:
+                f.setFamily(family)
+            if bold is not None:
+                f.setBold(bold)
+            if italic is not None:
+                f.setItalic(italic)
+            if underline is not None:
+                f.setUnderline(underline)
+            if point_size is not None:
+                f.setPointSizeF(max(1.0, float(point_size)))
+            t.setFont(f)
+
+        _apply_run_format(t, has_sel, family=family, bold=bold, italic=italic,
+                           underline=underline, point_size=point_size)
 
     # setFont() does not emit the document's contentsChanged signal (only
     # actual text edits do), so a TableItem never hears about a font/size
@@ -458,6 +480,127 @@ def _apply_text_font(item, family=None, bold=None, italic=None, underline=None, 
     if isinstance(item, TextNoteItem):
         item._on_text_changed()
         item.update()
+
+
+_UNSET = object()  # sentinel: "leave this property alone" vs. an explicit None
+
+
+def _apply_run_format(text_item, has_selection, family=None, bold=None, italic=None,
+                       underline=None, point_size=None, foreground=None, anchor_url=_UNSET):
+    """Low-level formatting primitive shared by every toolbar text control
+    (Font family / Bold / Italic / Underline / Size / Color / Link):
+    merges a QTextCharFormat built from whichever of these are given into
+    either `text_item`'s current selection (has_selection=True - real
+    per-character rich text, exactly like any ordinary editor's toolbar)
+    or, with has_selection=False, a cursor spanning its entire document
+    (so the change reads as "the whole text field changed") - this also
+    overwrites any earlier per-character formatting already in that
+    field, so "no selection = whole field" stays literally true even
+    after part of it was restyled a different way a moment ago."""
+    cur = text_item.textCursor() if has_selection else QTextCursor(text_item.document())
+    if not has_selection:
+        cur.select(QTextCursor.Document)
+    if not cur.hasSelection():
+        return
+    fmt = QTextCharFormat()
+    if family is not None:
+        fmt.setFontFamily(family)
+    if bold is not None:
+        fmt.setFontWeight(QFont.Bold if bold else QFont.Normal)
+    if italic is not None:
+        fmt.setFontItalic(italic)
+    if point_size is not None:
+        fmt.setFontPointSize(max(1.0, float(point_size)))
+    if foreground is not None:
+        fmt.setForeground(QColor(foreground))
+    if anchor_url is not _UNSET:
+        # A hyperlink implies its familiar underlined look, same as when
+        # a whole item first becomes a link (see MainWindow.on_hyperlink_clicked).
+        if anchor_url:
+            fmt.setAnchor(True)
+            fmt.setAnchorHref(anchor_url)
+            fmt.setFontUnderline(True)
+        else:
+            fmt.setAnchor(False)
+            fmt.setAnchorHref("")
+    elif underline is not None:
+        fmt.setFontUnderline(underline)
+    cur.mergeCharFormat(fmt)
+
+
+def _document_has_anchor(document):
+    """Whether any run of `document` already carries its own per-character
+    hyperlink formatting (set via _apply_run_format) - used by to_html()
+    to decide whether an item-level `link_url` (the older, whole-field-only
+    way a link could be stored) still needs to be applied as an outer
+    wrapper, or whether the rich text itself already accounts for it."""
+    block = document.begin()
+    while block.isValid():
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid() and frag.charFormat().isAnchor():
+                return True
+            it += 1
+        block = block.next()
+    return False
+
+
+def _text_run_to_html(frag_text, fmt, base_family, base_size):
+    """Render one same-formatted run of characters (a QTextFragment) as
+    a <span> (or <a>, if it's a hyperlink run) carrying exactly its own
+    font/color/bold/italic/underline - the building block that lets the
+    exported HTML mirror per-character rich text instead of one style
+    for an entire field."""
+    text = frag_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if not text:
+        return ""
+    f = fmt.font()
+    style_bits = []
+    family = f.family() or base_family
+    style_bits.append(f"font-family:'{family}',sans-serif")
+    size = f.pointSizeF()
+    if size <= 0:
+        size = base_size
+    style_bits.append(f"font-size:{size:.1f}pt")
+    fg = fmt.foreground()
+    if fg.style() != Qt.NoBrush:
+        style_bits.append(f"color:{fg.color().name()}")
+    if f.bold() or f.weight() > QFont.Normal:
+        style_bits.append("font-weight:bold")
+    if f.italic():
+        style_bits.append("font-style:italic")
+    is_link = fmt.isAnchor() and bool(fmt.anchorHref())
+    if f.underline() or is_link:
+        style_bits.append("text-decoration:underline")
+    style = ";".join(style_bits)
+    if is_link:
+        safe_url = fmt.anchorHref().replace('"', "&quot;")
+        return f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" style="{style}">{text}</a>'
+    return f'<span style="{style}">{text}</span>'
+
+
+def _qtextdocument_to_web_html(document, base_family="Segoe UI", base_size=11.0):
+    """Render a QTextDocument's actual rich, per-character formatting
+    (one <span>/<a> per differently-formatted run: bold, italic,
+    underline, color, font, hyperlink, ...) as portable HTML for the
+    exported board file, so a browser shows exactly what the app shows -
+    formatting selection-by-selection, not just one style per field."""
+    parts = []
+    block = document.begin()
+    first_block = True
+    while block.isValid():
+        if not first_block:
+            parts.append("<br>")
+        first_block = False
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid() and frag.length() > 0:
+                parts.append(_text_run_to_html(frag.text(), frag.charFormat(), base_family, base_size))
+            it += 1
+        block = block.next()
+    return "".join(parts)
 
 
 def _representative_font(item, editing_item=None):
@@ -506,6 +649,15 @@ class EditableTextItem(QGraphicsTextItem):
     # losing focus *to that combo* (see focusOutEvent below).
     _font_combo = None
 
+    # Set once by MainWindow to a no-arg callable that refreshes the
+    # toolbar's Font/B/I/U/Color/Link controls from the live text
+    # cursor. The scene's selectionChanged/focusItemChanged signals only
+    # fire when which *item* is selected/focused changes, not when the
+    # text *cursor*/selection moves within an item that's already being
+    # edited - so without this, e.g. dragging to highlight a link inside
+    # a note wouldn't light up the Link button the way it should.
+    _toolbar_refresh_cb = None
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFlag(QGraphicsItem.ItemIsFocusable, True)
@@ -534,7 +686,14 @@ class EditableTextItem(QGraphicsTextItem):
         return fw is fc or fw is fc.lineEdit()
 
     def focusOutEvent(self, event):
-        if self._losing_focus_to_font_combo():
+        if self._losing_focus_to_font_combo() or QApplication.activeModalWidget() is not None:
+            # Same idea as the font-combo case below: QColorDialog / the
+            # Link QInputDialog are modal windows that momentarily steal
+            # focus while picking a color or URL for the current
+            # selection. Don't drop out of edit mode or clear the
+            # selection for that, or by the time the dialog closes and
+            # the toolbar action tries to re-read the selection to apply
+            # the change, there's nothing left to apply it to.
             # The font-family combo needs real keyboard focus to let the
             # user type/search or use its dropdown list - momentarily
             # taking focus away from whatever text is being edited. Don't
@@ -587,6 +746,16 @@ class EditableTextItem(QGraphicsTextItem):
             event.ignore()
             return
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self.textInteractionFlags() == Qt.TextEditorInteraction and EditableTextItem._toolbar_refresh_cb:
+            EditableTextItem._toolbar_refresh_cb()
+
+    def keyReleaseEvent(self, event):
+        super().keyReleaseEvent(event)
+        if self.textInteractionFlags() == Qt.TextEditorInteraction and EditableTextItem._toolbar_refresh_cb:
+            EditableTextItem._toolbar_refresh_cb()
 
     def _toggle_checkbox_at(self, pos):
         doc = self.document()
@@ -759,12 +928,21 @@ class BaseComponentItem(QGraphicsObject):
             event.accept()
         else:
             super().mouseReleaseEvent(event)
+        if was_resizing:
+            self._on_resize_interaction_finished()
         if self._hover_board is not None:
             self._hover_board.clear_insert_preview()
             self._hover_board = None
         scene = self.scene()
         if scene is not None and not was_resizing and hasattr(scene, "item_drag_released"):
             scene.item_drag_released(self)
+
+    def _on_resize_interaction_finished(self):
+        """Hook for subclasses (ImageItem/GifItem) that render at a
+        cheaper quality while the resize handle is actively being
+        dragged - called once the handle is released, so they can force
+        one final high-quality redraw at the now-settled size."""
+        pass
 
     def hoverMoveEvent(self, event):
         if self.isSelected() and self.handle_rect().contains(event.pos()):
@@ -851,7 +1029,8 @@ class TextNoteItem(BaseComponentItem):
 
     def __init__(self, x=0, y=0, w=220, h=140, text="New note", color=None, item_id=None,
                  font_family=None, font_size=None, bold=False, italic=False, underline=False,
-                 link_url=None, text_color=None, title="Title", show_title=False, title_font=None):
+                 link_url=None, text_color=None, title="Title", show_title=False, title_font=None,
+                 text_html=None, title_html=None):
         super().__init__(x, y, w, h, item_id)
         self.color = color or self.DEFAULT_COLOR
         # The note's fill/background is self.color (inherited from
@@ -896,6 +1075,15 @@ class TextNoteItem(BaseComponentItem):
         self.link_url = None
         if link_url:
             self.set_link(link_url)
+        # Rich per-character formatting (from selection-based toolbar
+        # edits) is preserved across save/load as Qt's own document HTML -
+        # applied last so it fully overrides the plain-text/whole-font
+        # setup above whenever it's present (i.e. loading a board saved
+        # by this version of the app).
+        if title_html:
+            self.title_item.document().setHtml(title_html)
+        if text_html:
+            self.text_item.document().setHtml(text_html)
 
     def set_link(self, url):
         """Attach (or, with url=None/empty, remove) a hyperlink to this
@@ -1061,59 +1249,36 @@ class TextNoteItem(BaseComponentItem):
         d["underline"] = f.underline()
         d["title_font"] = _font_to_dict(self.title_item.font())
         d["link_url"] = self.link_url
+        # Full rich-text fidelity (per-character bold/italic/underline/
+        # color/font/link runs from selection-based edits) - the plain
+        # "text"/"font_family"/... fields above remain as a simple
+        # fallback for anything that only reads those.
+        d["text_html"] = self.text_item.document().toHtml()
+        d["title_html"] = self.title_item.document().toHtml()
         return d
 
     def to_html(self):
-        text = (
-            self.text_item.toPlainText()
-            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace("\n", "<br>")
-        )
+        # Walks the document's actual per-character formatting so the
+        # exported HTML mirrors exactly what's shown in the app, run by
+        # run - not just one style applied to the whole field.
         f = self.text_item.font()
-        text_color = self.text_item.defaultTextColor().name()
-        # pointSizeF() is a point size, not a pixel size - tagging it "pt"
-        # (rather than "px") keeps the exported size in sync with the app,
-        # the same fix already applied to the Arrow label's font-size.
-        style_bits = [
-            f"font-family:'{f.family()}',sans-serif",
-            f"font-size:{f.pointSizeF():.1f}pt",
-            f"color:{text_color}",
-        ]
-        if f.bold():
-            style_bits.append("font-weight:bold")
-        if f.italic():
-            style_bits.append("font-style:italic")
-        if f.underline():
-            style_bits.append("text-decoration:underline")
-        text_style = ";".join(style_bits)
-        if self.link_url:
+        text = _qtextdocument_to_web_html(self.text_item.document(),
+                                           base_family=f.family(), base_size=f.pointSizeF())
+        if not text:
+            text = "&nbsp;"
+        if self.link_url and not _document_has_anchor(self.text_item.document()):
+            # Backward-compat: an older, whole-field-only link (no
+            # per-character anchor runs in the document itself).
             safe_url = self.link_url.replace('"', "&quot;")
-            link_style = text_style if f.underline() else f"{text_style};text-decoration:underline"
-            text = f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" style="{link_style}">{text}</a>'
-        else:
-            text = f'<span style="{text_style}">{text}</span>'
+            text = (f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
+                    f'style="color:inherit;text-decoration:underline">{text}</a>')
         bg_css = color_to_css(self.color)
         title_html = ""
         if self.show_title:
-            title_text = (
-                self.title_item.toPlainText()
-                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                .replace("\n", "<br>")
-            )
             tf = self.title_item.font()
-            title_color = color_to_css(self.title_item.defaultTextColor().name())
-            title_bits = [
-                f"font-family:'{tf.family()}',sans-serif",
-                f"font-size:{tf.pointSizeF():.1f}pt",
-                "margin-bottom:4px",
-                f"color:{title_color}",
-            ]
-            title_bits.append("font-weight:bold" if tf.bold() else "font-weight:normal")
-            if tf.italic():
-                title_bits.append("font-style:italic")
-            if tf.underline():
-                title_bits.append("text-decoration:underline")
-            title_html = f'<div style="{";".join(title_bits)}">{title_text}</div>'
+            title_text = _qtextdocument_to_web_html(self.title_item.document(),
+                                                      base_family=tf.family(), base_size=tf.pointSizeF())
+            title_html = f'<div style="margin-bottom:4px">{title_text}</div>'
         return (
             f'<div class="comp text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;background:{bg_css};'
@@ -1132,7 +1297,7 @@ class PlainTextItem(BaseComponentItem):
 
     def __init__(self, x=0, y=0, w=220, h=50, text="Text", color=None, item_id=None,
                  font_family=None, font_size=None, bold=False, italic=False, underline=False,
-                 link_url=None):
+                 link_url=None, text_html=None):
         super().__init__(x, y, w, h, item_id)
         self.color = color or self.DEFAULT_COLOR
         self.text_item = EditableTextItem(self)
@@ -1150,6 +1315,10 @@ class PlainTextItem(BaseComponentItem):
         self.link_url = None
         if link_url:
             self.set_link(link_url)
+        # See TextNoteItem.__init__ - preserves per-character formatting
+        # from selection-based toolbar edits across save/load.
+        if text_html:
+            self.text_item.document().setHtml(text_html)
 
     def set_link(self, url):
         """Attach (or, with url=None/empty, remove) a hyperlink to this
@@ -1217,34 +1386,19 @@ class PlainTextItem(BaseComponentItem):
         d["italic"] = f.italic()
         d["underline"] = f.underline()
         d["link_url"] = self.link_url
+        d["text_html"] = self.text_item.document().toHtml()
         return d
 
     def to_html(self):
-        text = (
-            self.text_item.toPlainText()
-            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace("\n", "<br>")
-        )
         f = self.text_item.font()
-        text_color = QColor(self.color).name()
-        style_bits = [
-            f"font-family:'{f.family()}',sans-serif",
-            f"font-size:{f.pointSizeF():.1f}pt",
-            f"color:{text_color}",
-        ]
-        if f.bold():
-            style_bits.append("font-weight:bold")
-        if f.italic():
-            style_bits.append("font-style:italic")
-        if f.underline():
-            style_bits.append("text-decoration:underline")
-        text_style = ";".join(style_bits)
-        if self.link_url:
+        text = _qtextdocument_to_web_html(self.text_item.document(),
+                                           base_family=f.family(), base_size=f.pointSizeF())
+        if not text:
+            text = "&nbsp;"
+        if self.link_url and not _document_has_anchor(self.text_item.document()):
             safe_url = self.link_url.replace('"', "&quot;")
-            link_style = text_style if f.underline() else f"{text_style};text-decoration:underline"
-            text = f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" style="{link_style}">{text}</a>'
-        else:
-            text = f'<span style="{text_style}">{text}</span>'
+            text = (f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
+                    f'style="color:inherit;text-decoration:underline">{text}</a>')
         return (
             f'<div class="comp plain-text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;'
@@ -1508,6 +1662,27 @@ class ImageItem(MediaCardMixin, BaseComponentItem):
                  title_font=None, desc_font=None, title_color=None, desc_color=None):
         super().__init__(x, y, w, h, item_id)
         self.pixmap_orig = pixmap if pixmap is not None else base64_to_pixmap(b64)
+        # Cache of the last smooth-scaled pixmap, keyed by target size -
+        # scaling a full-resolution photo is expensive, and paint() can be
+        # called on every scene repaint (cursor blink elsewhere, another
+        # item animating, mouse move, ...), not just when this image
+        # actually changes. Without caching, a single large imported photo
+        # re-does that expensive scale dozens of times a second and stalls
+        # the whole app, not just this item.
+        self._scaled_cache_pixmap = None
+        self._scaled_cache_size = None
+        self._scaled_cache_mode = None
+        # Cache of the PNG/base64 encoding of pixmap_orig - encoding a
+        # full-resolution photo to PNG is real CPU work, and serialize()
+        # runs far more often than the pixmap itself actually changes:
+        # every debounced undo checkpoint (scene.changed, ~every settled
+        # drag/edit) and every unsaved-changes check re-serializes the
+        # whole board. Clicking to pick the item up for a drag flushes
+        # any pending checkpoint immediately (see MainWindow's
+        # _flush_pending_undo_checkpoint), so without this cache that
+        # PNG re-encode was happening synchronously right as a drag
+        # begins - the actual source of "dragging feels expensive".
+        self._b64_cache = None
         self.min_w, self.min_h = 120, 140
         self.setAcceptDrops(True)
         self._init_title_desc(title, description, show_title, show_description,
@@ -1516,6 +1691,26 @@ class ImageItem(MediaCardMixin, BaseComponentItem):
 
     def set_pixmap(self, pixmap):
         self.pixmap_orig = pixmap
+        self._scaled_cache_pixmap = None
+        self._scaled_cache_size = None
+        self._scaled_cache_mode = None
+        self._b64_cache = None
+        self.update()
+
+    def _get_b64(self):
+        if self._b64_cache is None:
+            self._b64_cache = pixmap_to_base64(self.pixmap_orig)
+        return self._b64_cache
+
+    def _on_resize_interaction_finished(self):
+        # The handle was just released after possibly several frames of
+        # cheap Qt.FastTransformation scaling (see paint()) - drop the
+        # cache so the very next paint redoes one final, high-quality
+        # smooth scale at the settled size instead of leaving the
+        # blocky/aliased fast-mode result on screen at rest.
+        self._scaled_cache_pixmap = None
+        self._scaled_cache_size = None
+        self._scaled_cache_mode = None
         self.update()
 
     def on_resized(self):
@@ -1540,9 +1735,23 @@ class ImageItem(MediaCardMixin, BaseComponentItem):
         painter.setPen(Qt.NoPen)
         painter.drawRect(rect)
         if not self.pixmap_orig.isNull():
-            scaled = self.pixmap_orig.scaled(
-                rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
+            target_size = rect.size().toSize()
+            # Nearest-neighbor while the resize handle is actively being
+            # dragged (set_size()/on_resized() fire on every mouse-move,
+            # so the target size - and thus the cache - genuinely changes
+            # every frame here; a full bilinear smooth scale of a large
+            # photo on every one of those frames is what made resizing
+            # feel heavy). One high-quality smooth pass happens via
+            # _on_resize_interaction_finished() once the handle is let go.
+            mode = Qt.FastTransformation if self._resizing else Qt.SmoothTransformation
+            if (self._scaled_cache_pixmap is None or self._scaled_cache_size != target_size
+                    or self._scaled_cache_mode != mode):
+                self._scaled_cache_pixmap = self.pixmap_orig.scaled(
+                    target_size, Qt.KeepAspectRatio, mode
+                )
+                self._scaled_cache_size = target_size
+                self._scaled_cache_mode = mode
+            scaled = self._scaled_cache_pixmap
             px = rect.x() + (rect.width() - scaled.width()) / 2
             py = rect.y() + (rect.height() - scaled.height()) / 2
             painter.drawPixmap(int(px), int(py), scaled)
@@ -1573,11 +1782,11 @@ class ImageItem(MediaCardMixin, BaseComponentItem):
 
     def serialize(self):
         d = super().serialize()
-        d["data"] = pixmap_to_base64(self.pixmap_orig)
+        d["data"] = self._get_b64()
         return self._title_desc_serialize(d)
 
     def to_html(self):
-        b64 = pixmap_to_base64(self.pixmap_orig)
+        b64 = self._get_b64()
         title_html, desc_html = self._title_desc_html()
         return (
             f'<div class="comp image-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
@@ -1606,6 +1815,9 @@ class GifItem(MediaCardMixin, BaseComponentItem):
         self.buffer = None
         self.movie = None
         self._current_pixmap = QPixmap()
+        self._scaled_cache_pixmap = None
+        self._scaled_cache_size = None
+        self._scaled_cache_mode = None
         self.min_w, self.min_h = 120, 140
         self.setAcceptDrops(True)
         self._init_title_desc(title, description, show_title, show_description,
@@ -1627,7 +1839,16 @@ class GifItem(MediaCardMixin, BaseComponentItem):
     def _on_frame(self, _frame_no):
         if self.movie:
             self._current_pixmap = self.movie.currentPixmap()
+            self._scaled_cache_pixmap = None
+            self._scaled_cache_size = None
+            self._scaled_cache_mode = None
             self.update()
+
+    def _on_resize_interaction_finished(self):
+        self._scaled_cache_pixmap = None
+        self._scaled_cache_size = None
+        self._scaled_cache_mode = None
+        self.update()
 
     def set_gif_bytes(self, data):
         if self.movie:
@@ -1656,9 +1877,16 @@ class GifItem(MediaCardMixin, BaseComponentItem):
         painter.setPen(Qt.NoPen)
         painter.drawRect(rect)
         if not self._current_pixmap.isNull():
-            scaled = self._current_pixmap.scaled(
-                rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
+            target_size = rect.size().toSize()
+            mode = Qt.FastTransformation if self._resizing else Qt.SmoothTransformation
+            if (self._scaled_cache_pixmap is None or self._scaled_cache_size != target_size
+                    or self._scaled_cache_mode != mode):
+                self._scaled_cache_pixmap = self._current_pixmap.scaled(
+                    target_size, Qt.KeepAspectRatio, mode
+                )
+                self._scaled_cache_size = target_size
+                self._scaled_cache_mode = mode
+            scaled = self._scaled_cache_pixmap
             px = rect.x() + (rect.width() - scaled.width()) / 2
             py = rect.y() + (rect.height() - scaled.height()) / 2
             painter.drawPixmap(int(px), int(py), scaled)
@@ -4916,12 +5144,14 @@ def subitem_to_component(subitem, x, y):
             italic=subitem.get("italic", False),
             underline=subitem.get("underline", False),
             link_url=subitem.get("link_url"),
+            text_html=subitem.get("text_html"),
         )
         if cls is TextNoteItem:
             kwargs["text_color"] = subitem.get("text_color")
             kwargs["title"] = subitem.get("title", "Title")
             kwargs["show_title"] = subitem.get("show_title", False)
             kwargs["title_font"] = subitem.get("title_font")
+            kwargs["title_html"] = subitem.get("title_html")
         return cls(x, y, **kwargs)
     if kind == "checklist":
         # No standalone checklist component exists yet, so fall back to a
@@ -4947,6 +5177,7 @@ def deserialize_component(d):
             text_color=d.get("text_color"),
             title=d.get("title", "Title"), show_title=d.get("show_title", False),
             title_font=d.get("title_font"),
+            text_html=d.get("text_html"), title_html=d.get("title_html"),
         )
     elif t == "plaintext":
         item = PlainTextItem(
@@ -4954,6 +5185,7 @@ def deserialize_component(d):
             font_family=d.get("font_family"), font_size=d.get("font_size"),
             bold=d.get("bold", False), italic=d.get("italic", False),
             underline=d.get("underline", False), link_url=d.get("link_url"),
+            text_html=d.get("text_html"),
         )
     elif t == "image":
         item = ImageItem(x, y, w, h, b64=d.get("data"), item_id=item_id,
@@ -6295,6 +6527,7 @@ class MainWindow(QMainWindow):
         # re-picking the same font) is handled by _FontFamilyCombo's
         # hidePopup override and on_font_family_changed.
         EditableTextItem._font_combo = self.font_combo
+        EditableTextItem._toolbar_refresh_cb = self._refresh_text_format_buttons
 
         self.bold_btn = QToolButton()
         self.bold_btn.setText("B")
@@ -6326,6 +6559,7 @@ class MainWindow(QMainWindow):
         self.link_btn = QToolButton()
         self.link_btn.setText("Link")
         self.link_btn.setToolTip("Add / edit hyperlink")
+        self.link_btn.setCheckable(True)
         self.link_btn.setFocusPolicy(Qt.NoFocus)
         self.link_btn.clicked.connect(self.on_hyperlink_clicked)
         self.link_action = draw_tb.addWidget(self.link_btn)
@@ -6517,6 +6751,10 @@ class MainWindow(QMainWindow):
             self.underline_btn.blockSignals(True)
             self.underline_btn.setChecked(font.underline())
             self.underline_btn.blockSignals(False)
+            if editing_item is None and text_sel:
+                self.link_btn.blockSignals(True)
+                self.link_btn.setChecked(bool(getattr(text_sel[0], "link_url", None)))
+                self.link_btn.blockSignals(False)
         elif sel:
             first = sel[0]
             if isinstance(first, DrawingItem) and first.strokes:
@@ -6552,29 +6790,81 @@ class MainWindow(QMainWindow):
             self.opacity_slider.blockSignals(False)
             self.opacity_stepper.setValue(self.opacity_slider.value())
 
+        if editing_item is not None:
+            self._refresh_text_format_buttons()
+
+    def _refresh_text_format_buttons(self):
+        """Live-refresh the Font/B/I/U/Color/Link toolbar controls from
+        the exact text cursor - the selected run's own formatting if
+        there's a real selection, otherwise whatever's at the caret.
+        Called whenever the text cursor's selection could have moved
+        (see EditableTextItem.mouseReleaseEvent/keyReleaseEvent), since
+        the scene's selectionChanged/focusItemChanged signals only cover
+        which *item* is selected/focused, not the cursor within one that
+        was already being edited."""
+        editing_item = self._focused_text_item()
+        if editing_item is None or not self._font_selection:
+            return
+        cur = editing_item.textCursor()
+        fmt = cur.charFormat()
+        f = fmt.font()
+        self.font_combo.blockSignals(True)
+        self.font_combo.setCurrentFont(f)
+        self.font_combo.blockSignals(False)
+        self.bold_btn.blockSignals(True)
+        self.bold_btn.setChecked(f.bold())
+        self.bold_btn.blockSignals(False)
+        self.italic_btn.blockSignals(True)
+        self.italic_btn.setChecked(f.italic())
+        self.italic_btn.blockSignals(False)
+        self.underline_btn.blockSignals(True)
+        self.underline_btn.setChecked(f.underline())
+        self.underline_btn.blockSignals(False)
+        size = f.pointSizeF()
+        if size <= 0:
+            size = editing_item.font().pointSizeF()
+        self.size_slider.blockSignals(True)
+        self.size_slider.setValue(int(max(1, min(40, round(size)))))
+        self.size_slider.blockSignals(False)
+        self.size_stepper.setValue(self.size_slider.value())
+        fg = fmt.foreground()
+        col = fg.color() if fg.style() != Qt.NoBrush else editing_item.defaultTextColor()
+        self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+        if self.link_action.isVisible():
+            self.link_btn.blockSignals(True)
+            self.link_btn.setChecked(fmt.isAnchor())
+            self.link_btn.blockSignals(False)
+
     def pick_color(self):
         editing_item = self._focused_text_item()
         if editing_item is not None:
-            # Editing text (or a selection inside it): change the TEXT
-            # color of whatever's being edited, regardless of which
-            # component type it belongs to - never the component's own
+            # Editing text: a genuine selection restyles just that
+            # highlighted run of characters (real per-character rich
+            # text); with no selection, the whole field's text color
+            # changes, same as before - never the component's own
             # background/border color while in this mode.
             parent = editing_item.parentItem()
-            start = editing_item.defaultTextColor()
+            cur = editing_item.textCursor()
+            has_sel = cur.hasSelection()
+            fg = cur.charFormat().foreground()
+            start = fg.color() if (has_sel and fg.style() != Qt.NoBrush) else editing_item.defaultTextColor()
             color = QColorDialog.getColor(start, self, "Pick text color")
             if not color.isValid():
                 return
-            if isinstance(parent, TextNoteItem):
-                parent.set_text_color(color)
-            elif isinstance(parent, PlainTextItem):
-                parent.set_color(color)
-            else:
-                editing_item.setDefaultTextColor(color)
-                if isinstance(parent, BoardCardItem) and parent._sub_edit_index is not None:
-                    idx = parent._sub_edit_index
-                    if idx < len(parent.subitems):
-                        parent.subitems[idx]["color"] = color.name()
-                        parent.update()
+            _apply_run_format(editing_item, has_sel, foreground=color.name())
+            self._restore_text_edit_focus()
+            if not has_sel:
+                if isinstance(parent, TextNoteItem):
+                    parent.set_text_color(color)
+                elif isinstance(parent, PlainTextItem):
+                    parent.set_color(color)
+                else:
+                    editing_item.setDefaultTextColor(color)
+                    if isinstance(parent, BoardCardItem) and parent._sub_edit_index is not None:
+                        idx = parent._sub_edit_index
+                        if idx < len(parent.subitems):
+                            parent.subitems[idx]["color"] = color.name()
+                            parent.update()
             self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
             return
         if self._editing_selection:
@@ -6717,6 +7007,43 @@ class MainWindow(QMainWindow):
 
     def on_hyperlink_clicked(self):
         if not self._text_selection:
+            return
+        editing_item = self._focused_text_item()
+        if editing_item is not None:
+            # Editing text: a genuine selection turns just that run into
+            # (or out of) a link; with no selection, the whole field's
+            # link changes, same as the other formatting controls.
+            cur = editing_item.textCursor()
+            has_sel = cur.hasSelection()
+            fmt = cur.charFormat()
+            current = fmt.anchorHref() if fmt.isAnchor() else (
+                getattr(editing_item.parentItem(), "link_url", None) or ""
+            )
+            url, ok = QInputDialog.getText(
+                self, "Hyperlink", "URL (leave empty to remove the link):", text=current
+            )
+            if not ok:
+                return
+            url = url.strip()
+            norm = normalize_link_url(url) if url else ""
+            _apply_run_format(editing_item, has_sel, anchor_url=norm or None)
+            self._restore_text_edit_focus()
+            parent = editing_item.parentItem()
+            if not has_sel and hasattr(parent, "set_link"):
+                was_linked = bool(getattr(parent, "link_url", None))
+                parent.set_link(norm or None)
+                if norm and not was_linked:
+                    if isinstance(parent, PlainTextItem):
+                        parent.set_color(QColor("#5b9dd9"))
+                    elif isinstance(parent, TextNoteItem):
+                        parent.set_text_color(QColor("#5b9dd9"))
+            elif has_sel and norm:
+                # First time this exact run becomes a link: nudge just
+                # its own text to the familiar link-blue as a starting
+                # point - an ordinary color choice from here on, freely
+                # repickable afterward via the Color button.
+                _apply_run_format(editing_item, has_sel, foreground="#5b9dd9")
+            self._refresh_text_format_buttons()
             return
         first = self._text_selection[0]
         current = getattr(first, "link_url", None) or ""
