@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QToolButton,
     QFontComboBox, QInputDialog, QCompleter, QCheckBox,
     QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QGridLayout, QLineEdit,
-    QSizePolicy,
+    QSizePolicy, QTabWidget,
 )
 
 try:
@@ -137,6 +137,55 @@ def base64_to_pixmap(b64):
         except Exception:
             pass
     return pm
+
+
+class _BgStripColorDialog(QDialog):
+    """Two-tab color picker used whenever a component with its Top Strip
+    enabled has its color changed (see TopStripMixin._open_color_dialog
+    and MainWindow.pick_color) - one tab for the component's regular
+    Background color, one for the Top Strip color, each tab hosting the
+    exact same standard QColorDialog picker widget the rest of the app
+    already uses for every other "Change Color" action, just embedded
+    instead of shown standalone (QColorDialog.NoButtons hides its own
+    OK/Cancel/pick-screen-color row - this dialog has one shared row for
+    both tabs at the bottom instead)."""
+
+    def __init__(self, parent, bg_color, strip_color, title="Pick component color", bg_label="Background"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
+
+        self.bg_picker = QColorDialog(bg_color, self)
+        self.bg_picker.setWindowFlags(Qt.Widget)
+        self.bg_picker.setOption(QColorDialog.NoButtons, True)
+        tabs.addTab(self.bg_picker, bg_label)
+
+        self.strip_picker = QColorDialog(strip_color, self)
+        self.strip_picker.setWindowFlags(Qt.Widget)
+        self.strip_picker.setOption(QColorDialog.NoButtons, True)
+        tabs.addTab(self.strip_picker, "Top Strip")
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_colors(self):
+        return self.bg_picker.currentColor(), self.strip_picker.currentColor()
+
+
+def open_bg_strip_color_dialog(parent, bg_start, strip_start, title="Pick component color", bg_label="Background"):
+    """Show the two-tab picker above; returns (bg_color, strip_color) if
+    accepted, or (None, None) if cancelled. bg_label names what the first
+    tab actually controls - "Background" for a real fill (Text Note,
+    Board Card), "Border" for Image/GIF/Video (see TopStripMixin.
+    COLOR_TAB_LABEL)."""
+    dlg = _BgStripColorDialog(parent, bg_start, strip_start, title, bg_label)
+    if dlg.exec() == QDialog.Accepted:
+        return dlg.selected_colors()
+    return None, None
 
 
 # File extension -> MIME type for board-link thumbnails (raster images
@@ -846,10 +895,12 @@ class BaseComponentItem(QGraphicsObject):
 
     def _frame_pen(self, default="#000000"):
         """Border pen used by image/gif/video items: blue while selected,
-        otherwise the user's custom color if they set one, else `default`."""
+        otherwise a fixed thin border - self.color now drives the title/
+        description background instead (see
+        MediaCardMixin._paint_title_desc_chrome)."""
         if self.isSelected():
             return QPen(QColor("#4c8bf5"), 2)
-        return QPen(QColor(self.color) if self.color else QColor(default), 1)
+        return QPen(QColor(default), 1)
 
     def handle_rect(self):
         return QRectF(self._w - HANDLE_SIZE, self._h - HANDLE_SIZE, HANDLE_SIZE, HANDLE_SIZE)
@@ -1017,10 +1068,103 @@ class BaseComponentItem(QGraphicsObject):
 
 
 # --------------------------------------------------------------------------
+# Top Strip - an optional colored accent bar along a component's top edge,
+# available on Text Note, Image, GIF, Video and Board Card. Implemented as
+# a mixin (rather than on BaseComponentItem itself) since it's opt-in per
+# type - Drawing/Arrow/Table/PlainText/BoardLink never carry one.
+# --------------------------------------------------------------------------
+
+class TopStripMixin:
+    """Toggled via the toolbar's "Top Strip" checkbox (shown whenever a
+    component of an eligible type is selected) or the context menu entry
+    of the same name. While enabled, the component's own Color button/
+    "Change Color..." entry opens a two-tab dialog (Background/Top Strip)
+    instead of a single plain color picker - see _open_color_dialog below
+    and MainWindow.pick_color."""
+
+    TOP_STRIP_H = 5
+    DEFAULT_STRIP_COLOR = "#e74c3c"
+    # What the two-tab color dialog's first tab should call self.color -
+    # "Background" everywhere: a real fill for Text Note/Board Card, and
+    # for Image/GIF/Video it's the title/description bar background (see
+    # MediaCardMixin._paint_title_desc_chrome). The frame border is a
+    # fixed color, independent of self.color (see BaseComponentItem._frame_pen).
+    COLOR_TAB_LABEL = "Background"
+
+    def _init_top_strip(self, top_strip_enabled=False, top_strip_color=None):
+        self.top_strip_enabled = bool(top_strip_enabled)
+        self.top_strip_color = top_strip_color or self.DEFAULT_STRIP_COLOR
+
+    def set_top_strip_color(self, color):
+        self.top_strip_color = color.name() if isinstance(color, QColor) else color
+        self.update()
+
+    def _toggle_top_strip(self):
+        self.top_strip_enabled = not self.top_strip_enabled
+        self.update()
+
+    def _paint_top_strip(self, painter, clip_path=None):
+        """Call last in paint(), after everything else, so the strip sits
+        cleanly on top as a cap across the component's full width. Pass
+        the component's own rounded-rect QPainterPath as clip_path (if it
+        has one) so the strip's corners follow the component's rounding
+        instead of poking square corners out past it."""
+        if not getattr(self, "top_strip_enabled", False):
+            return
+        painter.save()
+        if clip_path is not None:
+            painter.setClipPath(clip_path)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(self.top_strip_color))
+        painter.drawRect(QRectF(0, 0, self._w, self.TOP_STRIP_H))
+        painter.restore()
+
+    def _top_strip_serialize(self, d):
+        d["top_strip_enabled"] = self.top_strip_enabled
+        d["top_strip_color"] = self.top_strip_color
+        return d
+
+    def _top_strip_html(self):
+        if not getattr(self, "top_strip_enabled", False):
+            return ""
+        return (f'<div class="top-strip" style="position:absolute;left:0;top:0;right:0;'
+                f'height:{self.TOP_STRIP_H}px;background:{self.top_strip_color};"></div>')
+
+    def _build_top_strip_context_menu(self, menu):
+        action = menu.addAction("Top Strip")
+        action.setCheckable(True)
+        action.setChecked(self.top_strip_enabled)
+        self._top_strip_menu_action = action
+
+    def _handle_top_strip_context_action(self, action):
+        if action is getattr(self, "_top_strip_menu_action", None):
+            self._toggle_top_strip()
+            return True
+        return False
+
+    def _open_color_dialog(self):
+        """Overrides BaseComponentItem._open_color_dialog (the context
+        menu's "Change Color..." entry point) - falls back to the normal
+        single-color dialog via super() unless the strip is on."""
+        if getattr(self, "top_strip_enabled", False):
+            bg, strip = open_bg_strip_color_dialog(
+                None,
+                QColor(self.color) if getattr(self, "color", None) else QColor(getattr(self, "DEFAULT_COLOR", None) or "#ffffff"),
+                QColor(self.top_strip_color),
+                bg_label=self.COLOR_TAB_LABEL,
+            )
+            if bg is not None:
+                self.set_color(bg)
+                self.set_top_strip_color(strip)
+            return
+        super()._open_color_dialog()
+
+
+# --------------------------------------------------------------------------
 # Text note
 # --------------------------------------------------------------------------
 
-class TextNoteItem(BaseComponentItem):
+class TextNoteItem(TopStripMixin, BaseComponentItem):
     TYPE_NAME = "text"
     DEFAULT_COLOR = "#1e1e1e"
     DEFAULT_TEXT_COLOR = "#e8e8e8"
@@ -1030,8 +1174,9 @@ class TextNoteItem(BaseComponentItem):
     def __init__(self, x=0, y=0, w=220, h=140, text="New note", color=None, item_id=None,
                  font_family=None, font_size=None, bold=False, italic=False, underline=False,
                  link_url=None, text_color=None, title="Title", show_title=False, title_font=None,
-                 text_html=None, title_html=None):
+                 text_html=None, title_html=None, top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
+        self._init_top_strip(top_strip_enabled, top_strip_color)
         self.color = color or self.DEFAULT_COLOR
         # The note's fill/background is self.color (inherited from
         # BaseComponentItem); the text drawn on top of it is a separate
@@ -1151,6 +1296,7 @@ class TextNoteItem(BaseComponentItem):
                    2 if self.isSelected() else 1)
         painter.setPen(pen)
         painter.drawPath(path)
+        self._paint_top_strip(painter, clip_path=path)
         self.paint_handle(painter)
 
     def mouseDoubleClickEvent(self, event):
@@ -1185,6 +1331,7 @@ class TextNoteItem(BaseComponentItem):
         self._title_menu_action = menu.addAction("Title")
         self._title_menu_action.setCheckable(True)
         self._title_menu_action.setChecked(self.show_title)
+        self._build_top_strip_context_menu(menu)
         menu.addSeparator()
         self._bullet_menu_action = menu.addAction("Toggle Bullet List")
         self._check_menu_action = menu.addAction("Toggle Checklist")
@@ -1193,6 +1340,8 @@ class TextNoteItem(BaseComponentItem):
     def _handle_context_action(self, action):
         if action == self._title_menu_action:
             self._toggle_show_title()
+        elif self._handle_top_strip_context_action(action):
+            pass
         elif action == self._bullet_menu_action:
             self.toggle_bullet_list()
         elif action == self._check_menu_action:
@@ -1255,7 +1404,7 @@ class TextNoteItem(BaseComponentItem):
         # fallback for anything that only reads those.
         d["text_html"] = self.text_item.document().toHtml()
         d["title_html"] = self.title_item.document().toHtml()
-        return d
+        return self._top_strip_serialize(d)
 
     def to_html(self):
         # Walks the document's actual per-character formatting so the
@@ -1282,7 +1431,7 @@ class TextNoteItem(BaseComponentItem):
         return (
             f'<div class="comp text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;background:{bg_css};'
-            f'opacity:{self.opacity():.2f}">{title_html}{text}</div>'
+            f'opacity:{self.opacity():.2f}">{self._top_strip_html()}{title_html}{text}</div>'
         )
 
 
@@ -1544,7 +1693,7 @@ class MediaCardMixin:
 
     def _paint_title_desc_chrome(self, painter):
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#1e1e1e"))
+        painter.setBrush(QColor(self.color) if self.color else QColor("#1e1e1e"))
         if self.show_title:
             painter.drawRect(QRectF(0, 0, self._w, self._title_bar_h()))
         if self.show_description:
@@ -1638,6 +1787,7 @@ class MediaCardMixin:
         desc_action = menu.addAction("Show Description")
         desc_action.setCheckable(True)
         desc_action.setChecked(self.show_description)
+        self._build_top_strip_context_menu(menu)
         menu.addSeparator()
         self._media_title_action = title_action
         self._media_desc_action = desc_action
@@ -1651,16 +1801,24 @@ class MediaCardMixin:
         if action is getattr(self, "_media_desc_action", None):
             self._toggle_show_description()
             return True
+        if self._handle_top_strip_context_action(action):
+            return True
         return False
 
 
-class ImageItem(MediaCardMixin, BaseComponentItem):
+class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     TYPE_NAME = "image"
+    DEFAULT_COLOR = "#1e1e1e"  # title/description bar background fill (see
+                                # MediaCardMixin._paint_title_desc_chrome) -
+                                # matches TextNoteItem's default.
+    COLOR_TAB_LABEL = "Background"
 
     def __init__(self, x=0, y=0, w=240, h=180, pixmap=None, b64=None, item_id=None,
                  title="", description="", show_title=True, show_description=True,
-                 title_font=None, desc_font=None, title_color=None, desc_color=None):
+                 title_font=None, desc_font=None, title_color=None, desc_color=None,
+                 top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
+        self._init_top_strip(top_strip_enabled, top_strip_color)
         self.pixmap_orig = pixmap if pixmap is not None else base64_to_pixmap(b64)
         # Cache of the last smooth-scaled pixmap, keyed by target size -
         # scaling a full-resolution photo is expensive, and paint() can be
@@ -1762,6 +1920,7 @@ class ImageItem(MediaCardMixin, BaseComponentItem):
         painter.setPen(self._frame_pen("#000000"))
         painter.setBrush(Qt.NoBrush)
         painter.drawRect(self.rect())
+        self._paint_top_strip(painter)
         self.paint_handle(painter)
 
     def dragEnterEvent(self, event):
@@ -1783,14 +1942,14 @@ class ImageItem(MediaCardMixin, BaseComponentItem):
     def serialize(self):
         d = super().serialize()
         d["data"] = self._get_b64()
-        return self._title_desc_serialize(d)
+        return self._top_strip_serialize(self._title_desc_serialize(d))
 
     def to_html(self):
         b64 = self._get_b64()
         title_html, desc_html = self._title_desc_html()
         return (
             f'<div class="comp image-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
-            f'width:{self._w}px;height:{self._h}px;">{title_html}'
+            f'width:{self._w}px;height:{self._h}px;">{self._top_strip_html()}{title_html}'
             f'<img src="data:image/png;base64,{b64}" />{desc_html}</div>'
         )
 
@@ -1799,13 +1958,17 @@ class ImageItem(MediaCardMixin, BaseComponentItem):
 # GIF (animated)
 # --------------------------------------------------------------------------
 
-class GifItem(MediaCardMixin, BaseComponentItem):
+class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     TYPE_NAME = "gif"
+    DEFAULT_COLOR = "#1e1e1e"
+    COLOR_TAB_LABEL = "Background"
 
     def __init__(self, x=0, y=0, w=240, h=180, gif_bytes=None, b64=None, item_id=None,
                  title="", description="", show_title=True, show_description=True,
-                 title_font=None, desc_font=None, title_color=None, desc_color=None):
+                 title_font=None, desc_font=None, title_color=None, desc_color=None,
+                 top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
+        self._init_top_strip(top_strip_enabled, top_strip_color)
         if gif_bytes is not None:
             self.gif_bytes = gif_bytes
         elif b64:
@@ -1897,6 +2060,7 @@ class GifItem(MediaCardMixin, BaseComponentItem):
         painter.setPen(self._frame_pen("#000000"))
         painter.setBrush(Qt.NoBrush)
         painter.drawRect(self.rect())
+        self._paint_top_strip(painter)
         self.paint_handle(painter)
 
     def dragEnterEvent(self, event):
@@ -1921,14 +2085,14 @@ class GifItem(MediaCardMixin, BaseComponentItem):
     def serialize(self):
         d = super().serialize()
         d["data"] = base64.b64encode(self.gif_bytes).decode("ascii") if self.gif_bytes else ""
-        return self._title_desc_serialize(d)
+        return self._top_strip_serialize(self._title_desc_serialize(d))
 
     def to_html(self):
         b64 = base64.b64encode(self.gif_bytes).decode("ascii") if self.gif_bytes else ""
         title_html, desc_html = self._title_desc_html()
         return (
             f'<div class="comp gif-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
-            f'width:{self._w}px;height:{self._h}px;">{title_html}'
+            f'width:{self._w}px;height:{self._h}px;">{self._top_strip_html()}{title_html}'
             f'<img src="data:image/gif;base64,{b64}" />{desc_html}</div>'
         )
 
@@ -2110,14 +2274,18 @@ class VideoPlayerNode(QGraphicsObject):
         self._seeking = False
 
 
-class VideoItem(MediaCardMixin, BaseComponentItem):
+class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     TYPE_NAME = "video"
+    DEFAULT_COLOR = "#1e1e1e"
+    COLOR_TAB_LABEL = "Background"
     DRAG_STRIP_H = 16
 
     def __init__(self, x=0, y=0, w=320, h=220, video_bytes=None, b64=None, item_id=None,
                  title="", description="", show_title=True, show_description=True,
-                 title_font=None, desc_font=None, title_color=None, desc_color=None):
+                 title_font=None, desc_font=None, title_color=None, desc_color=None,
+                 top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
+        self._init_top_strip(top_strip_enabled, top_strip_color)
         if video_bytes is not None:
             self.video_bytes = video_bytes
         elif b64:
@@ -2181,6 +2349,7 @@ class VideoItem(MediaCardMixin, BaseComponentItem):
         painter.setPen(self._frame_pen("#000000"))
         painter.setBrush(Qt.NoBrush)
         painter.drawRect(self.rect())
+        self._paint_top_strip(painter)
         self.paint_handle(painter)
 
     def dragEnterEvent(self, event):
@@ -2205,14 +2374,14 @@ class VideoItem(MediaCardMixin, BaseComponentItem):
     def serialize(self):
         d = super().serialize()
         d["data"] = base64.b64encode(self.video_bytes).decode("ascii") if self.video_bytes else ""
-        return self._title_desc_serialize(d)
+        return self._top_strip_serialize(self._title_desc_serialize(d))
 
     def to_html(self):
         b64 = base64.b64encode(self.video_bytes).decode("ascii") if self.video_bytes else ""
         title_html, desc_html = self._title_desc_html()
         return (
             f'<div class="comp video-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
-            f'width:{self._w}px;height:{self._h}px;">{title_html}'
+            f'width:{self._w}px;height:{self._h}px;">{self._top_strip_html()}{title_html}'
             f'<video controls src="data:video/mp4;base64,{b64}"></video>{desc_html}</div>'
         )
 
@@ -3656,7 +3825,7 @@ class SubitemDragGhost(QGraphicsObject):
         painter.drawText(QRectF(0, -18, self._w, 16), Qt.AlignHCenter | Qt.AlignVCenter, caption)
 
 
-class BoardCardItem(BaseComponentItem):
+class BoardCardItem(TopStripMixin, BaseComponentItem):
     TYPE_NAME = "board"
     DEFAULT_COLOR = "#2b2b2b"
     MEDIA_GAP = 18  # vertical gap between stacked image/gif/video subitems
@@ -3673,8 +3842,10 @@ class BoardCardItem(BaseComponentItem):
                           # dragging that subitem out needs its own grab
                           # target that isn't fighting the widget for clicks
 
-    def __init__(self, x=0, y=0, w=280, h=320, title="New Board", subitems=None, item_id=None):
+    def __init__(self, x=0, y=0, w=280, h=320, title="New Board", subitems=None, item_id=None,
+                 top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
+        self._init_top_strip(top_strip_enabled, top_strip_color)
         self.subitems = subitems or []
         self.min_w, self.min_h = 160, 120
         self.setAcceptDrops(True)
@@ -4181,6 +4352,7 @@ class BoardCardItem(BaseComponentItem):
         painter.setBrush(QColor("#1e1e1e"))
         painter.drawRect(QRectF(0, 0, self._w, 36))
         painter.restore()
+        self._paint_top_strip(painter, clip_path=path)
 
         y = 42
         pad = 8
@@ -4404,11 +4576,18 @@ class BoardCardItem(BaseComponentItem):
                 self.add_subitem({"kind": "image", "data": b64})
         event.acceptProposedAction()
 
+    def _build_context_menu(self, menu):
+        self._build_top_strip_context_menu(menu)
+        menu.addSeparator()
+
+    def _handle_context_action(self, action):
+        self._handle_top_strip_context_action(action)
+
     def serialize(self):
         d = super().serialize()
         d["title"] = self.title_item.toPlainText()
         d["subitems"] = self.subitems
-        return d
+        return self._top_strip_serialize(d)
 
     def to_html(self):
         rows = []
@@ -4480,7 +4659,7 @@ class BoardCardItem(BaseComponentItem):
         bg_css = color_to_css(self.color or self.DEFAULT_COLOR)
         return (
             f'<div class="comp board-card" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
-            f'width:{self._w}px;height:{self._h}px;background:{bg_css};">'
+            f'width:{self._w}px;height:{self._h}px;background:{bg_css};">{self._top_strip_html()}'
             f'<div class="board-title">{title}</div>'
             f'<div class="board-body">{"".join(rows)}</div></div>'
         )
@@ -5260,6 +5439,10 @@ def deserialize_component(d):
         # so "Change Color" round-trips through save/load for all
         # component kinds.
         item.color = d.get("color")
+    if isinstance(item, TopStripMixin):
+        item.top_strip_enabled = bool(d.get("top_strip_enabled", False))
+        if d.get("top_strip_color"):
+            item.top_strip_color = d.get("top_strip_color")
     return item
 
 
@@ -6479,6 +6662,17 @@ class MainWindow(QMainWindow):
         self.media_desc_checkbox.toggled.connect(self.on_media_desc_toggled)
         self.media_desc_checkbox_action.setVisible(False)
 
+        # Top Strip - available on Text Note, Image, GIF, Video and Board
+        # Card (see TopStripMixin) - so this one checkbox covers several
+        # otherwise-unrelated component types at once, unlike the
+        # type-specific checkboxes above.
+        self.top_strip_checkbox = QCheckBox("  Top Strip")
+        self.top_strip_checkbox.setStyleSheet(checkbox_style)
+        self.top_strip_checkbox.setFocusPolicy(Qt.NoFocus)
+        self.top_strip_checkbox_action = draw_tb.addWidget(self.top_strip_checkbox)
+        self.top_strip_checkbox.toggled.connect(self.on_top_strip_toggled)
+        self.top_strip_checkbox_action.setVisible(False)
+
         # -- text formatting controls (Text Note / Text only) -----------
         # Hidden by default; on_selection_changed shows them only while a
         # text component is selected, so they don't clutter the toolbar
@@ -6704,11 +6898,23 @@ class MainWindow(QMainWindow):
             self.media_desc_checkbox.setChecked(media_sel[0].show_description)
             self.media_desc_checkbox.blockSignals(False)
 
+        # Top Strip - Text Note, Image, GIF, Video, Board Card (see
+        # TopStripMixin) - a single checkbox spanning several otherwise
+        # unrelated component types, mirrored by all_sel rather than any
+        # one of the type-specific *_sel lists above.
+        top_strip_sel = [it for it in all_sel if isinstance(it, TopStripMixin)]
+        self._top_strip_selection = top_strip_sel or None
+        self.top_strip_checkbox_action.setVisible(bool(top_strip_sel))
+        if top_strip_sel:
+            self.top_strip_checkbox.blockSignals(True)
+            self.top_strip_checkbox.setChecked(top_strip_sel[0].top_strip_enabled)
+            self.top_strip_checkbox.blockSignals(False)
+
         # Only show the leading separator (and its extra spacing) when at
         # least one of the checkboxes it introduces is actually visible -
         # otherwise it'd leave a stray divider mark on the toolbar even
         # with nothing selected.
-        self.checkbox_group_sep.setVisible(bool(text_note_sel or arrow_sel or media_sel))
+        self.checkbox_group_sep.setVisible(bool(text_note_sel or arrow_sel or media_sel or top_strip_sel))
 
         if editing_item is not None:
             # In-place text editing (or a text selection within it) takes
@@ -6890,6 +7096,19 @@ class MainWindow(QMainWindow):
             # component's own color - the background fill for a Text
             # Note, or (its only color) the text color for a plain Text.
             first = self._text_selection[0]
+            if isinstance(first, TopStripMixin) and first.top_strip_enabled:
+                bg, strip = open_bg_strip_color_dialog(
+                    self, QColor(first.color) if first.color else QColor(first.DEFAULT_COLOR),
+                    QColor(first.top_strip_color), bg_label=first.COLOR_TAB_LABEL,
+                )
+                if bg is None:
+                    return
+                for it in self._text_selection:
+                    it.set_color(bg)
+                    if isinstance(it, TopStripMixin):
+                        it.set_top_strip_color(strip)
+                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #888;")
+                return
             start = QColor(first.color) if first.color else QColor(first.DEFAULT_COLOR)
             color = QColorDialog.getColor(start, self, "Pick component color")
             if not color.isValid():
@@ -6908,6 +7127,20 @@ class MainWindow(QMainWindow):
                 # entry point (this button, and its context menu) opens
                 # its dedicated settings dialog instead of QColorDialog.
                 first.open_settings_dialog(self)
+                return
+            if isinstance(first, TopStripMixin) and first.top_strip_enabled:
+                bg, strip = open_bg_strip_color_dialog(
+                    self,
+                    QColor(first.color) if getattr(first, "color", None) else QColor(getattr(first, "DEFAULT_COLOR", None) or "#ffffff"),
+                    QColor(first.top_strip_color), bg_label=first.COLOR_TAB_LABEL,
+                )
+                if bg is None:
+                    return
+                for it in self._other_selection:
+                    it.set_color(bg)
+                    if isinstance(it, TopStripMixin):
+                        it.set_top_strip_color(strip)
+                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #888;")
                 return
             start = QColor(first.color) if getattr(first, "color", None) else QColor(getattr(first, "DEFAULT_COLOR", None) or "#ffffff")
             color = QColorDialog.getColor(start, self, "Pick component color")
@@ -7114,6 +7347,13 @@ class MainWindow(QMainWindow):
         for it in self._media_selection:
             if it.show_description != checked:
                 it._toggle_show_description()
+
+    def on_top_strip_toggled(self, checked):
+        if not getattr(self, "_top_strip_selection", None):
+            return
+        for it in self._top_strip_selection:
+            if it.top_strip_enabled != checked:
+                it._toggle_top_strip()
 
     def toggle_draw_mode(self, checked):
         self.scene.draw_mode = checked
