@@ -140,33 +140,31 @@ def base64_to_pixmap(b64):
     return pm
 
 
-class _BgStripColorDialog(QDialog):
-    """Two-tab color picker used whenever a component with its Top Strip
-    enabled has its color changed (see TopStripMixin._open_color_dialog
-    and MainWindow.pick_color) - one tab for the component's regular
-    Background color, one for the Top Strip color, each tab hosting the
-    exact same standard QColorDialog picker widget the rest of the app
-    already uses for every other "Change Color" action, just embedded
-    instead of shown standalone (QColorDialog.NoButtons hides its own
-    OK/Cancel/pick-screen-color row - this dialog has one shared row for
-    both tabs at the bottom instead)."""
+class _MultiColorDialog(QDialog):
+    """N-tab color picker - one tab per (label, start_color) pair, each
+    hosting the exact same standard QColorDialog picker widget the rest
+    of the app already uses for every other "Change Color" action, just
+    embedded instead of shown standalone (QColorDialog.NoButtons hides
+    its own OK/Cancel/pick-screen-color row - this dialog has one shared
+    row for all tabs at the bottom instead). Powers both the classic
+    two-tab Background/Top Strip picker and, in MainWindow.pick_color,
+    a three-tab Text/Highlight/Top Strip picker when a selected text run
+    happens to need both at once."""
 
-    def __init__(self, parent, bg_color, strip_color, title="Pick component color", bg_label="Background"):
+    def __init__(self, parent, tabs, title="Pick color"):
         super().__init__(parent)
         self.setWindowTitle(title)
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-        layout.addWidget(tabs)
+        tab_widget = QTabWidget()
+        layout.addWidget(tab_widget)
 
-        self.bg_picker = QColorDialog(bg_color, self)
-        self.bg_picker.setWindowFlags(Qt.Widget)
-        self.bg_picker.setOption(QColorDialog.NoButtons, True)
-        tabs.addTab(self.bg_picker, bg_label)
-
-        self.strip_picker = QColorDialog(strip_color, self)
-        self.strip_picker.setWindowFlags(Qt.Widget)
-        self.strip_picker.setOption(QColorDialog.NoButtons, True)
-        tabs.addTab(self.strip_picker, "Top Strip")
+        self._pickers = []
+        for label, color in tabs:
+            picker = QColorDialog(color, self)
+            picker.setWindowFlags(Qt.Widget)
+            picker.setOption(QColorDialog.NoButtons, True)
+            tab_widget.addTab(picker, label)
+            self._pickers.append(picker)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -174,19 +172,32 @@ class _BgStripColorDialog(QDialog):
         layout.addWidget(buttons)
 
     def selected_colors(self):
-        return self.bg_picker.currentColor(), self.strip_picker.currentColor()
+        return [p.currentColor() for p in self._pickers]
 
 
-def open_bg_strip_color_dialog(parent, bg_start, strip_start, title="Pick component color", bg_label="Background"):
+def open_multi_color_dialog(parent, tabs, title="Pick color"):
+    """Show the N-tab picker above; `tabs` is a list of (label, start_color)
+    pairs. Returns a list of chosen colors (same order as `tabs`) if
+    accepted, or None if cancelled."""
+    dlg = _MultiColorDialog(parent, tabs, title)
+    if dlg.exec() == QDialog.Accepted:
+        return dlg.selected_colors()
+    return None
+
+
+def open_bg_strip_color_dialog(parent, bg_start, strip_start, title="Pick component color", bg_label="Background",
+                                strip_label="Top Strip"):
     """Show the two-tab picker above; returns (bg_color, strip_color) if
     accepted, or (None, None) if cancelled. bg_label names what the first
     tab actually controls - "Background" for a real fill (Text Note,
     Board Card), "Border" for Image/GIF/Video (see TopStripMixin.
-    COLOR_TAB_LABEL)."""
-    dlg = _BgStripColorDialog(parent, bg_start, strip_start, title, bg_label)
-    if dlg.exec() == QDialog.Accepted:
-        return dlg.selected_colors()
-    return None, None
+    COLOR_TAB_LABEL). strip_label names the second tab - "Top Strip" for
+    components, or "Highlight" when reused for text highlight color (see
+    MainWindow.pick_color)."""
+    result = open_multi_color_dialog(parent, [(bg_label, bg_start), (strip_label, strip_start)], title)
+    if result is None:
+        return None, None
+    return result[0], result[1]
 
 
 # File extension -> MIME type for board-link thumbnails (raster images
@@ -693,6 +704,19 @@ def _qtextdocument_to_web_html(document, base_family="Segoe UI", base_size=11.0)
             it += 1
         block = block.next()
     return "".join(parts)
+
+
+def _subitem_top_strip_html(item):
+    """Board Card subitems (image/gif/video/text) can each have their own
+    Top Strip, same as the standalone components they came from - but
+    they only exist as plain dict data inside the card (no live
+    TopStripMixin instance), so BoardCardItem.to_html() needs its own
+    tiny renderer instead of calling TopStripMixin._top_strip_html()."""
+    if not item.get("top_strip_enabled"):
+        return ""
+    color = item.get("top_strip_color") or TopStripMixin.DEFAULT_STRIP_COLOR
+    return (f'<div style="position:absolute;left:0;top:0;right:0;'
+            f'height:{TopStripMixin.TOP_STRIP_H}px;background:{color};"></div>')
 
 
 def _rich_html_from_doc_html(doc_html, base_family="Segoe UI", base_size=11.0):
@@ -1503,6 +1527,17 @@ class TextNoteItem(TopStripMixin, BaseComponentItem):
             text = (f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
                     f'style="color:inherit;text-decoration:underline">{text}</a>')
         bg_css = color_to_css(self.color)
+        # self.text_color (set via set_text_color()) is what the app
+        # actually paints as this field's default text color - it lives
+        # on the QGraphicsTextItem's defaultTextColor(), NOT as a
+        # QTextCharFormat.foreground() brush, so _qtextdocument_to_web_html
+        # never sees it and emits no color:... for runs the user never
+        # explicitly recolored. Without an explicit color here, those
+        # runs fell back to the CSS class's own default (#222), which is
+        # dark and doesn't match e.g. the app's own light-gray default
+        # (#e8e8e8) - explicitly setting it on the wrapper div lets CSS
+        # inheritance supply it for every un-colored span underneath.
+        text_color_css = color_to_css(self.text_color)
         title_html = ""
         if self.show_title:
             tf = self.title_item.font()
@@ -1511,7 +1546,7 @@ class TextNoteItem(TopStripMixin, BaseComponentItem):
             title_html = f'<div style="margin-bottom:4px">{title_text}</div>'
         return (
             f'<div class="comp text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
-            f'width:{self._w}px;height:{self._h}px;background:{bg_css};'
+            f'width:{self._w}px;height:{self._h}px;background:{bg_css};color:{text_color_css};'
             f'opacity:{self.opacity():.2f}">{self._top_strip_html()}{title_html}{text}</div>'
         )
 
@@ -1629,9 +1664,14 @@ class PlainTextItem(BaseComponentItem):
             safe_url = self.link_url.replace('"', "&quot;")
             text = (f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
                     f'style="color:inherit;text-decoration:underline">{text}</a>')
+        # Same fix as TextNoteItem.to_html above: self.color IS this
+        # component's text color (see set_color) but only lives on
+        # defaultTextColor(), not in the document's own char formats, so
+        # it must be set explicitly here for un-colored runs to inherit
+        # it instead of falling back to the browser's default black.
         return (
             f'<div class="comp plain-text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
-            f'width:{self._w}px;height:{self._h}px;'
+            f'width:{self._w}px;height:{self._h}px;color:{color_to_css(self.color)};'
             f'opacity:{self.opacity():.2f}">{text}</div>'
         )
 
@@ -3918,6 +3958,15 @@ class _SubitemTextEdit(EditableTextItem):
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
+        if self._losing_focus_to_font_combo() or QApplication.activeModalWidget() is not None:
+            # Same guard as EditableTextItem.focusOutEvent above: a modal
+            # color/link dialog (or the font-family combo) only takes
+            # focus momentarily. Ending the edit here - which commits the
+            # subitem's text/html and tears the overlay down - would
+            # leave nothing left for pick_color()/etc. to apply the
+            # chosen color to once the dialog closes, and made it look
+            # like the subitem's text edit had simply lost focus/selection.
+            return
         if self._on_finish:
             self._on_finish()
 
@@ -4686,6 +4735,11 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             kind = item.get("kind")
             row_top = y
             if kind in ("image", "gif"):
+                if item.get("top_strip_enabled"):
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QColor(item.get("top_strip_color") or self.DEFAULT_STRIP_COLOR))
+                    painter.drawRect(QRectF(pad, y, avail_w, self.TOP_STRIP_H))
+                    y += self.TOP_STRIP_H + 4
                 if kind == "gif":
                     # A per-subitem QMovie drives real animation here -
                     # its frameChanged signal keeps this pixmap current
@@ -4734,6 +4788,11 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 y += self.MEDIA_GAP
                 self._subitem_rects.append((idx, QRectF(pad, row_top, avail_w, y - row_top)))
             elif kind == "video":
+                if item.get("top_strip_enabled"):
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QColor(item.get("top_strip_color") or self.DEFAULT_STRIP_COLOR))
+                    painter.drawRect(QRectF(pad, y, avail_w, self.TOP_STRIP_H))
+                    y += self.TOP_STRIP_H + 4
                 # Videos have no decoded thumbnail to measure, but the
                 # aspect ratio of the source is stored on the subitem (see
                 # component_to_subitem) so the player box keeps the same
@@ -4778,6 +4837,11 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 y += self.MEDIA_GAP
                 self._subitem_rects.append((idx, QRectF(pad, row_top, avail_w, y - row_top)))
             elif kind == "text":
+                if item.get("top_strip_enabled"):
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QColor(item.get("top_strip_color") or self.DEFAULT_STRIP_COLOR))
+                    painter.drawRect(QRectF(pad, y, avail_w, self.TOP_STRIP_H))
+                    y += self.TOP_STRIP_H + 4
                 sub_font = QFont(item.get("font_family") or "Segoe UI", 10)
                 sub_font.setBold(bool(item.get("bold")))
                 sub_font.setItalic(bool(item.get("italic")))
@@ -4946,7 +5010,9 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 else:
                     media = f'<video controls src="data:video/mp4;base64,{item.get("data","")}"></video>'
                     css_class = "sub-video"
-                rows.append(f'<div class="{css_class}">{t_html}{media}{d_html}</div>')
+                strip_html = _subitem_top_strip_html(item)
+                pad_style = f"padding-top:{TopStripMixin.TOP_STRIP_H + 4}px;" if strip_html else ""
+                rows.append(f'<div class="{css_class}" style="position:relative;{pad_style}">{strip_html}{t_html}{media}{d_html}</div>')
             elif kind == "text":
                 title_html = ""
                 if item.get("note_type") == "text" and item.get("show_title") and item.get("title"):
@@ -5000,7 +5066,9 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                         style_bits.append(f"color:{color_to_css(item.get('color'))}")
                     style = ";".join(style_bits)
                     t = f'<span style="{style}">{t}</span>'
-                rows.append(f'<div class="sub-text">{title_html}{t}</div>')
+                strip_html = _subitem_top_strip_html(item)
+                pad_style = f"padding-top:{TopStripMixin.TOP_STRIP_H + 4}px;" if strip_html else ""
+                rows.append(f'<div class="sub-text" style="position:relative;{pad_style}">{strip_html}{title_html}{t}</div>')
             elif kind == "checklist":
                 lis = "".join(f'<li><input type="checkbox" disabled> {x}</li>' for x in item.get("items", []))
                 rows.append(f'<ul class="sub-checklist">{lis}</ul>')
@@ -5012,10 +5080,15 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         title = _qtextdocument_to_web_html(
             self.title_item.document(), base_family=tf.family(), base_size=tf.pointSizeF())
         bg_css = color_to_css(self.color or self.DEFAULT_COLOR)
+        # Same fix as TextNoteItem.to_html: the title's default color
+        # (settable via title_color, see __init__) only lives on
+        # defaultTextColor(), so un-colored runs need it set explicitly
+        # here instead of silently inheriting .board-title's CSS default.
+        title_color_css = color_to_css(self.title_item.defaultTextColor().name())
         return (
             f'<div class="comp board-card" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;background:{bg_css};">{self._top_strip_html()}'
-            f'<div class="board-title">{title}</div>'
+            f'<div class="board-title" style="color:{title_color_css};">{title}</div>'
             f'<div class="board-body">{"".join(rows)}</div></div>'
         )
 
@@ -5562,6 +5635,8 @@ def component_to_subitem(item):
             # this to export the same highlight that shows in the app.
             "title_html": item.title_item.document().toHtml(),
             "description_html": item.description_item.document().toHtml(),
+            "top_strip_enabled": item.top_strip_enabled,
+            "top_strip_color": item.top_strip_color,
         }
     if isinstance(item, GifItem):
         return {
@@ -5577,6 +5652,8 @@ def component_to_subitem(item):
             "description_color": item.description_item.defaultTextColor().name(),
             "title_html": item.title_item.document().toHtml(),
             "description_html": item.description_item.document().toHtml(),
+            "top_strip_enabled": item.top_strip_enabled,
+            "top_strip_color": item.top_strip_color,
         }
     if isinstance(item, VideoItem):
         return {
@@ -5597,6 +5674,8 @@ def component_to_subitem(item):
             "description_color": item.description_item.defaultTextColor().name(),
             "title_html": item.title_item.document().toHtml(),
             "description_html": item.description_item.document().toHtml(),
+            "top_strip_enabled": item.top_strip_enabled,
+            "top_strip_color": item.top_strip_color,
         }
     if isinstance(item, (TextNoteItem, PlainTextItem)):
         f = item.text_item.font()
@@ -5629,6 +5708,8 @@ def component_to_subitem(item):
             d["show_title"] = item.show_title
             d["title_font"] = _font_to_dict(item.title_item.font())
             d["title_html"] = item.title_item.document().toHtml()
+            d["top_strip_enabled"] = item.top_strip_enabled
+            d["top_strip_color"] = item.top_strip_color
         return d
     if isinstance(item, DrawingItem):
         img = QImage(max(1, int(item._w)), max(1, int(item._h)), QImage.Format_ARGB32)
@@ -5666,21 +5747,27 @@ def subitem_to_component(subitem, x, y):
                           show_title=subitem.get("show_title", True),
                           show_description=subitem.get("show_description", True),
                           title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
-                          title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"))
+                          title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"),
+                          top_strip_enabled=subitem.get("top_strip_enabled", False),
+                          top_strip_color=subitem.get("top_strip_color"))
     if kind == "gif":
         return GifItem(x, y, b64=subitem.get("data"),
                         title=subitem.get("title", ""), description=subitem.get("description", ""),
                         show_title=subitem.get("show_title", True),
                         show_description=subitem.get("show_description", True),
                         title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
-                        title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"))
+                        title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"),
+                        top_strip_enabled=subitem.get("top_strip_enabled", False),
+                        top_strip_color=subitem.get("top_strip_color"))
     if kind == "video":
         return VideoItem(x, y, b64=subitem.get("data"),
                           title=subitem.get("title", ""), description=subitem.get("description", ""),
                           show_title=subitem.get("show_title", True),
                           show_description=subitem.get("show_description", True),
                           title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
-                          title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"))
+                          title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"),
+                          top_strip_enabled=subitem.get("top_strip_enabled", False),
+                          top_strip_color=subitem.get("top_strip_color"))
     if kind == "text":
         cls = PlainTextItem if subitem.get("note_type") == "plaintext" else TextNoteItem
         kwargs = dict(
@@ -5700,6 +5787,8 @@ def subitem_to_component(subitem, x, y):
             kwargs["show_title"] = subitem.get("show_title", False)
             kwargs["title_font"] = subitem.get("title_font")
             kwargs["title_html"] = subitem.get("title_html")
+            kwargs["top_strip_enabled"] = subitem.get("top_strip_enabled", False)
+            kwargs["top_strip_color"] = subitem.get("top_strip_color")
         return cls(x, y, **kwargs)
     if kind == "checklist":
         # No standalone checklist component exists yet, so fall back to a
@@ -6325,7 +6414,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   body.has-breadcrumb #viewport {{ height:calc(100vh - 37px); margin-top:37px; }}
   #canvas {{ position:absolute; top:0; left:0; transform-origin:0 0; }}
   .comp {{ position:absolute; box-sizing:border-box; }}
-  .text-note {{ border-radius:8px; padding:10px; color:#222; box-shadow:0 2px 6px rgba(0,0,0,.4); white-space:pre-wrap; overflow:auto; }}
+  .text-note {{ border-radius:8px; padding:10px; color:#e8e8e8; box-shadow:0 2px 6px rgba(0,0,0,.4); white-space:pre-wrap; overflow:auto; }}
   .plain-text-note {{ padding:4px; white-space:pre-wrap; overflow:auto; font-size:15px; }}
   .image-note, .gif-note, .video-note {{ display:flex; flex-direction:column; background:#111; border:1px solid #000; box-sizing:border-box; }}
   .image-note img, .gif-note img {{ flex:1 1 auto; width:100%; min-height:0; object-fit:contain; background:#111; }}
@@ -7139,18 +7228,14 @@ class MainWindow(QMainWindow):
         self.link_action = draw_tb.addWidget(self.link_btn)
 
         # -- text highlight (background color behind a run of text) -----
-        # A checkable toggle button + color-swatch pair. The toggle
-        # button mirrors Bold/Italic/Underline above (a plain checkable
-        # QToolButton that shows pressed/active exactly when the current
-        # cursor position/selection already has a highlight - see
-        # _refresh_text_format_buttons) rather than a QCheckBox: unlike a
-        # checkbox, its `toggled` signal firing doesn't depend on the
-        # widget retaining any notion of prior checked state across the
-        # click, which is what made *un*checking the old checkbox
-        # unreliable while a text selection was active. The swatch
-        # button next to it always shows the current highlight color and
-        # doubles as the button that opens the color picker (same
-        # pairing as self.color_btn elsewhere on this toolbar).
+        # A plain checkable toggle, mirroring Bold/Italic/Underline above -
+        # shows pressed/active exactly when the current cursor position/
+        # selection already has a highlight (see _refresh_text_format_
+        # buttons). There used to be a second color-swatch button next to
+        # this one just for picking the highlight color; that's gone now -
+        # while a highlight is active, the main Color button/window (see
+        # MainWindow.pick_color) grows a "Highlight" tab instead, the same
+        # way it grows a "Top Strip" tab for components that have one.
         self.highlight_btn = QToolButton()
         self.highlight_btn.setText("Highlight")
         self.highlight_btn.setToolTip("Text highlight")
@@ -7160,17 +7245,6 @@ class MainWindow(QMainWindow):
         self.highlight_action = draw_tb.addWidget(self.highlight_btn)
 
         self.highlight_color = QColor("#ffff00")
-        self.highlight_color_btn = QPushButton()
-        self.highlight_color_btn.setFixedSize(26, 26)
-        # Same NoFocus reasoning as color_btn above: this must not steal
-        # focus away from the text item currently being edited.
-        self.highlight_color_btn.setFocusPolicy(Qt.NoFocus)
-        self.highlight_color_btn.setToolTip("Highlight color")
-        self.highlight_color_btn.setStyleSheet(
-            f"background-color:{self.highlight_color.name()}; border:1px solid #888;"
-        )
-        self.highlight_color_btn.clicked.connect(self.pick_highlight_color)
-        self.highlight_color_action = draw_tb.addWidget(self.highlight_color_btn)
 
         # Placed last on the toolbar (rather than beside Brush, where it
         # used to live) so it always sits at the far end of the bar.
@@ -7186,7 +7260,7 @@ class MainWindow(QMainWindow):
         self._font_format_actions = [
             self.text_format_sep, self.font_label_action, self.font_action,
             self.bold_action, self.italic_action, self.underline_action,
-            self.highlight_action, self.highlight_color_action,
+            self.highlight_action,
         ]
         self._text_format_actions = self._font_format_actions + [self.link_action]
         for a in self._text_format_actions:
@@ -7498,7 +7572,6 @@ class MainWindow(QMainWindow):
         self.highlight_btn.blockSignals(False)
         if bg.style() != Qt.NoBrush:
             self.highlight_color = bg.color()
-            self.highlight_color_btn.setStyleSheet(f"background-color:{bg.color().name()}; border:1px solid #888;")
         if self.link_action.isVisible():
             self.link_btn.blockSignals(True)
             self.link_btn.setChecked(fmt.isAnchor())
@@ -7515,12 +7588,64 @@ class MainWindow(QMainWindow):
             parent = editing_item.parentItem()
             cur = editing_item.textCursor()
             has_sel = cur.hasSelection()
-            fg = cur.charFormat().foreground()
+            fmt = cur.charFormat()
+            fg = fmt.foreground()
             start = fg.color() if (has_sel and fg.style() != Qt.NoBrush) else editing_item.defaultTextColor()
-            color = QColorDialog.getColor(start, self, "Pick text color")
-            if not color.isValid():
-                return
-            _apply_run_format(editing_item, has_sel, foreground=color.name())
+            bg_fmt = fmt.background()
+            has_highlight = bg_fmt.style() != Qt.NoBrush
+            # Figure out whether this text's own component (or, inside a
+            # Board Card, the specific subitem being edited - a plain
+            # dict, not a live TopStripMixin instance, so it needs its
+            # own lookup) has an active Top Strip, and how to persist a
+            # new strip color back to whichever one it is.
+            strip_start = None
+            apply_strip = None
+            if isinstance(parent, TopStripMixin) and parent.top_strip_enabled:
+                strip_start = QColor(parent.top_strip_color)
+                apply_strip = parent.set_top_strip_color
+            elif (isinstance(parent, BoardCardItem) and parent._sub_edit_index is not None
+                  and parent._sub_edit_index < len(parent.subitems)
+                  and parent.subitems[parent._sub_edit_index].get("top_strip_enabled")):
+                sub = parent.subitems[parent._sub_edit_index]
+                strip_start = QColor(sub.get("top_strip_color") or TopStripMixin.DEFAULT_STRIP_COLOR)
+
+                def apply_strip(c, _sub=sub, _parent=parent):
+                    _sub["top_strip_color"] = c.name()
+                    _parent.update()
+
+            # Build one tab per color role that actually applies here -
+            # Text always, plus Highlight and/or Top Strip when present -
+            # so a run that has both still gets both in the SAME dialog
+            # instead of one silently hiding the other.
+            tabs = [("Text", start)]
+            if has_highlight:
+                tabs.append(("Highlight", bg_fmt.color()))
+            if strip_start is not None:
+                tabs.append(("Top Strip", strip_start))
+
+            if len(tabs) > 1:
+                result = open_multi_color_dialog(self, tabs, title="Pick text color")
+                if result is None:
+                    return
+                i = 1
+                color = result[0]
+                hl_color = None
+                if has_highlight:
+                    hl_color = result[i]
+                    i += 1
+                strip_color = result[i] if strip_start is not None else None
+                if has_highlight:
+                    _apply_run_format(editing_item, has_sel, foreground=color.name(), background=hl_color.name())
+                    self.highlight_color = hl_color
+                else:
+                    _apply_run_format(editing_item, has_sel, foreground=color.name())
+                if strip_color is not None:
+                    apply_strip(strip_color)
+            else:
+                color = QColorDialog.getColor(start, self, "Pick text color")
+                if not color.isValid():
+                    return
+                _apply_run_format(editing_item, has_sel, foreground=color.name())
             self._restore_text_edit_focus()
             if not has_sel:
                 if isinstance(parent, TextNoteItem):
@@ -7721,15 +7846,6 @@ class MainWindow(QMainWindow):
         if not self._font_selection:
             return
         self._apply_highlight(self.highlight_color.name() if checked else "")
-
-    def pick_highlight_color(self):
-        color = QColorDialog.getColor(self.highlight_color, self, "Pick highlight color")
-        if not color.isValid():
-            return
-        self.highlight_color = color
-        self.highlight_color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
-        if self._font_selection and self.highlight_btn.isChecked():
-            self._apply_highlight(color.name())
 
     def on_hyperlink_clicked(self):
         if not self._text_selection:
