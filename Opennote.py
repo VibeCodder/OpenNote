@@ -32,9 +32,10 @@ from PySide6.QtCore import (
     Qt, QRectF, QPointF, QPoint, QSize, QSizeF, QByteArray, QBuffer, QIODevice, QUrl, Signal, QTimer,
 )
 from PySide6.QtGui import (
-    QColor, QPen, QPainter, QPainterPath, QPixmap, QImage, QFont, QFontMetrics,
+    QColor, QPen, QBrush, QPainter, QPainterPath, QPixmap, QImage, QFont, QFontMetrics,
     QMovie, QPalette, QKeySequence, QAction, QGuiApplication,
-    QIcon, QActionGroup, QTextCursor, QIntValidator, QTextCharFormat,
+    QIcon, QActionGroup, QTextCursor, QIntValidator, QTextCharFormat, QTextDocument,
+    QAbstractTextDocumentLayout,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsObject,
@@ -526,6 +527,9 @@ def _apply_text_font(item, family=None, bold=None, italic=None, underline=None, 
     if hasattr(item, "_on_label_text_changed"):
         item._on_label_text_changed()
         item.update()
+    if hasattr(item, "_on_subitem_text_font_changed"):
+        item._on_subitem_text_font_changed()
+        item.update()
     if isinstance(item, TextNoteItem):
         item._on_text_changed()
         item.update()
@@ -535,17 +539,23 @@ _UNSET = object()  # sentinel: "leave this property alone" vs. an explicit None
 
 
 def _apply_run_format(text_item, has_selection, family=None, bold=None, italic=None,
-                       underline=None, point_size=None, foreground=None, anchor_url=_UNSET):
+                       underline=None, point_size=None, foreground=_UNSET, background=_UNSET,
+                       anchor_url=_UNSET):
     """Low-level formatting primitive shared by every toolbar text control
-    (Font family / Bold / Italic / Underline / Size / Color / Link):
-    merges a QTextCharFormat built from whichever of these are given into
-    either `text_item`'s current selection (has_selection=True - real
-    per-character rich text, exactly like any ordinary editor's toolbar)
-    or, with has_selection=False, a cursor spanning its entire document
-    (so the change reads as "the whole text field changed") - this also
-    overwrites any earlier per-character formatting already in that
-    field, so "no selection = whole field" stays literally true even
-    after part of it was restyled a different way a moment ago."""
+    (Font family / Bold / Italic / Underline / Size / Color / Highlight /
+    Link): merges a QTextCharFormat built from whichever of these are
+    given into either `text_item`'s current selection (has_selection=True
+    - real per-character rich text, exactly like any ordinary editor's
+    toolbar) or, with has_selection=False, a cursor spanning its entire
+    document (so the change reads as "the whole text field changed") -
+    this also overwrites any earlier per-character formatting already in
+    that field, so "no selection = whole field" stays literally true even
+    after part of it was restyled a different way a moment ago.
+
+    `foreground` and `background` follow the same "unset vs explicit"
+    convention as `anchor_url`: leave the argument out entirely to not
+    touch that property, pass a color (name/QColor) to set it, or pass
+    "" / None to explicitly clear it back to the item's own default."""
     cur = text_item.textCursor() if has_selection else QTextCursor(text_item.document())
     if not has_selection:
         cur.select(QTextCursor.Document)
@@ -560,20 +570,50 @@ def _apply_run_format(text_item, has_selection, family=None, bold=None, italic=N
         fmt.setFontItalic(italic)
     if point_size is not None:
         fmt.setFontPointSize(max(1.0, float(point_size)))
-    if foreground is not None:
-        fmt.setForeground(QColor(foreground))
+    if foreground is not _UNSET:
+        if foreground:
+            fmt.setForeground(QColor(foreground))
+        else:
+            # NOTE: clearForeground() would *remove* the property from
+            # this patch format instead of setting it - and
+            # mergeCharFormat() below only copies over properties that
+            # are actually present in the patch, so a removed property
+            # leaves whatever the destination already had untouched.
+            # An explicit empty QBrush (style NoBrush) *is* a real,
+            # merge-visible property, and NoBrush is exactly what Qt
+            # treats as "no override, fall back to the item's default
+            # color" (see editing_item.defaultTextColor() usage in
+            # _refresh_text_format_buttons) - so this is what actually
+            # clears a previously set color.
+            fmt.setForeground(QBrush())
+    if background is not _UNSET:
+        if background:
+            fmt.setBackground(QBrush(QColor(background)))
+        else:
+            # Same reasoning as foreground above: clearBackground() is a
+            # no-op through mergeCharFormat, an explicit NoBrush is not.
+            fmt.setBackground(QBrush())
     if anchor_url is not _UNSET:
-        # A hyperlink implies its familiar underlined look, same as when
-        # a whole item first becomes a link (see MainWindow.on_hyperlink_clicked).
         if anchor_url:
             fmt.setAnchor(True)
             fmt.setAnchorHref(anchor_url)
-            fmt.setFontUnderline(True)
         else:
             fmt.setAnchor(False)
             fmt.setAnchorHref("")
-    elif underline is not None:
+    # Underline is intentionally decoupled from the anchor branch above
+    # (rather than an `elif`) so an explicit underline=False can still
+    # clear the link's own auto-underline when a link is being removed
+    # (see MainWindow.on_hyperlink_clicked) - previously the two were
+    # mutually exclusive, which silently dropped any underline=False
+    # passed alongside anchor_url and left removed links visually
+    # underlined forever after.
+    if underline is not None:
         fmt.setFontUnderline(underline)
+    elif anchor_url is not _UNSET and anchor_url:
+        # A newly-created hyperlink implies its familiar underlined look
+        # (same as when a whole item first becomes a link), unless an
+        # explicit underline value was already given above.
+        fmt.setFontUnderline(True)
     cur.mergeCharFormat(fmt)
 
 
@@ -615,6 +655,9 @@ def _text_run_to_html(frag_text, fmt, base_family, base_size):
     fg = fmt.foreground()
     if fg.style() != Qt.NoBrush:
         style_bits.append(f"color:{fg.color().name()}")
+    bg = fmt.background()
+    if bg.style() != Qt.NoBrush:
+        style_bits.append(f"background-color:{bg.color().name()}")
     if f.bold() or f.weight() > QFont.Normal:
         style_bits.append("font-weight:bold")
     if f.italic():
@@ -650,6 +693,44 @@ def _qtextdocument_to_web_html(document, base_family="Segoe UI", base_size=11.0)
             it += 1
         block = block.next()
     return "".join(parts)
+
+
+def _rich_html_from_doc_html(doc_html, base_family="Segoe UI", base_size=11.0):
+    """Reconstruct a throwaway QTextDocument from Qt's own toHtml() output
+    (as stashed in a *_html field by serialize()/subitem editing) and
+    re-render it through _qtextdocument_to_web_html() to get portable,
+    per-run web HTML - including any highlight/color/bold/italic/underline
+    runs - out of text that only exists as saved dict/JSON data rather
+    than a live QGraphicsTextItem (Board Card subitems - see
+    BoardCardItem.to_html()). Returns None if there's nothing to render.
+    """
+    if not doc_html:
+        return None
+    doc = QTextDocument()
+    doc.setHtml(doc_html)
+    if not doc.toPlainText().strip():
+        return None
+    return _qtextdocument_to_web_html(doc, base_family=base_family, base_size=base_size)
+
+
+def _paint_rich_doc(painter, doc, rect, default_color):
+    """Paint a QTextDocument (built from a subitem's stored *_html, or
+    plain text as a fallback) at `rect`, honoring per-run background
+    (highlight) the same way the live in-place editors do - plain
+    QPainter.drawText() has no concept of that, which is why a subitem's
+    highlight used to only ever show while actively being edited and
+    vanish the instant editing ended (see BoardCardItem.paint()). This
+    drives the same QAbstractTextDocumentLayout a QGraphicsTextItem uses
+    internally, just directly, since these subitems don't have a
+    permanent QGraphicsTextItem of their own."""
+    painter.save()
+    painter.setClipRect(rect)
+    painter.translate(rect.topLeft())
+    ctx = QAbstractTextDocumentLayout.PaintContext()
+    ctx.palette.setColor(QPalette.Text, default_color)
+    ctx.clip = QRectF(0, 0, rect.width(), rect.height())
+    doc.documentLayout().draw(painter, ctx)
+    painter.restore()
 
 
 def _representative_font(item, editing_item=None):
@@ -1572,7 +1653,8 @@ class MediaCardMixin:
                        # title/description bars have grown to fit their text
 
     def _init_title_desc(self, title="", description="", show_title=True, show_description=True,
-                          title_font=None, desc_font=None, title_color=None, desc_color=None):
+                          title_font=None, desc_font=None, title_color=None, desc_color=None,
+                          title_html=None, desc_html=None):
         # Whether the title/description bars are shown at all - toggled
         # via the "Show Title"/"Show Description" context menu entries
         # (see _build_media_context_menu). When both are off, the media
@@ -1589,6 +1671,8 @@ class MediaCardMixin:
         self.title_item.setPlainText(title)
         self.title_item.setTextInteractionFlags(Qt.NoTextInteraction)
         self.title_item.document().setDocumentMargin(4)
+        if title_html:
+            self.title_item.document().setHtml(title_html)
 
         self.description_item = EditableTextItem(self)
         self.description_item.setDefaultTextColor(QColor(desc_color) if desc_color else QColor("#aaaaaa"))
@@ -1599,6 +1683,8 @@ class MediaCardMixin:
         self.description_item.setPlainText(description)
         self.description_item.setTextInteractionFlags(Qt.NoTextInteraction)
         self.description_item.document().setDocumentMargin(4)
+        if desc_html:
+            self.description_item.document().setHtml(desc_html)
 
         # Dynamic bar heights - fit the current text/font, growing or
         # shrinking as needed. Recomputed on every text edit
@@ -1726,6 +1812,12 @@ class MediaCardMixin:
         d["description_font"] = _font_to_dict(self.description_item.font())
         d["title_color"] = self.title_item.defaultTextColor().name()
         d["description_color"] = self.description_item.defaultTextColor().name()
+        # Full rich-text fidelity (per-character bold/italic/underline/
+        # color/highlight runs from selection-based toolbar edits) - see
+        # TextNoteItem.serialize for the same pattern. The plain "title"/
+        # "description" strings above remain as a simple fallback.
+        d["title_html"] = self.title_item.document().toHtml()
+        d["description_html"] = self.description_item.document().toHtml()
         return d
 
     @staticmethod
@@ -1755,14 +1847,27 @@ class MediaCardMixin:
         return ";".join(bits)
 
     def _title_desc_html(self):
-        title = self._escape_html(self.title_item.toPlainText()) if self.show_title else ""
-        desc = self._escape_html(self.description_item.toPlainText()) if self.show_description else ""
-        title_style = self._font_style_css(self.title_item.font(), self.title_item.defaultTextColor().name())
-        desc_style = self._font_style_css(self.description_item.font(), self.description_item.defaultTextColor().name())
-        return (
-            f'<div class="media-title" style="{title_style}">{title}</div>' if title else "",
-            f'<div class="media-desc" style="{desc_style}">{desc}</div>' if desc else "",
-        )
+        # Walks each field's actual per-character formatting (same helper
+        # TextNoteItem.to_html uses) so highlight/color/bold/italic/
+        # underline runs applied via the toolbar survive the HTML export,
+        # not just the plain text - the title/description items are live
+        # QGraphicsTextItems the whole time, so their document is always
+        # up to date here.
+        title_html = ""
+        if self.show_title and self.title_item.toPlainText().strip():
+            tf = self.title_item.font()
+            title_style = self._font_style_css(tf, self.title_item.defaultTextColor().name())
+            title_text = _qtextdocument_to_web_html(
+                self.title_item.document(), base_family=tf.family(), base_size=tf.pointSizeF())
+            title_html = f'<div class="media-title" style="{title_style}">{title_text}</div>'
+        desc_html = ""
+        if self.show_description and self.description_item.toPlainText().strip():
+            df = self.description_item.font()
+            desc_style = self._font_style_css(df, self.description_item.defaultTextColor().name())
+            desc_text = _qtextdocument_to_web_html(
+                self.description_item.document(), base_family=df.family(), base_size=df.pointSizeF())
+            desc_html = f'<div class="media-desc" style="{desc_style}">{desc_text}</div>'
+        return title_html, desc_html
 
     # -- toggling title/description on/off, wired up through each media
     # subclass's context menu (see e.g. ImageItem._build_context_menu) --
@@ -1816,6 +1921,7 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     def __init__(self, x=0, y=0, w=240, h=180, pixmap=None, b64=None, item_id=None,
                  title="", description="", show_title=True, show_description=True,
                  title_font=None, desc_font=None, title_color=None, desc_color=None,
+                 title_html=None, desc_html=None,
                  top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
         self._init_top_strip(top_strip_enabled, top_strip_color)
@@ -1845,7 +1951,8 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         self.setAcceptDrops(True)
         self._init_title_desc(title, description, show_title, show_description,
                                title_font=title_font, desc_font=desc_font,
-                               title_color=title_color, desc_color=desc_color)
+                               title_color=title_color, desc_color=desc_color,
+                               title_html=title_html, desc_html=desc_html)
 
     def set_pixmap(self, pixmap):
         self.pixmap_orig = pixmap
@@ -1966,6 +2073,7 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     def __init__(self, x=0, y=0, w=240, h=180, gif_bytes=None, b64=None, item_id=None,
                  title="", description="", show_title=True, show_description=True,
                  title_font=None, desc_font=None, title_color=None, desc_color=None,
+                 title_html=None, desc_html=None,
                  top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
         self._init_top_strip(top_strip_enabled, top_strip_color)
@@ -1985,7 +2093,8 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         self.setAcceptDrops(True)
         self._init_title_desc(title, description, show_title, show_description,
                                title_font=title_font, desc_font=desc_font,
-                               title_color=title_color, desc_color=desc_color)
+                               title_color=title_color, desc_color=desc_color,
+                               title_html=title_html, desc_html=desc_html)
         self._setup_movie()
 
     def _setup_movie(self):
@@ -2283,6 +2392,7 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     def __init__(self, x=0, y=0, w=320, h=220, video_bytes=None, b64=None, item_id=None,
                  title="", description="", show_title=True, show_description=True,
                  title_font=None, desc_font=None, title_color=None, desc_color=None,
+                 title_html=None, desc_html=None,
                  top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
         self._init_top_strip(top_strip_enabled, top_strip_color)
@@ -2297,7 +2407,8 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         self.setAcceptDrops(True)
         self._init_title_desc(title, description, show_title, show_description,
                                title_font=title_font, desc_font=desc_font,
-                               title_color=title_color, desc_color=desc_color)
+                               title_color=title_color, desc_color=desc_color,
+                               title_html=title_html, desc_html=desc_html)
         self._resize_player()
 
     def _resize_player(self):
@@ -2512,7 +2623,7 @@ class ArrowItem(BaseComponentItem):
     def __init__(self, x=0, y=0, w=160, h=90, p1=None, p2=None, color=None,
                  stroke_width=4, style="single", line_style="solid", item_id=None,
                  label="", show_label=False, label_font=None, label_color=None,
-                 anchor1=None, anchor2=None):
+                 label_html=None, anchor1=None, anchor2=None):
         super().__init__(x, y, max(1.0, w), max(1.0, h), item_id)
         self.color = color or self.DEFAULT_COLOR
         self.stroke_width = stroke_width
@@ -2552,6 +2663,8 @@ class ArrowItem(BaseComponentItem):
         self.label_item.setPlainText(label)
         self.label_item.setTextInteractionFlags(Qt.NoTextInteraction)
         self.label_item.document().setDocumentMargin(5)
+        if label_html:
+            self.label_item.document().setHtml(label_html)
         self.label_item.setVisible(self.show_label)
         self._label_w = 0.0
         self._label_h = 0.0
@@ -3088,6 +3201,7 @@ class ArrowItem(BaseComponentItem):
         d["show_label"] = self.show_label
         d["label_font"] = _font_to_dict(self.label_item.font())
         d["label_color"] = self.label_item.defaultTextColor().name()
+        d["label_html"] = self.label_item.document().toHtml()
         d["anchor1"] = (
             {"item_id": self.anchor1["item"].id, "rx": self.anchor1["rx"], "ry": self.anchor1["ry"]}
             if self.anchor1 else None
@@ -3143,14 +3257,16 @@ class ArrowItem(BaseComponentItem):
         )
         label_html = ""
         if self.show_label and self.label_item.toPlainText().strip():
-            text = (
-                self.label_item.toPlainText()
-                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                .replace("\n", "<br>")
-            )
+            lf = self.label_item.font()
+            # Walk the label's actual per-character formatting (same
+            # helper TextNoteItem.to_html uses) so highlight/color/bold/
+            # italic/underline runs applied via the toolbar survive the
+            # export - label_item is a live QGraphicsTextItem, so its
+            # document is always current here.
+            text = _qtextdocument_to_web_html(
+                self.label_item.document(), base_family=lf.family(), base_size=lf.pointSizeF())
             mid_x = (self.p1.x() + self.p2.x()) / 2.0
             mid_y = (self.p1.y() + self.p2.y()) / 2.0
-            lf = self.label_item.font()
             label_style_bits = [
                 f"font-family:'{lf.family()}',sans-serif",
                 # pointSizeF() is a point size, not a pixel size - tagging
@@ -3286,7 +3402,7 @@ class TableItem(BaseComponentItem):
                  data=None, headers=None, header_bg=None, header_text_color=None,
                  text_color=None, even_row_bg=None, odd_row_bg=None,
                  even_row_text_color=None, odd_row_text_color=None,
-                 header_fonts=None, data_fonts=None):
+                 header_fonts=None, data_fonts=None, header_htmls=None, data_htmls=None):
         super().__init__(x, y, w, h, item_id)
         self.rows = max(1, int(rows))
         self.cols = max(1, int(cols))
@@ -3317,6 +3433,15 @@ class TableItem(BaseComponentItem):
         init_data_fonts = [(list(row) + [None] * self.cols)[:self.cols] for row in init_data_fonts]
         init_data_fonts = (init_data_fonts + [[None] * self.cols for _ in range(self.rows)])[:self.rows]
 
+        # Full rich-text fidelity (per-character bold/italic/underline/
+        # color/highlight runs) for each cell - mirrors the plain
+        # "headers"/"data" fields above, see serialize()/to_html().
+        init_header_htmls = list(header_htmls) if header_htmls else [None] * self.cols
+        init_header_htmls = (init_header_htmls + [None] * self.cols)[:self.cols]
+        init_data_htmls = [list(r) for r in data_htmls] if data_htmls else [[None] * self.cols for _ in range(self.rows)]
+        init_data_htmls = [(list(row) + [None] * self.cols)[:self.cols] for row in init_data_htmls]
+        init_data_htmls = (init_data_htmls + [[None] * self.cols for _ in range(self.rows)])[:self.rows]
+
         # Per-row/header heights auto-grow to fit their content, the same
         # way TextNoteItem grows to fit typed text - see
         # _on_cell_text_changed / _recalc_row_heights. _grid_ready guards
@@ -3329,11 +3454,12 @@ class TableItem(BaseComponentItem):
 
         self._header_items = []
         self._cell_items = []
-        self._build_grid_items(init_headers, init_data, init_header_fonts, init_data_fonts)
+        self._build_grid_items(init_headers, init_data, init_header_fonts, init_data_fonts,
+                                init_header_htmls, init_data_htmls)
         self._update_min_size()
 
     # -- grid content (child EditableTextItems are the source of truth) --
-    def _make_cell_item(self, text, color, bold=False, font_info=None):
+    def _make_cell_item(self, text, color, bold=False, font_info=None, html=None):
         it = EditableTextItem(self)
         it.setTextInteractionFlags(Qt.NoTextInteraction)
         f = _font_from_dict(font_info, base_bold=bold) if font_info else QFont("Segoe UI", 10)
@@ -3342,6 +3468,8 @@ class TableItem(BaseComponentItem):
         it.setFont(f)
         it.setDefaultTextColor(QColor(color))
         it.setPlainText(text)
+        if html:
+            it.document().setHtml(html)
         it.setZValue(1)
         it.document().contentsChanged.connect(self._on_cell_text_changed)
         return it
@@ -3357,23 +3485,29 @@ class TableItem(BaseComponentItem):
         self._header_items = []
         self._cell_items = []
 
-    def _build_grid_items(self, headers_text, data_text, header_fonts=None, data_fonts=None):
+    def _build_grid_items(self, headers_text, data_text, header_fonts=None, data_fonts=None,
+                           header_htmls=None, data_htmls=None):
         self._grid_ready = False
         header_fonts = header_fonts or [None] * self.cols
+        header_htmls = header_htmls or [None] * self.cols
         self._header_items = [
             self._make_cell_item(headers_text[c], self.header_text_color, bold=True,
-                                  font_info=header_fonts[c] if c < len(header_fonts) else None)
+                                  font_info=header_fonts[c] if c < len(header_fonts) else None,
+                                  html=header_htmls[c] if c < len(header_htmls) else None)
             for c in range(self.cols)
         ]
         self._cell_items = []
         data_fonts = data_fonts or [[None] * self.cols for _ in range(self.rows)]
+        data_htmls = data_htmls or [[None] * self.cols for _ in range(self.rows)]
         for r in range(self.rows):
             is_even = (r + 1) % 2 == 0
             row_color = self.even_row_text_color if is_even else self.odd_row_text_color
             row_fonts = data_fonts[r] if r < len(data_fonts) else [None] * self.cols
+            row_htmls = data_htmls[r] if r < len(data_htmls) else [None] * self.cols
             self._cell_items.append(
                 [self._make_cell_item(data_text[r][c], row_color,
-                                       font_info=row_fonts[c] if c < len(row_fonts) else None)
+                                       font_info=row_fonts[c] if c < len(row_fonts) else None,
+                                       html=row_htmls[c] if c < len(row_htmls) else None)
                  for c in range(self.cols)]
             )
         self._grid_ready = True
@@ -3390,6 +3524,12 @@ class TableItem(BaseComponentItem):
 
     def _current_data_fonts(self):
         return [[_font_to_dict(c.font()) for c in row] for row in self._cell_items]
+
+    def _current_header_htmls(self):
+        return [it.document().toHtml() for it in self._header_items]
+
+    def _current_data_htmls(self):
+        return [[c.document().toHtml() for c in row] for row in self._cell_items]
 
     def all_text_items(self):
         """Every editable text item in the grid - header row plus body
@@ -3426,13 +3566,17 @@ class TableItem(BaseComponentItem):
         old_data = self._current_data()
         old_header_fonts = self._current_header_fonts()
         old_data_fonts = self._current_data_fonts()
+        old_header_htmls = self._current_header_htmls()
+        old_data_htmls = self._current_data_htmls()
         self.prepareGeometryChange()
         self.rows = max(1, int(rows))
         self.cols = max(1, int(cols))
         new_headers = (old_headers + [""] * self.cols)[:self.cols]
         new_header_fonts = (old_header_fonts + [None] * self.cols)[:self.cols]
+        new_header_htmls = (old_header_htmls + [None] * self.cols)[:self.cols]
         new_data = []
         new_data_fonts = []
+        new_data_htmls = []
         for r in range(self.rows):
             row = old_data[r] if r < len(old_data) else []
             row = (list(row) + [""] * self.cols)[:self.cols]
@@ -3440,8 +3584,12 @@ class TableItem(BaseComponentItem):
             row_fonts = old_data_fonts[r] if r < len(old_data_fonts) else []
             row_fonts = (list(row_fonts) + [None] * self.cols)[:self.cols]
             new_data_fonts.append(row_fonts)
+            row_htmls = old_data_htmls[r] if r < len(old_data_htmls) else []
+            row_htmls = (list(row_htmls) + [None] * self.cols)[:self.cols]
+            new_data_htmls.append(row_htmls)
         self._clear_grid_items()
-        self._build_grid_items(new_headers, new_data, new_header_fonts, new_data_fonts)
+        self._build_grid_items(new_headers, new_data, new_header_fonts, new_data_fonts,
+                                new_header_htmls, new_data_htmls)
         self._update_min_size()
         self.update()
 
@@ -3681,6 +3829,8 @@ class TableItem(BaseComponentItem):
         d["data"] = self._current_data()
         d["header_fonts"] = self._current_header_fonts()
         d["data_fonts"] = self._current_data_fonts()
+        d["header_htmls"] = self._current_header_htmls()
+        d["data_htmls"] = self._current_data_htmls()
         d["header_bg"] = self.header_bg
         d["header_text_color"] = self.header_text_color
         d["text_color"] = self.text_color
@@ -3691,13 +3841,6 @@ class TableItem(BaseComponentItem):
         return d
 
     def to_html(self):
-        def esc(s):
-            return (
-                (s or "")
-                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                .replace("\n", "<br>")
-            )
-
         def font_style_bits(font_dict):
             bits = []
             if not font_dict:
@@ -3716,15 +3859,23 @@ class TableItem(BaseComponentItem):
                 bits.append("text-decoration:underline")
             return bits
 
-        headers = self._current_headers()
-        data = self._current_data()
+        def cell_rich_html(text_item, font_dict):
+            # Walk the cell's actual per-character formatting (same
+            # helper TextNoteItem.to_html uses) so highlight/color/bold/
+            # italic/underline runs applied via the toolbar survive the
+            # export - every cell is a live QGraphicsTextItem, so its
+            # document is always current here.
+            fam = (font_dict or {}).get("font_family") or "Segoe UI"
+            size = (font_dict or {}).get("font_size") or 10.0
+            return _qtextdocument_to_web_html(text_item.document(), base_family=fam, base_size=size)
+
         header_fonts = self._current_header_fonts()
         data_fonts = self._current_data_fonts()
         header_cells = "".join(
             f'<th style="text-align:left;padding:6px;background:{color_to_css(self.header_bg)};'
             f'color:{color_to_css(self.header_text_color)};'
-            f'{";".join(font_style_bits(header_fonts[c]))}">{esc(h)}</th>'
-            for c, h in enumerate(headers)
+            f'{";".join(font_style_bits(header_fonts[c]))}">{cell_rich_html(it, header_fonts[c])}</th>'
+            for c, it in enumerate(self._header_items)
         )
         body_rows = []
         for r in range(self.rows):
@@ -3734,7 +3885,8 @@ class TableItem(BaseComponentItem):
             cells = "".join(
                 f'<td style="padding:6px;background:{color_to_css(row_bg)};'
                 f'color:{color_to_css(row_text_color)};'
-                f'{";".join(font_style_bits(data_fonts[r][c]))}">{esc(data[r][c])}</td>'
+                f'{";".join(font_style_bits(data_fonts[r][c]))}">'
+                f'{cell_rich_html(self._cell_items[r][c], data_fonts[r][c])}</td>'
                 for c in range(self.cols)
             )
             body_rows.append(f"<tr>{cells}</tr>")
@@ -3843,7 +3995,8 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                           # target that isn't fighting the widget for clicks
 
     def __init__(self, x=0, y=0, w=280, h=320, title="New Board", subitems=None, item_id=None,
-                 top_strip_enabled=False, top_strip_color=None):
+                 top_strip_enabled=False, top_strip_color=None, title_font=None, title_color=None,
+                 title_html=None):
         super().__init__(x, y, w, h, item_id)
         self._init_top_strip(top_strip_enabled, top_strip_color)
         self.subitems = subitems or []
@@ -3851,11 +4004,16 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         self.setAcceptDrops(True)
         self.title_item = EditableTextItem(self)
         self.title_item.setPos(10, 6)
-        self.title_item.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        self.title_item.setDefaultTextColor(QColor("#ffffff"))
+        self.title_item.setFont(
+            _font_from_dict(title_font, base_family="Segoe UI", base_size=12.0, base_bold=True)
+            if title_font else QFont("Segoe UI", 12, QFont.Bold)
+        )
+        self.title_item.setDefaultTextColor(QColor(title_color) if title_color else QColor("#ffffff"))
         self.title_item.setPlainText(title)
         self.title_item.setTextInteractionFlags(Qt.NoTextInteraction)
         self.title_item.setTextWidth(max(10, w - 20))
+        if title_html:
+            self.title_item.document().setHtml(title_html)
 
         # -- subitem drag-out / reorder state ---------------------------
         # Filled in during paint() so hit-testing always matches what is
@@ -3906,6 +4064,15 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         # lifetime rules as _video_proxies above (see _prune_gif_movies).
         self._gif_movies = {}
 
+        # -- static rich-text render cache for un-edited subitems ---------
+        # Painting a subitem's title/description/body with the actual
+        # highlight/color/bold/... runs it was saved with (instead of
+        # plain QPainter.drawText()) means building a small QTextDocument
+        # from its stored *_html - this caches those per (id(subitem),
+        # field) so paint() (called every repaint) doesn't rebuild one
+        # from scratch every single frame; see _get_subitem_rich_doc.
+        self._subitem_rich_doc_cache = {}
+
     def on_resized(self):
         self.title_item.setTextWidth(max(10, self._w - 20))
         self.update()
@@ -3919,7 +4086,17 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             if idx is not None:
                 kind = self.subitems[idx].get("kind")
                 if kind == "text":
-                    self._begin_edit_subitem(idx)
+                    # A Text Note subitem carries its own optional title
+                    # bar (see _sub_text_title_height/paint()) - clicking
+                    # that bar should edit the title, exactly like it does
+                    # on the standalone TextNoteItem it came from, not the
+                    # body text underneath it.
+                    rects = self._subitem_td_click_rects.get(idx)
+                    title_rect = rects[0] if rects else None
+                    if title_rect is not None and title_rect.contains(event.pos()):
+                        self._begin_edit_subitem_field(idx, "title")
+                    else:
+                        self._begin_edit_subitem(idx)
                 elif kind in ("image", "gif", "video"):
                     rects = self._subitem_td_click_rects.get(idx)
                     if rects:
@@ -3944,12 +4121,16 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 break
         if rect is None:
             return
+        sub = self.subitems[idx]
+        title_h, _ = self._sub_text_title_height(sub, max(1, rect.width()))
         edit = _SubitemTextEdit(self, on_finish=self._end_edit_subitem)
-        edit.setPos(rect.x(), rect.y())
+        edit.setPos(rect.x(), rect.y() + title_h)
         edit.setTextWidth(max(10, rect.width()))
-        edit.setDefaultTextColor(QColor("#dddddd"))
+        edit.setDefaultTextColor(self._subitem_text_color(sub))
         edit.setFont(self._subitem_font)
-        edit.setPlainText(self.subitems[idx].get("text", ""))
+        edit.setPlainText(sub.get("text", ""))
+        if sub.get("text_html"):
+            edit.document().setHtml(sub["text_html"])
         edit.document().contentsChanged.connect(lambda: self._sync_subitem_text(idx))
         edit.setZValue(10)
         self._sub_edit_item = edit
@@ -3966,31 +4147,58 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         if self._sub_edit_item is None or self._sub_edit_index != idx or idx >= len(self.subitems):
             return
         self.subitems[idx]["text"] = self._sub_edit_item.toPlainText()
+        # Full rich-text fidelity (bold/italic/underline/color/highlight
+        # runs from selection-based toolbar edits) - see to_html(), which
+        # needs this to export the same highlight shown in the app,
+        # since this subitem otherwise only exists as plain dict data.
+        self.subitems[idx]["text_html"] = self._sub_edit_item.document().toHtml()
         self._autogrow_to_fit()
         self.update()
 
-    # -- in-place editing of an image/gif/video subitem's title/description
+    # -- in-place editing of an image/gif/video subitem's title/description,
+    # or a "text" subitem's own optional title bar (see paint()'s kind ==
+    # "text" branch and _sub_text_title_height) - the same in-place editor
+    # overlay is reused for all of these, just positioned/styled/keyed
+    # differently.
     def _begin_edit_subitem_field(self, idx, field):
         if idx is None or idx >= len(self.subitems):
             return
         item = self.subitems[idx]
-        if item.get("kind") not in ("image", "gif", "video"):
+        kind = item.get("kind")
+        if kind not in ("image", "gif", "video", "text"):
+            return
+        if kind == "text" and field != "title":
             return
         self._end_edit_subitem()
         rects = self._subitem_td_click_rects.get(idx)
         if not rects:
             return
         rect = rects[0] if field == "title" else rects[1]
+        if rect is None:
+            return
         edit = _SubitemTextEdit(self, on_finish=self._end_edit_subitem)
-        edit.setPos(rect.x() + 6, rect.y())
-        edit.setTextWidth(max(10, rect.width() - 12))
-        if field == "title":
-            edit.setDefaultTextColor(QColor("#ffffff"))
-            edit.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        if kind == "text":
+            # A text subitem's title is drawn flush with the row (see
+            # paint()), not inset like the media title/description bars.
+            edit.setPos(rect.x(), rect.y())
+            edit.setTextWidth(max(10, rect.width()))
+            avail_w = max(1, rect.width())
+            _, title_font = self._sub_text_title_height(item, avail_w)
+            edit.setFont(title_font or QFont("Segoe UI", 11, QFont.Bold))
+            title_color = item.get("title_color") or self._subitem_text_color(item).name()
+            edit.setDefaultTextColor(QColor(title_color))
         else:
-            edit.setDefaultTextColor(QColor("#aaaaaa"))
-            edit.setFont(QFont("Segoe UI", 8))
+            edit.setPos(rect.x() + 6, rect.y())
+            edit.setTextWidth(max(10, rect.width() - 12))
+            if field == "title":
+                edit.setDefaultTextColor(QColor("#ffffff"))
+                edit.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            else:
+                edit.setDefaultTextColor(QColor("#aaaaaa"))
+                edit.setFont(QFont("Segoe UI", 8))
         edit.setPlainText(item.get(field, ""))
+        if item.get(f"{field}_html"):
+            edit.document().setHtml(item[f"{field}_html"])
         edit.document().contentsChanged.connect(lambda: self._sync_subitem_field(idx, field))
         edit.setZValue(10)
         self._sub_edit_item = edit
@@ -4008,6 +4216,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 or self._sub_edit_field != field or idx >= len(self.subitems)):
             return
         self.subitems[idx][field] = self._sub_edit_item.toPlainText()
+        self.subitems[idx][f"{field}_html"] = self._sub_edit_item.document().toHtml()
         self._autogrow_to_fit()
         self.update()
 
@@ -4019,6 +4228,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         field = self._sub_edit_field or "text"
         if idx is not None and idx < len(self.subitems):
             self.subitems[idx][field] = edit.toPlainText()
+            self.subitems[idx][f"{field}_html"] = edit.document().toHtml()
         self._sub_edit_item = None
         self._sub_edit_index = None
         self._sub_edit_field = None
@@ -4027,6 +4237,74 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             edit.scene().removeItem(edit)
         self._autogrow_to_fit()
         self.update()
+
+    @staticmethod
+    def _subitem_text_color(item):
+        """The color a "text" subitem is currently painted with - shared
+        by paint() and _begin_edit_subitem() so the in-place editor
+        starts out showing exactly the color that was on screen before
+        double-click, instead of always resetting to the neutral
+        default (see paint()'s kind == "text" branch for the full
+        story on each of these cases)."""
+        if item.get("link_url"):
+            return QColor("#5b9dd9")
+        if item.get("note_type") == "plaintext" and item.get("color"):
+            return QColor(item.get("color"))
+        if item.get("note_type") == "text" and item.get("text_color"):
+            return QColor(item.get("text_color"))
+        if not item.get("note_type") and item.get("color"):
+            return QColor(item.get("color"))
+        return QColor("#dddddd")
+
+    def font_targets(self, editing_item=None):
+        """What the toolbar's Font/B/I/U/Size controls should restyle:
+        the card's own title while it's being edited, or the in-place
+        editor overlay for a subitem (its body text, or its title/
+        description) while one is active - this is how a board-card's
+        title and subitems get the exact same Font/B/I/U/Size treatment
+        as a standalone Text Note / media component (see
+        MainWindow.on_selection_changed, which only includes this
+        BoardCardItem in the toolbar's font selection while one of these
+        is open). There's no meaningful "whole card" font to restyle
+        otherwise, since a card can hold any number of
+        differently-formatted subitems at once."""
+        if editing_item is self.title_item:
+            return [self.title_item]
+        if editing_item is self._sub_edit_item:
+            return [self._sub_edit_item]
+        return []
+
+    def _on_subitem_text_font_changed(self):
+        """Relayout hook - see _apply_text_font's call to this whenever
+        it exists on the target. Captures the font the toolbar just
+        applied to the active subitem editor back into the subitem's own
+        dict, the same way _sync_subitem_text/_sync_subitem_field already
+        keep the plain text itself synced, so the formatting survives
+        once editing ends and gets painted correctly (see paint()). A
+        text subitem's own title (field == "title") keeps its own
+        "title_font" entry, separate from the body text's "font_family"/
+        "bold"/... fields, exactly like a standalone TextNoteItem does.
+        An image/gif/video subitem's title/description each get their
+        own "<field>_font" entry, mirroring MediaCardMixin's
+        title_font/description_font."""
+        idx = self._sub_edit_index
+        edit = self._sub_edit_item
+        field = self._sub_edit_field
+        if edit is None or idx is None or idx >= len(self.subitems):
+            return
+        f = edit.font()
+        sub = self.subitems[idx]
+        kind = sub.get("kind")
+        if kind == "text" and field == "title":
+            sub["title_font"] = _font_to_dict(f)
+        elif kind in ("image", "gif", "video") and field in ("title", "description"):
+            sub[f"{field}_font"] = _font_to_dict(f)
+        else:
+            sub["font_family"] = f.family()
+            sub["bold"] = f.bold()
+            sub["italic"] = f.italic()
+            sub["underline"] = f.underline()
+        self._autogrow_to_fit()
 
     def add_subitem(self, subitem, index=None):
         """Add a subitem to this card. By default it's appended at the
@@ -4091,21 +4369,31 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         desc_h = self.SUB_MEDIA_DESC_H if show_desc else 0
         return show_title, show_desc, title_h, desc_h
 
-    def _paint_sub_media_title(self, painter, rect, text):
+    def _paint_sub_media_title(self, painter, rect, item):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#1e1e1e"))
         painter.drawRect(rect)
-        painter.setPen(QColor("#ffffff"))
-        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        painter.drawText(rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+        font = QFont("Segoe UI", 9, QFont.Bold)
+        text_rect = rect.adjusted(6, 0, -6, 0)
+        doc = self._get_subitem_rich_doc(item, "title", item.get("title_html"), item.get("title", ""),
+                                          font, text_rect.width())
+        doc_h = doc.size().height()
+        paint_rect = QRectF(text_rect.x(), text_rect.y() + (text_rect.height() - doc_h) / 2,
+                             text_rect.width(), doc_h)
+        _paint_rich_doc(painter, doc, paint_rect, QColor("#ffffff"))
 
-    def _paint_sub_media_desc(self, painter, rect, text):
+    def _paint_sub_media_desc(self, painter, rect, item):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#1e1e1e"))
         painter.drawRect(rect)
-        painter.setPen(QColor("#aaaaaa"))
-        painter.setFont(QFont("Segoe UI", 8))
-        painter.drawText(rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+        font = QFont("Segoe UI", 8)
+        text_rect = rect.adjusted(6, 0, -6, 0)
+        doc = self._get_subitem_rich_doc(item, "description", item.get("description_html"),
+                                          item.get("description", ""), font, text_rect.width())
+        doc_h = doc.size().height()
+        paint_rect = QRectF(text_rect.x(), text_rect.y() + (text_rect.height() - doc_h) / 2,
+                             text_rect.width(), doc_h)
+        _paint_rich_doc(painter, doc, paint_rect, QColor("#aaaaaa"))
 
     def _estimate_content_height(self):
         """Approximate the total height needed to show every subitem
@@ -4241,6 +4529,37 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             entry = self._gif_movies.pop(key)
             entry["movie"].stop()
 
+    def _get_subitem_rich_doc(self, item, field, html, plain_text, font, width):
+        """Cached QTextDocument for painting one subitem field's stored
+        rich text (see _paint_rich_doc) - rebuilt only when the field's
+        html/text/font/width actually changed since the last paint()."""
+        key = (id(item), field)
+        font_key = (font.family(), font.pointSizeF(), font.bold(), font.italic(), font.underline())
+        entry = self._subitem_rich_doc_cache.get(key)
+        if (entry is not None and entry["html"] == html and entry["text"] == plain_text
+                and entry["font_key"] == font_key and abs(entry["width"] - width) < 0.5):
+            return entry["doc"]
+        doc = QTextDocument()
+        doc.setDefaultFont(font)
+        doc.setDocumentMargin(0)
+        if html:
+            doc.setHtml(html)
+        else:
+            doc.setPlainText(plain_text or "")
+        doc.setTextWidth(max(1.0, width))
+        self._subitem_rich_doc_cache[key] = {
+            "html": html, "text": plain_text, "font_key": font_key, "width": width, "doc": doc,
+        }
+        return doc
+
+    def _prune_rich_doc_cache(self):
+        """Drop cached documents (see _get_subitem_rich_doc) for any
+        subitem no longer in self.subitems, mirroring
+        _prune_video_proxies/_prune_gif_movies above."""
+        live_ids = {id(s) for s in self.subitems}
+        for key in [k for k in self._subitem_rich_doc_cache if k[0] not in live_ids]:
+            del self._subitem_rich_doc_cache[key]
+
     def _reorder_target_index(self, y):
         """Given a local y coordinate, figure out which slot the dragged
         subitem should land in if dropped now."""
@@ -4324,6 +4643,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 sub = self.subitems.pop(idx)
                 self._prune_video_proxies()
                 self._prune_gif_movies()
+                self._prune_rich_doc_cache()
                 scene_pos = event.scenePos()
                 new_item = subitem_to_component(sub, scene_pos.x() - 100, scene_pos.y() - 60)
                 if new_item is not None and self.scene() is not None:
@@ -4391,7 +4711,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 title_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_TITLE_H)
                 editing_title = idx == self._sub_edit_index and self._sub_edit_field == "title"
                 if show_title and not editing_title:
-                    self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item.get("title", ""))
+                    self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item)
                 if show_title:
                     y += title_h
                 r = QRectF(pad, y, avail_w, media_h)
@@ -4407,7 +4727,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 desc_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_DESC_H)
                 editing_desc = idx == self._sub_edit_index and self._sub_edit_field == "description"
                 if show_desc and not editing_desc:
-                    self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item.get("description", ""))
+                    self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item)
                 if show_desc:
                     y += desc_h
                 self._subitem_td_click_rects[idx] = (title_click_rect, desc_click_rect)
@@ -4429,7 +4749,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 title_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_TITLE_H)
                 editing_title = idx == self._sub_edit_index and self._sub_edit_field == "title"
                 if show_title and not editing_title:
-                    self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item.get("title", ""))
+                    self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item)
                 if show_title:
                     y += title_h
                 media_h = self._subitem_media_height(
@@ -4451,7 +4771,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 desc_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_DESC_H)
                 editing_desc = idx == self._sub_edit_index and self._sub_edit_field == "description"
                 if show_desc and not editing_desc:
-                    self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item.get("description", ""))
+                    self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item)
                 if show_desc:
                     y += desc_h
                 self._subitem_td_click_rects[idx] = (title_click_rect, desc_click_rect)
@@ -4470,20 +4790,9 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 # subitem's own stored color if it has one (Text/plaintext
                 # components carry their text color in "color"), else the
                 # neutral default used before this had any color at all.
+                text_color = self._subitem_text_color(item)
                 if item.get("link_url"):
-                    text_color = QColor("#5b9dd9")
                     sub_font.setUnderline(True)
-                elif item.get("note_type") == "plaintext" and item.get("color"):
-                    text_color = QColor(item.get("color"))
-                elif item.get("note_type") == "text" and item.get("text_color"):
-                    text_color = QColor(item.get("text_color"))
-                elif not item.get("note_type") and item.get("color"):
-                    # A subitem with no originating standalone component
-                    # (e.g. colored via the Color button while editing it
-                    # in place) - "color" is simply its text color here.
-                    text_color = QColor(item.get("color"))
-                else:
-                    text_color = QColor("#dddddd")
                 # Size the row to the text's actual wrapped height (instead
                 # of a fixed 50px) so short text doesn't leave a stray gap
                 # and long text doesn't spill past its row - previously
@@ -4497,18 +4806,27 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 ).height() + 4
                 h = min(max(20, needed_h) + title_h, remaining_h)
                 r = QRectF(pad, y, avail_w, h)
-                if idx != self._sub_edit_index:
-                    painter.save()
-                    painter.setClipRect(r)
-                    if title_h:
-                        title_color = QColor(item.get("title_color")) if item.get("title_color") else text_color
-                        painter.setFont(title_font)
-                        painter.setPen(title_color)
-                        painter.drawText(QRectF(pad, y, avail_w, title_h), Qt.TextWordWrap, item.get("title", ""))
-                    painter.setFont(sub_font)
-                    painter.setPen(text_color)
-                    painter.drawText(QRectF(pad, y + title_h, avail_w, h - title_h), Qt.TextWordWrap, text)
-                    painter.restore()
+                editing_title = idx == self._sub_edit_index and self._sub_edit_field == "title"
+                editing_text = idx == self._sub_edit_index and self._sub_edit_field == "text"
+                painter.save()
+                painter.setClipRect(r)
+                if title_h and not editing_title:
+                    title_color = QColor(item.get("title_color")) if item.get("title_color") else text_color
+                    title_doc = self._get_subitem_rich_doc(
+                        item, "title", item.get("title_html"), item.get("title", ""), title_font, avail_w)
+                    _paint_rich_doc(painter, title_doc, QRectF(pad, y, avail_w, title_h), title_color)
+                if not editing_text:
+                    body_doc = self._get_subitem_rich_doc(
+                        item, "text", item.get("text_html"), text, sub_font, avail_w)
+                    _paint_rich_doc(painter, body_doc, QRectF(pad, y + title_h, avail_w, h - title_h), text_color)
+                painter.restore()
+                # Reserved click target for the title bar (only when this
+                # subitem actually has a title bar showing - see
+                # mouseDoubleClickEvent) so double-clicking it edits the
+                # title instead of falling through to the body text.
+                self._subitem_td_click_rects[idx] = (
+                    QRectF(pad, y, avail_w, title_h) if title_h else None, None
+                )
                 y += h + 8
                 self._subitem_rects.append((idx, QRectF(pad, row_top, avail_w, y - row_top)))
             elif kind == "checklist":
@@ -4587,6 +4905,9 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         d = super().serialize()
         d["title"] = self.title_item.toPlainText()
         d["subitems"] = self.subitems
+        d["title_font"] = _font_to_dict(self.title_item.font())
+        d["title_color"] = self.title_item.defaultTextColor().name()
+        d["title_html"] = self.title_item.document().toHtml()
         return self._top_strip_serialize(d)
 
     def to_html(self):
@@ -4596,9 +4917,25 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             if kind in ("image", "gif", "video"):
                 show_title = bool(item.get("show_title", True)) and bool(item.get("title"))
                 show_desc = bool(item.get("show_description", True)) and bool(item.get("description"))
-                t_html = (f'<div class="media-title">{MediaCardMixin._escape_html(item.get("title",""))}</div>'
+                # Prefer the rich per-run HTML captured while editing (see
+                # _sync_subitem_field/_end_edit_subitem) so highlight/
+                # color/bold/italic/underline runs survive the export -
+                # these subitems only exist as plain dict data (no live
+                # QGraphicsTextItem), so _rich_html_from_doc_html()
+                # rebuilds a throwaway document to walk their formatting.
+                title_rich = _rich_html_from_doc_html(
+                    item.get("title_html"),
+                    base_family=(item.get("title_font") or {}).get("font_family") or "Segoe UI",
+                    base_size=(item.get("title_font") or {}).get("font_size") or 10.0,
+                ) if show_title else None
+                desc_rich = _rich_html_from_doc_html(
+                    item.get("description_html"),
+                    base_family=(item.get("description_font") or {}).get("font_family") or "Segoe UI",
+                    base_size=(item.get("description_font") or {}).get("font_size") or 9.0,
+                ) if show_desc else None
+                t_html = (f'<div class="media-title">{title_rich if title_rich else MediaCardMixin._escape_html(item.get("title",""))}</div>'
                           if show_title else "")
-                d_html = (f'<div class="media-desc">{MediaCardMixin._escape_html(item.get("description",""))}</div>'
+                d_html = (f'<div class="media-desc">{desc_rich if desc_rich else MediaCardMixin._escape_html(item.get("description",""))}</div>'
                           if show_desc else "")
                 if kind == "image":
                     media = f'<img src="data:image/png;base64,{item.get("data","")}"/>'
@@ -4613,17 +4950,33 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             elif kind == "text":
                 title_html = ""
                 if item.get("note_type") == "text" and item.get("show_title") and item.get("title"):
-                    title_text = (
-                        item.get("title", "")
+                    title_rich = _rich_html_from_doc_html(
+                        item.get("title_html"),
+                        base_family=(item.get("title_font") or {}).get("font_family") or "Segoe UI",
+                        base_size=(item.get("title_font") or {}).get("font_size") or 11.0,
+                    )
+                    if title_rich:
+                        title_text = title_rich
+                    else:
+                        title_text = (
+                            item.get("title", "")
+                            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                            .replace("\n", "<br>")
+                        )
+                    title_html = f'<div style="font-weight:bold;margin-bottom:2px;">{title_text}</div>'
+                text_rich = _rich_html_from_doc_html(
+                    item.get("text_html"),
+                    base_family=item.get("font_family") or "Segoe UI",
+                    base_size=item.get("font_size") or 10.0,
+                )
+                if text_rich:
+                    t = text_rich
+                else:
+                    t = (
+                        item.get("text", "")
                         .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                         .replace("\n", "<br>")
                     )
-                    title_html = f'<div style="font-weight:bold;margin-bottom:2px;">{title_text}</div>'
-                t = (
-                    item.get("text", "")
-                    .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    .replace("\n", "<br>")
-                )
                 style_bits = [f"font-family:'{item.get('font_family') or 'Segoe UI'}',sans-serif"]
                 if item.get("bold"):
                     style_bits.append("font-weight:bold")
@@ -4651,11 +5004,13 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             elif kind == "checklist":
                 lis = "".join(f'<li><input type="checkbox" disabled> {x}</li>' for x in item.get("items", []))
                 rows.append(f'<ul class="sub-checklist">{lis}</ul>')
-        title = (
-            self.title_item.toPlainText()
-            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace("\n", "<br>")
-        )
+        # The card's own title is a live QGraphicsTextItem (unlike the
+        # subitems above), so its rich per-run formatting can be read
+        # straight off its document - no stored-HTML reconstruction
+        # needed here.
+        tf = self.title_item.font()
+        title = _qtextdocument_to_web_html(
+            self.title_item.document(), base_family=tf.family(), base_size=tf.pointSizeF())
         bg_css = color_to_css(self.color or self.DEFAULT_COLOR)
         return (
             f'<div class="comp board-card" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
@@ -5202,6 +5557,11 @@ def component_to_subitem(item):
             "description_font": _font_to_dict(item.description_item.font()),
             "title_color": item.title_item.defaultTextColor().name(),
             "description_color": item.description_item.defaultTextColor().name(),
+            # Rich per-character formatting (bold/italic/underline/color/
+            # highlight runs) - see BoardCardItem.to_html(), which needs
+            # this to export the same highlight that shows in the app.
+            "title_html": item.title_item.document().toHtml(),
+            "description_html": item.description_item.document().toHtml(),
         }
     if isinstance(item, GifItem):
         return {
@@ -5215,6 +5575,8 @@ def component_to_subitem(item):
             "description_font": _font_to_dict(item.description_item.font()),
             "title_color": item.title_item.defaultTextColor().name(),
             "description_color": item.description_item.defaultTextColor().name(),
+            "title_html": item.title_item.document().toHtml(),
+            "description_html": item.description_item.document().toHtml(),
         }
     if isinstance(item, VideoItem):
         return {
@@ -5233,6 +5595,8 @@ def component_to_subitem(item):
             "description_font": _font_to_dict(item.description_item.font()),
             "title_color": item.title_item.defaultTextColor().name(),
             "description_color": item.description_item.defaultTextColor().name(),
+            "title_html": item.title_item.document().toHtml(),
+            "description_html": item.description_item.document().toHtml(),
         }
     if isinstance(item, (TextNoteItem, PlainTextItem)):
         f = item.text_item.font()
@@ -5252,6 +5616,10 @@ def component_to_subitem(item):
             "bold": f.bold(),
             "italic": f.italic(),
             "underline": f.underline(),
+            # Rich per-character formatting (bold/italic/underline/color/
+            # highlight runs) - see BoardCardItem.to_html(), which needs
+            # this to export the same highlight that shows in the app.
+            "text_html": item.text_item.document().toHtml(),
         }
         if isinstance(item, TextNoteItem):
             # A Text Note's own title (and whether it's shown) used to be
@@ -5260,6 +5628,7 @@ def component_to_subitem(item):
             d["title"] = item.title_item.toPlainText()
             d["show_title"] = item.show_title
             d["title_font"] = _font_to_dict(item.title_item.font())
+            d["title_html"] = item.title_item.document().toHtml()
         return d
     if isinstance(item, DrawingItem):
         img = QImage(max(1, int(item._w)), max(1, int(item._h)), QImage.Format_ARGB32)
@@ -5372,21 +5741,24 @@ def deserialize_component(d):
                           show_title=d.get("show_title", True),
                           show_description=d.get("show_description", True),
                           title_font=d.get("title_font"), desc_font=d.get("description_font"),
-                          title_color=d.get("title_color"), desc_color=d.get("description_color"))
+                          title_color=d.get("title_color"), desc_color=d.get("description_color"),
+                          title_html=d.get("title_html"), desc_html=d.get("description_html"))
     elif t == "gif":
         item = GifItem(x, y, w, h, b64=d.get("data"), item_id=item_id,
                         title=d.get("title", ""), description=d.get("description", ""),
                         show_title=d.get("show_title", True),
                         show_description=d.get("show_description", True),
                         title_font=d.get("title_font"), desc_font=d.get("description_font"),
-                        title_color=d.get("title_color"), desc_color=d.get("description_color"))
+                        title_color=d.get("title_color"), desc_color=d.get("description_color"),
+                        title_html=d.get("title_html"), desc_html=d.get("description_html"))
     elif t == "video":
         item = VideoItem(x, y, w, h, b64=d.get("data"), item_id=item_id,
                           title=d.get("title", ""), description=d.get("description", ""),
                           show_title=d.get("show_title", True),
                           show_description=d.get("show_description", True),
                           title_font=d.get("title_font"), desc_font=d.get("description_font"),
-                          title_color=d.get("title_color"), desc_color=d.get("description_color"))
+                          title_color=d.get("title_color"), desc_color=d.get("description_color"),
+                          title_html=d.get("title_html"), desc_html=d.get("description_html"))
     elif t == "drawing":
         item = DrawingItem(x, y, w, h, strokes=d.get("strokes", []), item_id=item_id)
     elif t == "arrow":
@@ -5405,11 +5777,14 @@ def deserialize_component(d):
             show_label=d.get("show_label", False),
             label_font=d.get("label_font"),
             label_color=d.get("label_color"),
+            label_html=d.get("label_html"),
             anchor1=d.get("anchor1"),
             anchor2=d.get("anchor2"),
         )
     elif t == "board":
-        item = BoardCardItem(x, y, w, h, title=d.get("title", "Board"), subitems=d.get("subitems", []), item_id=item_id)
+        item = BoardCardItem(x, y, w, h, title=d.get("title", "Board"), subitems=d.get("subitems", []),
+                              item_id=item_id, title_font=d.get("title_font"), title_color=d.get("title_color"),
+                              title_html=d.get("title_html"))
     elif t == "board_link":
         item = BoardLinkItem(
             x, y, w, h, title=d.get("title", "Board"), target_file=d.get("target_file", ""),
@@ -5424,6 +5799,7 @@ def deserialize_component(d):
             odd_row_bg=d.get("odd_row_bg"), even_row_text_color=d.get("even_row_text_color"),
             odd_row_text_color=d.get("odd_row_text_color"),
             header_fonts=d.get("header_fonts"), data_fonts=d.get("data_fonts"),
+            header_htmls=d.get("header_htmls"), data_htmls=d.get("data_htmls"),
         )
     else:
         return None
@@ -6329,6 +6705,10 @@ class MainWindow(QMainWindow):
         # the user ever "clicking away" from the arrow - see
         # on_selection_changed for where this gets updated/cleared.
         self._active_label_arrow = None
+        # Same idea as _active_label_arrow, but for a BoardCardItem's
+        # in-place "text" subitem editor (_SubitemTextEdit) - see
+        # BoardCardItem.font_targets and on_selection_changed.
+        self._active_text_board_card = None
         # The most recent text item that was genuinely in edit mode -
         # kept around (independent of _active_label_arrow's narrower
         # "is this arrow's label the font-panel target" bookkeeping) so
@@ -6758,6 +7138,40 @@ class MainWindow(QMainWindow):
         self.link_btn.clicked.connect(self.on_hyperlink_clicked)
         self.link_action = draw_tb.addWidget(self.link_btn)
 
+        # -- text highlight (background color behind a run of text) -----
+        # A checkable toggle button + color-swatch pair. The toggle
+        # button mirrors Bold/Italic/Underline above (a plain checkable
+        # QToolButton that shows pressed/active exactly when the current
+        # cursor position/selection already has a highlight - see
+        # _refresh_text_format_buttons) rather than a QCheckBox: unlike a
+        # checkbox, its `toggled` signal firing doesn't depend on the
+        # widget retaining any notion of prior checked state across the
+        # click, which is what made *un*checking the old checkbox
+        # unreliable while a text selection was active. The swatch
+        # button next to it always shows the current highlight color and
+        # doubles as the button that opens the color picker (same
+        # pairing as self.color_btn elsewhere on this toolbar).
+        self.highlight_btn = QToolButton()
+        self.highlight_btn.setText("Highlight")
+        self.highlight_btn.setToolTip("Text highlight")
+        self.highlight_btn.setCheckable(True)
+        self.highlight_btn.setFocusPolicy(Qt.NoFocus)
+        self.highlight_btn.toggled.connect(self.on_highlight_toggled)
+        self.highlight_action = draw_tb.addWidget(self.highlight_btn)
+
+        self.highlight_color = QColor("#ffff00")
+        self.highlight_color_btn = QPushButton()
+        self.highlight_color_btn.setFixedSize(26, 26)
+        # Same NoFocus reasoning as color_btn above: this must not steal
+        # focus away from the text item currently being edited.
+        self.highlight_color_btn.setFocusPolicy(Qt.NoFocus)
+        self.highlight_color_btn.setToolTip("Highlight color")
+        self.highlight_color_btn.setStyleSheet(
+            f"background-color:{self.highlight_color.name()}; border:1px solid #888;"
+        )
+        self.highlight_color_btn.clicked.connect(self.pick_highlight_color)
+        self.highlight_color_action = draw_tb.addWidget(self.highlight_color_btn)
+
         # Placed last on the toolbar (rather than beside Brush, where it
         # used to live) so it always sits at the far end of the bar.
         self.eraser_checkbox = QCheckBox("  Eraser")
@@ -6772,6 +7186,7 @@ class MainWindow(QMainWindow):
         self._font_format_actions = [
             self.text_format_sep, self.font_label_action, self.font_action,
             self.bold_action, self.italic_action, self.underline_action,
+            self.highlight_action, self.highlight_color_action,
         ]
         self._text_format_actions = self._font_format_actions + [self.link_action]
         for a in self._text_format_actions:
@@ -6834,11 +7249,46 @@ class MainWindow(QMainWindow):
         elif self._active_label_arrow not in arrow_sel:
             self._active_label_arrow = None
         arrow_label_sel = [it for it in arrow_sel if it is self._active_label_arrow]
+        # Same "sticky" idea as arrow_label_sel above, but for a
+        # BoardCardItem's title or its in-place "text" subitem editor -
+        # without this, neither ever gets the Font/B/I/U/Size controls
+        # the way every other text-bearing component does, since a
+        # BoardCardItem's subitem text lives in self.subitems rather
+        # than a permanent QGraphicsTextItem child (see
+        # BoardCardItem.font_targets and _SubitemTextEdit).
+        #
+        # Unlike arrow_label_sel, this deliberately does NOT check
+        # scene.selectedItems(): BoardCardItem.mousePressEvent skips
+        # calling super() (and so skips Qt's default click-to-select)
+        # whenever the press lands on a subitem, precisely so dragging
+        # to reorder/detach a subitem doesn't also select the whole
+        # card - which means a card being edited via double-click on a
+        # subitem is essentially never actually "selected". Clearing is
+        # instead driven directly by whether that specific edit is
+        # still live.
+        if editing_item is not None and isinstance(editing_item.parentItem(), BoardCardItem) and (
+            editing_item is editing_item.parentItem().title_item
+            or editing_item.parentItem()._sub_edit_item is editing_item
+        ):
+            self._active_text_board_card = editing_item.parentItem()
+        elif self._active_text_board_card is not None:
+            card = self._active_text_board_card
+            try:
+                still_active = (
+                    card.title_item.textInteractionFlags() == Qt.TextEditorInteraction
+                    or card._sub_edit_item is not None
+                )
+            except RuntimeError:
+                still_active = False
+            if not still_active:
+                self._active_text_board_card = None
+        board_text_sel = [self._active_text_board_card] if self._active_text_board_card is not None else []
         # Anything with a font to edit via the toolbar's Font/B/I/U/Size
         # controls - Text Note, plain Text, Table (whose cells each carry
-        # their own font - see TableItem.font_targets), media items, and
-        # an arrow's label while it's being edited.
-        font_sel = text_sel + table_sel + media_sel + arrow_label_sel
+        # their own font - see TableItem.font_targets), media items, an
+        # arrow's label, and a BoardCardItem's text subitem, each while
+        # being edited.
+        font_sel = text_sel + table_sel + media_sel + arrow_label_sel + board_text_sel
         # Every other component type (Image/GIF/Video/BoardCard, ...) -
         # these only ever have a single "color" (border/fill), so the
         # Color button can restyle them directly whenever one is the
@@ -6937,6 +7387,12 @@ class MainWindow(QMainWindow):
                     default = getattr(first, "DEFAULT_COLOR", None) or "#ffffff"
                     col = QColor(first.color) if first.color else QColor(default)
                 self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+                # No live text cursor to read a per-run highlight from
+                # here - default the toggle off (it'll pick up the real
+                # state again once actively editing/selecting text).
+                self.highlight_btn.blockSignals(True)
+                self.highlight_btn.setChecked(False)
+                self.highlight_btn.blockSignals(False)
             self.size_slider.blockSignals(True)
             self.size_slider.setValue(int(max(1, min(40, round(font.pointSizeF())))))
             self.size_slider.blockSignals(False)
@@ -7036,6 +7492,13 @@ class MainWindow(QMainWindow):
         fg = fmt.foreground()
         col = fg.color() if fg.style() != Qt.NoBrush else editing_item.defaultTextColor()
         self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+        bg = fmt.background()
+        self.highlight_btn.blockSignals(True)
+        self.highlight_btn.setChecked(bg.style() != Qt.NoBrush)
+        self.highlight_btn.blockSignals(False)
+        if bg.style() != Qt.NoBrush:
+            self.highlight_color = bg.color()
+            self.highlight_color_btn.setStyleSheet(f"background-color:{bg.color().name()}; border:1px solid #888;")
         if self.link_action.isVisible():
             self.link_btn.blockSignals(True)
             self.link_btn.setChecked(fmt.isAnchor())
@@ -7238,6 +7701,36 @@ class MainWindow(QMainWindow):
         for it in self._font_selection:
             _apply_text_font(it, underline=checked, editing_item=editing_item)
 
+    def _apply_highlight(self, color_name):
+        """Push `color_name` (or "" to clear) as the background of the
+        current text selection - or, with no selection, the whole field
+        - across every item in the font-format selection. Shared by the
+        Text Highlight checkbox and its color-swatch button, since
+        picking a new color while highlighting is already on should
+        re-apply immediately, same as it does for the Color button."""
+        editing_item = self._focused_text_item()
+        for it in self._font_selection:
+            targets = it.font_targets(editing_item) if hasattr(it, "font_targets") else [it.text_item]
+            for t in targets:
+                has_sel = (t is editing_item) and t.textCursor().hasSelection()
+                _apply_run_format(t, has_sel, background=color_name)
+        if editing_item is not None:
+            self._restore_text_edit_focus()
+
+    def on_highlight_toggled(self, checked):
+        if not self._font_selection:
+            return
+        self._apply_highlight(self.highlight_color.name() if checked else "")
+
+    def pick_highlight_color(self):
+        color = QColorDialog.getColor(self.highlight_color, self, "Pick highlight color")
+        if not color.isValid():
+            return
+        self.highlight_color = color
+        self.highlight_color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
+        if self._font_selection and self.highlight_btn.isChecked():
+            self._apply_highlight(color.name())
+
     def on_hyperlink_clicked(self):
         if not self._text_selection:
             return
@@ -7259,7 +7752,15 @@ class MainWindow(QMainWindow):
                 return
             url = url.strip()
             norm = normalize_link_url(url) if url else ""
-            _apply_run_format(editing_item, has_sel, anchor_url=norm or None)
+            if norm:
+                _apply_run_format(editing_item, has_sel, anchor_url=norm)
+            else:
+                # Removing the link must also drop the underline/blue
+                # that were only ever applied *because* it was a link -
+                # otherwise the text keeps visually looking like a link
+                # even after the link itself is gone.
+                _apply_run_format(editing_item, has_sel, anchor_url=None,
+                                   underline=False, foreground=None)
             self._restore_text_edit_focus()
             parent = editing_item.parentItem()
             if not has_sel and hasattr(parent, "set_link"):
@@ -7270,6 +7771,15 @@ class MainWindow(QMainWindow):
                         parent.set_color(QColor("#5b9dd9"))
                     elif isinstance(parent, TextNoteItem):
                         parent.set_text_color(QColor("#5b9dd9"))
+                elif not norm and was_linked:
+                    # Revert the auto-applied link-blue back to a normal
+                    # color - but only if it's still exactly that color
+                    # (the user hasn't since repicked something else
+                    # themself via the Color button).
+                    if isinstance(parent, PlainTextItem) and parent.color == "#5b9dd9":
+                        parent.set_color(QColor("#ffffff"))
+                    elif isinstance(parent, TextNoteItem) and parent.text_color == "#5b9dd9":
+                        parent.set_text_color(QColor("#ffffff"))
             elif has_sel and norm:
                 # First time this exact run becomes a link: nudge just
                 # its own text to the familiar link-blue as a starting
@@ -7299,6 +7809,12 @@ class MainWindow(QMainWindow):
                     it.set_color(QColor("#5b9dd9"))
                 elif isinstance(it, TextNoteItem):
                     it.set_text_color(QColor("#5b9dd9"))
+            elif not url and was_linked:
+                # Same revert as above for the in-place-edit path.
+                if isinstance(it, PlainTextItem) and it.color == "#5b9dd9":
+                    it.set_color(QColor("#ffffff"))
+                elif isinstance(it, TextNoteItem) and it.text_color == "#5b9dd9":
+                    it.set_text_color(QColor("#ffffff"))
 
     def on_line_style_changed(self, index):
         if not self._arrow_selection:
