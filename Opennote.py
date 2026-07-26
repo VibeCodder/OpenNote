@@ -1150,25 +1150,28 @@ class BaseComponentItem(QGraphicsObject):
             event.accept()
             return
         super().mouseMoveEvent(event)
-        self._update_board_hover_preview()
+        self._update_board_hover_preview(event.scenePos())
 
-    def _update_board_hover_preview(self):
+    def _update_board_hover_preview(self, cursor_scene_pos):
         """While this item is being dragged around the canvas (not
         resized), show a live insertion-line preview on whichever board
         card it is currently over, so the user can see exactly where the
         component will land instead of it always jumping to the end of
-        the card's contents on drop."""
+        the card's contents on drop.
+
+        Uses the actual mouse cursor position rather than this item's
+        own geometric center: for a tall/long dragged component, the
+        center can sit well outside (below) a board card even while the
+        cursor - and the part of the component actually overlapping the
+        card - is right at the card's bottom edge, which used to hide
+        the insertion line in exactly that case."""
         if isinstance(self, BoardCardItem):
             return
         scene = self.scene()
         if scene is None:
             return
-        try:
-            center = self.mapToScene(self.rect().center())
-        except Exception:
-            return
         target = None
-        for other in scene.items(center):
+        for other in scene.items(cursor_scene_pos):
             if isinstance(other, BoardCardItem) and other is not self:
                 target = other
                 break
@@ -1176,7 +1179,7 @@ class BaseComponentItem(QGraphicsObject):
         if prev is not None and prev is not target:
             prev.clear_insert_preview()
         if target is not None:
-            target.show_insert_preview(target.mapFromScene(center).y())
+            target.show_insert_preview(target.mapFromScene(cursor_scene_pos).y())
         self._hover_board = target
 
     def mouseReleaseEvent(self, event):
@@ -1188,12 +1191,13 @@ class BaseComponentItem(QGraphicsObject):
             super().mouseReleaseEvent(event)
         if was_resizing:
             self._on_resize_interaction_finished()
-        if self._hover_board is not None:
-            self._hover_board.clear_insert_preview()
-            self._hover_board = None
+        hover_board = self._hover_board
+        self._hover_board = None
         scene = self.scene()
         if scene is not None and not was_resizing and hasattr(scene, "item_drag_released"):
-            scene.item_drag_released(self)
+            scene.item_drag_released(self, hover_board)
+        if hover_board is not None:
+            hover_board.clear_insert_preview()
 
     def _on_resize_interaction_finished(self):
         """Hook for subclasses (ImageItem/GifItem) that render at a
@@ -3123,17 +3127,28 @@ class ArrowItem(BaseComponentItem):
 
     def _anchor_scene_point(self, anchor, other_scene_pt):
         """Where an anchored endpoint actually sits: the point on the
-        *outer border* of the target's rectangle, in the direction from
-        the target's center towards `other_scene_pt` (the arrow's other
-        endpoint, or its target's center if that end is anchored too).
+        *outer border* of the target's rectangle, sliding along whichever
+        edge (top/bottom/left/right) the user actually dropped it on,
+        in the direction from the target's center towards
+        `other_scene_pt` (the arrow's other endpoint, or its target's
+        center if that end is anchored too).
 
-        This is what makes an anchored endpoint "orbit" the target
-        correctly - as the other end moves around, this point slides
-        along the target's edge to keep facing it - and always hugs the
-        border instead of sitting at a fixed spot that can end up buried
-        inside the component. rx/ry (still stored on the anchor for the
-        save file) are no longer used to place the point; they're only
-        the drop location recorded when the anchor was created.
+        Which edge that is comes from rx/ry - the fixed fraction of the
+        target's width/height where the endpoint was dropped, recorded
+        once in _set_anchor and otherwise unused for placement - by
+        picking whichever of the four edges rx/ry sits closest to (e.g.
+        ry near 0 means it was dropped near the top, so this hugs the
+        top edge). Deriving the edge from that fixed, one-time fraction
+        rather than from the *current* tx/ty ray-cast comparison matters
+        because resizing the target shifts its geometric center (growth
+        extends the rect away from its fixed top-left corner): the old
+        ray-cast approach recomputed which edge was "closest" from
+        scratch on every refresh, so a resize alone - with neither the
+        target's position nor the other endpoint moving - could flip an
+        anchor from the top edge it was dropped on onto an unrelated
+        side edge. Locking the edge to rx/ry fixes that; the point still
+        slides along that edge (clamped to its segment) to keep facing
+        the other endpoint, preserving the original "orbiting" behavior.
         """
         target = anchor["item"]
         w = max(1.0, target._w)
@@ -3143,10 +3158,30 @@ class ArrowItem(BaseComponentItem):
         dx, dy = local_other.x() - cx, local_other.y() - cy
         if abs(dx) < 1e-6 and abs(dy) < 1e-6:
             dx, dy = 0.0, -1.0  # other point sits on the center: pick a default facing
-        tx = (w / 2.0) / abs(dx) if abs(dx) > 1e-9 else float("inf")
-        ty = (h / 2.0) / abs(dy) if abs(dy) > 1e-9 else float("inf")
-        t = min(tx, ty)
-        local_edge = QPointF(cx + dx * t, cy + dy * t)
+        rx = anchor.get("rx", 0.5)
+        ry = anchor.get("ry", 0.5)
+        dists = {"left": rx, "right": 1.0 - rx, "top": ry, "bottom": 1.0 - ry}
+        min_dist = min(dists.values())
+        candidates = [s for s, d in dists.items() if abs(d - min_dist) < 1e-9]
+        if len(candidates) > 1:
+            # Tie (e.g. a legacy/center-dropped anchor with no clear
+            # closest edge) - fall back to whichever edge the current
+            # direction ray would hit first.
+            tx = (w / 2.0) / abs(dx) if abs(dx) > 1e-9 else float("inf")
+            ty = (h / 2.0) / abs(dy) if abs(dy) > 1e-9 else float("inf")
+            side = ("right" if dx > 0 else "left") if tx < ty else ("bottom" if dy > 0 else "top")
+        else:
+            side = candidates[0]
+        if side in ("left", "right"):
+            edge_x = w if side == "right" else 0.0
+            t = (edge_x - cx) / dx if abs(dx) > 1e-9 else 0.0
+            edge_y = min(h, max(0.0, cy + dy * t))
+            local_edge = QPointF(edge_x, edge_y)
+        else:
+            edge_y = h if side == "bottom" else 0.0
+            t = (edge_y - cy) / dy if abs(dy) > 1e-9 else 0.0
+            edge_x = min(w, max(0.0, cx + dx * t))
+            local_edge = QPointF(edge_x, edge_y)
         return target.mapToScene(local_edge)
 
     def refresh_anchors(self):
@@ -4802,19 +4837,30 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         return None
 
     @staticmethod
-    def _subitem_media_height(pm, avail_w, remaining_h, aspect=None, min_h=40, max_h=280):
+    def _subitem_media_height(pm, avail_w, remaining_h, aspect=None, min_h=40, max_h=None):
         """Compute the reserved box height for an image/gif/video subitem
         so that its box matches the media's real aspect ratio (height/width)
         - this is what lets the media be drawn with KeepAspectRatio and
         exactly fill the box with no cropping and no empty bars, at any
-        card width."""
+        card width.
+
+        max_h is only applied if the caller explicitly asks for one - a
+        blanket default cap here would clamp the box's height while its
+        width stayed at avail_w, so a tall/long image would end up
+        scaled down to fit that capped height and no longer fill the
+        box's full width, appearing pillarboxed instead of "exactly
+        fill the box" as promised above. The only height limit that
+        should apply unconditionally is however much room is actually
+        left in the card (remaining_h)."""
         if aspect is None:
             if pm is not None and not pm.isNull() and pm.width() > 0:
                 aspect = pm.height() / pm.width()
             else:
                 aspect = 9 / 16
         h = avail_w * aspect
-        return max(min_h, min(h, max_h, remaining_h))
+        if max_h is not None:
+            h = min(h, max_h)
+        return max(min_h, min(h, remaining_h))
 
     def _get_or_create_video_proxy(self, subitem):
         """Return the embedded VideoPlayerNode for this "video" subitem,
@@ -6577,26 +6623,39 @@ class MindMapScene(QGraphicsScene):
         return merged
 
     # -- drag a component onto a board card to nest it -----------------
-    def item_drag_released(self, item):
+    def item_drag_released(self, item, hover_board=None):
         if isinstance(item, BoardCardItem):
             return
-        try:
-            center = item.mapToScene(item.rect().center())
-        except Exception:
-            return
-        for other in self.items(center):
-            if isinstance(other, BoardCardItem) and other is not item:
-                sub = component_to_subitem(item)
-                if sub is not None:
-                    # Insert at the slot the user was hovering over
-                    # (shown live by the insertion preview line) rather
-                    # than always appending to the end of the card.
+        other = hover_board if (hover_board is not None and hover_board.scene() is self) else None
+        if other is None:
+            # Fallback for callers that don't track hover state themselves
+            # (e.g. programmatic calls) - re-detect via the item's own
+            # center, same as before.
+            try:
+                center = item.mapToScene(item.rect().center())
+            except Exception:
+                return
+            for cand in self.items(center):
+                if isinstance(cand, BoardCardItem) and cand is not item:
+                    other = cand
+                    break
+        if other is not None:
+            sub = component_to_subitem(item)
+            if sub is not None:
+                # Insert at the slot the user was hovering over (shown
+                # live by the insertion preview line) rather than
+                # recomputing it from the dragged item's own center,
+                # which for a tall/long item can sit well outside the
+                # board card even while the cursor - and the preview
+                # line - were correctly over its bottom edge.
+                local_y = other._insert_preview_y
+                if local_y is None:
+                    center = item.mapToScene(item.rect().center())
                     local_y = other.mapFromScene(center).y()
-                    idx = other._subitem_insert_index(local_y)
-                    other.add_subitem(sub, index=idx)
-                    other.clear_insert_preview()
-                    self.removeItem(item)
-                break
+                idx = other._subitem_insert_index(local_y)
+                other.add_subitem(sub, index=idx)
+                other.clear_insert_preview()
+                self.removeItem(item)
 
     # -- helpers ----------------------------------------------------------
     def all_component_items(self):
