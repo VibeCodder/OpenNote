@@ -549,6 +549,62 @@ def _apply_text_font(item, family=None, bold=None, italic=None, underline=None, 
 _UNSET = object()  # sentinel: "leave this property alone" vs. an explicit None
 
 
+def _apply_text_alignment(item, alignment, editing_item=None):
+    """Set paragraph alignment (Qt.AlignLeft / Qt.AlignHCenter / Qt.AlignRight)
+    for a text component - the counterpart to _apply_text_font above, but
+    for a block-level property instead of a character-level one.
+
+    Unlike Bold/Italic/Underline/color, "no selection" here must NOT
+    mean "whole field" while a specific paragraph actually has the live
+    cursor in it - alignment is what a real cursor position (not just a
+    highlighted range) already scopes to in any ordinary rich text
+    editor: an unselected caret still restyles its own paragraph, not
+    every other paragraph in the field along with it. So while `t` is
+    the exact field actually being edited, this reuses its own live
+    QTextCursor as-is and lets Qt's mergeBlockFormat() apply the
+    alignment to whichever block(s) that cursor is genuinely in or
+    touching right now - the current block alone with no selection, or
+    every block a real selection spans. Only when `t` ISN'T being
+    edited at all (including whenever nothing at all is being edited,
+    i.e. a whole component is simply selected on the canvas) does it
+    fall back to the whole field, matching the original whole-item-only
+    behavior.
+
+    setHtml()/toHtml() already round-trip block alignment on their own
+    (it's just a per-<p> inline style to Qt), so this needs no extra
+    serialization work anywhere components are saved/loaded."""
+    targets = item.font_targets(editing_item) if hasattr(item, "font_targets") else [item.text_item]
+    for t in targets:
+        if t is editing_item:
+            cur = t.textCursor()
+        else:
+            cur = QTextCursor(t.document())
+            cur.select(QTextCursor.Document)
+        block_fmt = cur.blockFormat()
+        block_fmt.setAlignment(alignment)
+        cur.mergeBlockFormat(block_fmt)
+
+    # Same relayout hooks as _apply_text_font - a plain mergeBlockFormat()
+    # doesn't itself emit the document's contentsChanged signal, so
+    # anything that caches row/bar heights off the text needs nudging
+    # by hand or it'll go stale exactly like a font/size change would.
+    if hasattr(item, "_layout_cells"):
+        item._layout_cells()
+        item.update()
+    if hasattr(item, "_on_title_desc_text_changed"):
+        item._on_title_desc_text_changed()
+        item.update()
+    if hasattr(item, "_on_label_text_changed"):
+        item._on_label_text_changed()
+        item.update()
+    if hasattr(item, "_on_subitem_text_font_changed"):
+        item._on_subitem_text_font_changed()
+        item.update()
+    if isinstance(item, TextNoteItem):
+        item._on_text_changed()
+        item.update()
+
+
 def _apply_run_format(text_item, has_selection, family=None, bold=None, italic=None,
                        underline=None, point_size=None, foreground=_UNSET, background=_UNSET,
                        anchor_url=_UNSET):
@@ -683,25 +739,46 @@ def _text_run_to_html(frag_text, fmt, base_family, base_size):
     return f'<span style="{style}">{text}</span>'
 
 
+def _block_align_css(block_format):
+    """Map a QTextBlockFormat's alignment to a CSS text-align value -
+    shared by _qtextdocument_to_web_html below. Qt.AlignLeft (and any
+    default/unset block, which reads back as Qt.AlignLeft) needs no
+    special case: "left" is also the CSS default, but it's still spelled
+    out explicitly here rather than omitted, so exported alignment is
+    never silently at the mercy of some other CSS rule's default."""
+    align = block_format.alignment()
+    if align & Qt.AlignHCenter:
+        return "center"
+    if align & Qt.AlignRight:
+        return "right"
+    if align & Qt.AlignJustify:
+        return "justify"
+    return "left"
+
+
 def _qtextdocument_to_web_html(document, base_family="Segoe UI", base_size=11.0):
     """Render a QTextDocument's actual rich, per-character formatting
     (one <span>/<a> per differently-formatted run: bold, italic,
     underline, color, font, hyperlink, ...) as portable HTML for the
     exported board file, so a browser shows exactly what the app shows -
-    formatting selection-by-selection, not just one style per field."""
+    formatting selection-by-selection, not just one style per field.
+    Each paragraph becomes its own margin-free <div> (rather than just
+    joining blocks with <br>) so each one can carry its own text-align -
+    alignment is a block-level property in Qt's rich text model, unlike
+    the character-level formatting the spans inside already handle."""
     parts = []
     block = document.begin()
-    first_block = True
     while block.isValid():
-        if not first_block:
-            parts.append("<br>")
-        first_block = False
+        run_parts = []
         it = block.begin()
         while not it.atEnd():
             frag = it.fragment()
             if frag.isValid() and frag.length() > 0:
-                parts.append(_text_run_to_html(frag.text(), frag.charFormat(), base_family, base_size))
+                run_parts.append(_text_run_to_html(frag.text(), frag.charFormat(), base_family, base_size))
             it += 1
+        align = _block_align_css(block.blockFormat())
+        content = "".join(run_parts) or "&nbsp;"
+        parts.append(f'<div style="margin:0;padding:0;text-align:{align}">{content}</div>')
         block = block.next()
     return "".join(parts)
 
@@ -765,6 +842,25 @@ def _representative_font(item, editing_item=None):
         targets = item.font_targets(editing_item)
         return targets[0].font() if targets else QFont("Segoe UI", 10)
     return item.text_item.font()
+
+
+def _representative_alignment(item, editing_item=None):
+    """The alignment shown in the toolbar's Align dropdown for the
+    current selection - the block alignment at the live cursor (if
+    that's one of the returned targets), or of the first paragraph of
+    the first cell/text item otherwise. Mirrors _representative_font's
+    editing_item handling above, just reading blockFormat() instead of
+    the character format."""
+    if hasattr(item, "font_targets"):
+        targets = item.font_targets(editing_item)
+        target = targets[0] if targets else None
+    else:
+        target = item.text_item
+    if target is None:
+        return Qt.AlignLeft
+    if target is editing_item:
+        return target.textCursor().blockFormat().alignment()
+    return target.document().firstBlock().blockFormat().alignment()
 
 
 def _font_to_dict(f):
@@ -4319,7 +4415,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         differently-formatted subitems at once."""
         if editing_item is self.title_item:
             return [self.title_item]
-        if editing_item is self._sub_edit_item:
+        if editing_item is not None and editing_item is self._sub_edit_item:
             return [self._sub_edit_item]
         return []
 
@@ -7219,6 +7315,42 @@ class MainWindow(QMainWindow):
         self.underline_btn.toggled.connect(self.on_underline_toggled)
         self.underline_action = draw_tb.addWidget(self.underline_btn)
 
+        # -- text alignment (Left / Center / Right) ----------------------
+        # One dropdown button rather than three separate toggles, since
+        # the three options are mutually exclusive (a paragraph has
+        # exactly one alignment, never a combination) - a QActionGroup
+        # inside the popup menu enforces that. Shown/hidden together with
+        # Font/B/I/U (see _font_format_actions) and kept in sync with the
+        # live cursor the same way (see _refresh_text_format_buttons /
+        # on_selection_changed).
+        self.align_btn = QToolButton()
+        self.align_btn.setToolTip("Text alignment")
+        self.align_btn.setPopupMode(QToolButton.InstantPopup)
+        self.align_btn.setFocusPolicy(Qt.NoFocus)
+        align_menu = QMenu(self.align_btn)
+        self.align_group = QActionGroup(self)
+        self.align_group.setExclusive(True)
+        self._align_actions = {}
+        for label, alignment in (("Left", Qt.AlignLeft), ("Center", Qt.AlignHCenter), ("Right", Qt.AlignRight)):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.triggered.connect(lambda checked, a=alignment: self.on_align_changed(a))
+            align_menu.addAction(act)
+            self.align_group.addAction(act)
+            self._align_actions[alignment] = act
+        self.align_btn.setMenu(align_menu)
+        self._set_align_button(Qt.AlignLeft)
+        # aboutToShow fires synchronously, right before the popup steals
+        # focus - the live text cursor is still exactly where the user
+        # left it at that point, so this is what guarantees the menu
+        # always opens showing the field's *actual* current alignment,
+        # regardless of whether some earlier click happened to skip a
+        # _refresh_text_format_buttons()/on_selection_changed() call
+        # (only mouseReleaseEvent/keyReleaseEvent trigger those - not
+        # every possible way a click can land the cursor somewhere new).
+        align_menu.aboutToShow.connect(self._refresh_align_button_now)
+        self.align_action = draw_tb.addWidget(self.align_btn)
+
         self.link_btn = QToolButton()
         self.link_btn.setText("Link")
         self.link_btn.setToolTip("Add / edit hyperlink")
@@ -7260,7 +7392,7 @@ class MainWindow(QMainWindow):
         self._font_format_actions = [
             self.text_format_sep, self.font_label_action, self.font_action,
             self.bold_action, self.italic_action, self.underline_action,
-            self.highlight_action,
+            self.align_action, self.highlight_action,
         ]
         self._text_format_actions = self._font_format_actions + [self.link_action]
         for a in self._text_format_actions:
@@ -7302,6 +7434,29 @@ class MainWindow(QMainWindow):
         media_sel = [it for it in all_sel if isinstance(it, MediaCardMixin)]
         text_note_sel = [it for it in all_sel if isinstance(it, TextNoteItem)]
         editing_item = self._focused_text_item()
+        if editing_item is None and self._last_edited_text_item is not None:
+            # scene.focusItem() can report None even while a text item is
+            # still genuinely mid-edit: opening a popup (e.g. the Align
+            # dropdown's QMenu, or the font-family combo) steals real Qt
+            # widget focus from the QGraphicsView, which is enough to
+            # make the scene report no focus item - even though
+            # focusOutEvent (see EditableTextItem) deliberately left the
+            # item's own TextEditorInteraction flag untouched for exactly
+            # this case. Without this check, that momentary None was
+            # trusted at face value here, wiping _last_edited_text_item /
+            # _active_text_board_card and making every "current field"
+            # font_targets() call below return [] - which is what made
+            # the toolbar flash to generic defaults (Segoe UI 10, Align:
+            # Left, white) instead of the field's real live formatting
+            # the instant a dropdown was opened.
+            try:
+                still_editing = (
+                    self._last_edited_text_item.textInteractionFlags() == Qt.TextEditorInteraction
+                )
+            except RuntimeError:
+                still_editing = False
+            if still_editing:
+                editing_item = self._last_edited_text_item
         if editing_item is not None:
             self._last_edited_text_item = editing_item
         elif self._last_edited_text_item is not None:
@@ -7487,6 +7642,7 @@ class MainWindow(QMainWindow):
             self.underline_btn.blockSignals(True)
             self.underline_btn.setChecked(font.underline())
             self.underline_btn.blockSignals(False)
+            self._set_align_button(_representative_alignment(first, editing_item))
             if editing_item is None and text_sel:
                 self.link_btn.blockSignals(True)
                 self.link_btn.setChecked(bool(getattr(text_sel[0], "link_url", None)))
@@ -7556,6 +7712,7 @@ class MainWindow(QMainWindow):
         self.underline_btn.blockSignals(True)
         self.underline_btn.setChecked(f.underline())
         self.underline_btn.blockSignals(False)
+        self._set_align_button(cur.blockFormat().alignment())
         size = f.pointSizeF()
         if size <= 0:
             size = editing_item.font().pointSizeF()
@@ -7825,6 +7982,69 @@ class MainWindow(QMainWindow):
         editing_item = self._focused_text_item()
         for it in self._font_selection:
             _apply_text_font(it, underline=checked, editing_item=editing_item)
+
+    _ALIGN_LABELS = {Qt.AlignLeft: "Left", Qt.AlignHCenter: "Center", Qt.AlignRight: "Right"}
+
+    def _set_align_button(self, alignment):
+        """Update the Align dropdown's button text and which menu item
+        shows as checked, without triggering on_align_changed (QAction's
+        `triggered` signal only fires for genuine user activation, not
+        programmatic setChecked(), so no signal-blocking is needed here
+        the way the plain QToolButtons above need it)."""
+        mask = int(alignment) & int(Qt.AlignHCenter | Qt.AlignRight)
+        if mask & int(Qt.AlignHCenter):
+            key = Qt.AlignHCenter
+        elif mask & int(Qt.AlignRight):
+            key = Qt.AlignRight
+        else:
+            key = Qt.AlignLeft
+        act = self._align_actions.get(key)
+        if act is not None:
+            act.setChecked(True)
+        self.align_btn.setText(f"Align: {self._ALIGN_LABELS.get(key, 'Left')}")
+
+    def _refresh_align_button_now(self):
+        """Re-derive the Align dropdown's state from the live text cursor
+        the instant the popup is about to open (see its aboutToShow
+        connection above) rather than trusting whatever it was already
+        showing - the definitive fix for it looking "stuck" on a stale
+        alignment right after clicking into a field.
+
+        scene.focusItem() (what _focused_text_item() reads) can already
+        report None by the time aboutToShow fires - opening the popup
+        itself is enough to knock the scene's own idea of "focused item"
+        out, same underlying issue _restore_text_edit_focus works around
+        elsewhere. Falling back to _last_edited_text_item (which
+        on_selection_changed keeps pointed at the real editing item for
+        exactly this reason) avoids the resulting empty font_targets()
+        - e.g. BoardCardItem.font_targets(None) is [] - which was making
+        this look like the field had reset to Left instead of showing
+        its actual alignment."""
+        if not self._font_selection:
+            return
+        editing_item = self._focused_text_item() or self._last_edited_text_item
+        first = self._font_selection[0]
+        self._set_align_button(_representative_alignment(first, editing_item))
+
+    def on_align_changed(self, alignment):
+        if not self._font_selection:
+            return
+        # Same fallback as _refresh_align_button_now above, and for the
+        # same reason: the popup menu has already been open (stealing
+        # focus) by the time a user's click on one of its actions
+        # actually fires this, so _focused_text_item() alone risks
+        # returning None here too - which for BoardCardItem means
+        # font_targets(None) == [], silently applying the new alignment
+        # to nothing at all.
+        editing_item = self._focused_text_item() or self._last_edited_text_item
+        for it in self._font_selection:
+            _apply_text_alignment(it, alignment, editing_item=editing_item)
+        self._set_align_button(alignment)
+        # The popup menu (like the font-family combo) genuinely needs
+        # focus to be clickable at all, which otherwise silently drops
+        # whatever text item was mid-edit out of edit mode - see
+        # _restore_text_edit_focus.
+        self._restore_text_edit_focus()
 
     def _apply_highlight(self, color_name):
         """Push `color_name` (or "" to clear) as the background of the
