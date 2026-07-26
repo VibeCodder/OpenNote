@@ -5483,7 +5483,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         title_color_css = color_to_css(self.title_item.defaultTextColor().name())
         return (
             f'<div class="comp board-card" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
-            f'width:{self._w}px;height:{self._h}px;background:{bg_css};">{self._top_strip_html()}'
+            f'width:{self._w}px;min-height:{self._h}px;background:{bg_css};">{self._top_strip_html()}'
             f'<div class="board-title" style="color:{title_color_css};">{title}</div>'
             f'<div class="board-body">{"".join(rows)}</div></div>'
         )
@@ -6839,7 +6839,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .arrow-note svg {{ width:100%; height:100%; }}
   .board-card {{ background:#2b2b2b; border-radius:10px; border:1px solid #111; color:#eee; overflow:hidden; box-shadow:0 4px 10px rgba(0,0,0,.5); }}
   .board-title {{ background:#1e1e1e; padding:8px 12px; font-weight:600; }}
-  .board-body {{ padding:8px; overflow:auto; height:calc(100% - 40px); }}
+  /* height:auto (not a fixed calc(100% - 40px)) so the body always grows
+     to fit its actual rendered content. The browser's layout engine
+     (natural img aspect-ratio, its own font metrics for wrapped text)
+     essentially never reproduces Qt's paint()-computed row heights to
+     the pixel, so a fixed height + overflow:auto here would just hide
+     that mismatch behind a scrollbar instead of the card visually
+     "autogrowing" the way it does live in the app - see
+     BoardCardItem.to_html(), which sets min-height (not height) on the
+     card itself for the same reason. */
+  .board-body {{ padding:8px; overflow:visible; height:auto; }}
   .sub-image, .sub-video {{ margin-bottom:18px; border-radius:4px; overflow:hidden; background:#111; }}
   .sub-image img {{ width:100%; display:block; }}
   .sub-video video {{ width:100%; display:block; }}
