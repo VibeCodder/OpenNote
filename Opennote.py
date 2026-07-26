@@ -48,6 +48,12 @@ from PySide6.QtWidgets import (
 )
 
 try:
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
+    HAS_OPENGL = True
+except Exception:
+    HAS_OPENGL = False
+
+try:
     from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
     # QGraphicsVideoItem (a real QGraphicsItem the scene paints directly)
     # is used instead of QVideoWidget for the actual video frames: a
@@ -2060,6 +2066,18 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
                  title_html=None, desc_html=None,
                  top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
+        # Media cards tend to be large on screen, so during panning they
+        # fall inside the newly-exposed strip on almost every mouse-move
+        # step, re-running the whole paint() (background rect, image draw,
+        # title/description child items, border, handle) dozens of times
+        # a second even though none of that content actually changed -
+        # only the item's screen position did. DeviceCoordinateCache
+        # renders once and reuses that cached pixmap for pure translation/
+        # scroll, which is what was making panning stutter specifically on
+        # canvases with image/gif/video cards. update() (called whenever
+        # the pixmap, text, or size genuinely changes) still invalidates
+        # and re-renders the cache as normal.
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
         self._init_top_strip(top_strip_enabled, top_strip_color)
         self.pixmap_orig = pixmap if pixmap is not None else base64_to_pixmap(b64)
         # Cache of the last smooth-scaled pixmap, keyed by target size -
@@ -2212,6 +2230,11 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
                  title_html=None, desc_html=None,
                  top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
+        # See ImageItem.__init__ for why this cache mode matters for
+        # panning smoothness - same reasoning applies here, and the GIF's
+        # own animation update() calls still invalidate/refresh the cache
+        # normally, so the animation keeps playing correctly.
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
         self._init_top_strip(top_strip_enabled, top_strip_color)
         if gif_bytes is not None:
             self.gif_bytes = gif_bytes
@@ -2434,6 +2457,18 @@ class VideoPlayerNode(QGraphicsObject):
 
         self.controls_proxy = QGraphicsProxyWidget(self)
         self.controls_proxy.setWidget(controls)
+        # The controls are a real styled QWidget (QSS-rendered buttons and
+        # slider) re-rasterized via the style engine on every repaint. That
+        # cost is fine for a single static paint, but during panning the
+        # view repaints continuously while the widget's actual content
+        # never changes - only its screen position does. Caching the
+        # rendered pixmap here means panning just blits it instead of
+        # re-running the whole widget/style paint pipeline every frame,
+        # which is what caused the stutter on canvases with video/media
+        # cards (this cache is still invalidated automatically whenever the
+        # widget's content genuinely changes, e.g. play/pause icon, slider
+        # position, or time label text).
+        self.controls_proxy.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
 
         self.resize(self._w, self._h)
         if video_bytes:
@@ -2531,6 +2566,13 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
                  title_html=None, desc_html=None,
                  top_strip_enabled=False, top_strip_color=None):
         super().__init__(x, y, w, h, item_id)
+        # See ImageItem.__init__ for why this cache mode matters for
+        # panning smoothness. This only caches the card's own chrome
+        # (background, drag strip, border, title/description); the actual
+        # video frames are painted by self.player_node, a separate child
+        # item with its own independent cache mode, so playback still
+        # updates every frame as normal.
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
         self._init_top_strip(top_strip_enabled, top_strip_color)
         if video_bytes is not None:
             self.video_bytes = video_bytes
@@ -2642,6 +2684,13 @@ class DrawingItem(BaseComponentItem):
 
     def __init__(self, x=0, y=0, w=100, h=100, strokes=None, item_id=None):
         super().__init__(x, y, w, h, item_id)
+        # See ImageItem.__init__ for why this matters for panning/zoom
+        # smoothness - here it avoids rebuilding a QPainterPath from every
+        # stroke's raw points on every repaint, which for a detailed
+        # freehand sketch is real per-frame work. add_stroke()/
+        # set_stroke_style()/set_size() all call update(), which still
+        # invalidates and re-renders the cache as normal.
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
         self.strokes = strokes or []
         self.min_w, self.min_h = 20, 20
 
@@ -3454,7 +3503,14 @@ class TableSettingsDialog(QDialog):
         ("odd_row_text_color", "Text color for odd rows"),
         ("even_row_bg", "Even row color"),
         ("even_row_text_color", "Text color for even rows"),
+        ("grid_line_color", "Grid line color"),
     ]
+
+    # Roles whose color dialog should let the user pick transparency too -
+    # just the grid line for now, since it defaults to semi-transparent
+    # white so it reads against every row/header background at once (see
+    # TableItem.DEFAULT_GRID_LINE_COLOR).
+    ALPHA_ROLES = {"grid_line_color"}
 
     def __init__(self, table_item, parent=None):
         super().__init__(parent)
@@ -3477,6 +3533,12 @@ class TableSettingsDialog(QDialog):
         self.cols_spin.setValue(table_item.cols)
         form.addRow("Columns:", self.cols_spin)
 
+        self.grid_width_spin = QSpinBox()
+        self.grid_width_spin.setRange(0, 10)
+        self.grid_width_spin.setValue(table_item.grid_line_width)
+        self.grid_width_spin.setSuffix(" px")
+        form.addRow("Grid line width:", self.grid_width_spin)
+
         layout.addLayout(form)
 
         grid = QGridLayout()
@@ -3497,19 +3559,29 @@ class TableSettingsDialog(QDialog):
 
     def _refresh_swatch(self, name):
         col = self._colors[name]
+        # rgba(...) so the swatch itself previews the actual transparency
+        # for roles like grid_line_color, instead of showing it opaque.
         self._swatches[name].setStyleSheet(
-            f"background-color:{col.name()}; border:1px solid #888;"
+            f"background-color:rgba({col.red()},{col.green()},{col.blue()},{col.alphaF():.2f}); "
+            f"border:1px solid #888;"
         )
 
     def _pick(self, name):
-        chosen = QColorDialog.getColor(self._colors[name], self, "Pick color")
+        options = QColorDialog.ShowAlphaChannel if name in self.ALPHA_ROLES else QColorDialog.ColorDialogOptions()
+        chosen = QColorDialog.getColor(self._colors[name], self, "Pick color", options=options)
         if chosen.isValid():
             self._colors[name] = chosen
             self._refresh_swatch(name)
 
     def apply_to_table(self):
         self.table_item.set_grid_size(self.rows_spin.value(), self.cols_spin.value())
-        self.table_item.set_colors(**{name: col.name() for name, col in self._colors.items()})
+        self.table_item.set_colors(
+            grid_line_width=self.grid_width_spin.value(),
+            **{
+                name: (col.name(QColor.HexArgb) if col.alpha() < 255 else col.name())
+                for name, col in self._colors.items()
+            }
+        )
 
 
 class TableItem(BaseComponentItem):
@@ -3531,6 +3603,11 @@ class TableItem(BaseComponentItem):
     DEFAULT_TEXT_COLOR = "#e8e8e8"
     DEFAULT_EVEN_ROW_BG = "#242424"
     DEFAULT_ODD_ROW_BG = "#1b1b1b"
+    # Semi-transparent white by default, since it needs to read clearly
+    # against every row/header background above, which are all dark -
+    # see TableSettingsDialog.COLOR_ROLES for where this is user-editable.
+    DEFAULT_GRID_LINE_COLOR = "#46ffffff"
+    DEFAULT_GRID_LINE_WIDTH = 1
 
     CELL_PAD = 6
 
@@ -3538,8 +3615,13 @@ class TableItem(BaseComponentItem):
                  data=None, headers=None, header_bg=None, header_text_color=None,
                  text_color=None, even_row_bg=None, odd_row_bg=None,
                  even_row_text_color=None, odd_row_text_color=None,
-                 header_fonts=None, data_fonts=None, header_htmls=None, data_htmls=None):
+                 header_fonts=None, data_fonts=None, header_htmls=None, data_htmls=None,
+                 grid_line_color=None, grid_line_width=None):
         super().__init__(x, y, w, h, item_id)
+        # See ImageItem.__init__ for why this matters for panning/zoom
+        # smoothness. update() (row/col edits, restyle, resize) still
+        # invalidates and re-renders the cache as normal.
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
         self.rows = max(1, int(rows))
         self.cols = max(1, int(cols))
 
@@ -3552,6 +3634,8 @@ class TableItem(BaseComponentItem):
         self.odd_row_bg = odd_row_bg or self.DEFAULT_ODD_ROW_BG
         self.even_row_text_color = even_row_text_color or self.text_color
         self.odd_row_text_color = odd_row_text_color or self.text_color
+        self.grid_line_color = grid_line_color or self.DEFAULT_GRID_LINE_COLOR
+        self.grid_line_width = self.DEFAULT_GRID_LINE_WIDTH if grid_line_width is None else grid_line_width
 
         init_headers = list(headers) if headers else [f"Header {c + 1}" for c in range(self.cols)]
         init_headers = (init_headers + [""] * self.cols)[:self.cols]
@@ -3731,7 +3815,7 @@ class TableItem(BaseComponentItem):
 
     def set_colors(self, header_bg=None, header_text_color=None, text_color=None,
                     even_row_bg=None, odd_row_bg=None, even_row_text_color=None,
-                    odd_row_text_color=None):
+                    odd_row_text_color=None, grid_line_color=None, grid_line_width=None):
         if header_bg is not None:
             self.header_bg = header_bg
         if header_text_color is not None:
@@ -3746,6 +3830,10 @@ class TableItem(BaseComponentItem):
             self.even_row_text_color = even_row_text_color
         if odd_row_text_color is not None:
             self.odd_row_text_color = odd_row_text_color
+        if grid_line_color is not None:
+            self.grid_line_color = grid_line_color
+        if grid_line_width is not None:
+            self.grid_line_width = grid_line_width
         self._apply_cell_colors()
         self.update()
 
@@ -3922,14 +4010,28 @@ class TableItem(BaseComponentItem):
             y += h
             boundaries.append(y)
 
-        # Grid lines
-        painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(0, 0, 0, 90), 1))
-        for c in range(1, self.cols):
-            x = rect.x() + c * col_w
-            painter.drawLine(QPointF(x, rect.y()), QPointF(x, rect.y() + rect.height()))
-        for yb in boundaries:
-            painter.drawLine(QPointF(rect.x(), rect.y() + yb), QPointF(rect.x() + rect.width(), rect.y() + yb))
+        # Grid lines - color and thickness are user-editable
+        # (TableSettingsDialog's "Grid line color"/"Grid line width" -
+        # see self.grid_line_color/self.grid_line_width), defaulting to a
+        # thin, light, semi-opaque line rather than a dark one:
+        # header/row backgrounds here are all dark (#33465e/#242424/
+        # #1b1b1b), so a low-alpha *black* line barely shows up against
+        # them.
+        if self.grid_line_width > 0:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(self.grid_line_color), self.grid_line_width))
+            # Round to whole pixels: row heights auto-grow to fractional
+            # values (see _recalc_row_heights's per_slot math), and with
+            # antialiasing off a line at e.g. y=394.37 rasterizes as a
+            # blurry/uneven 1-2px smear instead of one crisp pixel line -
+            # which is what made some grid lines look noticeably thicker
+            # or fuzzier than others.
+            for c in range(1, self.cols):
+                x = round(rect.x() + c * col_w)
+                painter.drawLine(QPointF(x, round(rect.y())), QPointF(x, round(rect.y() + rect.height())))
+            for yb in boundaries:
+                y_line = round(rect.y() + yb)
+                painter.drawLine(QPointF(round(rect.x()), y_line), QPointF(round(rect.x() + rect.width()), y_line))
 
         # Outer frame - blue while selected, like every other component
         painter.setPen(QPen(QColor("#4c8bf5"), 2) if self.isSelected() else QPen(QColor(0, 0, 0, 120), 1))
@@ -3974,6 +4076,8 @@ class TableItem(BaseComponentItem):
         d["odd_row_bg"] = self.odd_row_bg
         d["even_row_text_color"] = self.even_row_text_color
         d["odd_row_text_color"] = self.odd_row_text_color
+        d["grid_line_color"] = self.grid_line_color
+        d["grid_line_width"] = self.grid_line_width
         return d
 
     def to_html(self):
@@ -4007,8 +4111,12 @@ class TableItem(BaseComponentItem):
 
         header_fonts = self._current_header_fonts()
         data_fonts = self._current_data_fonts()
+        cell_border = (
+            f"border:{self.grid_line_width}px solid {color_to_css(self.grid_line_color)}"
+            if self.grid_line_width > 0 else "border:none"
+        )
         header_cells = "".join(
-            f'<th style="text-align:left;padding:6px;background:{color_to_css(self.header_bg)};'
+            f'<th style="text-align:left;padding:6px;{cell_border};background:{color_to_css(self.header_bg)};'
             f'color:{color_to_css(self.header_text_color)};'
             f'{";".join(font_style_bits(header_fonts[c]))}">{cell_rich_html(it, header_fonts[c])}</th>'
             for c, it in enumerate(self._header_items)
@@ -4019,7 +4127,7 @@ class TableItem(BaseComponentItem):
             row_bg = self.even_row_bg if is_even else self.odd_row_bg
             row_text_color = self.even_row_text_color if is_even else self.odd_row_text_color
             cells = "".join(
-                f'<td style="padding:6px;background:{color_to_css(row_bg)};'
+                f'<td style="padding:6px;{cell_border};background:{color_to_css(row_bg)};'
                 f'color:{color_to_css(row_text_color)};'
                 f'{";".join(font_style_bits(data_fonts[r][c]))}">'
                 f'{cell_rich_html(self._cell_items[r][c], data_fonts[r][c])}</td>'
@@ -4143,6 +4251,13 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                  top_strip_enabled=False, top_strip_color=None, title_font=None, title_color=None,
                  title_html=None):
         super().__init__(x, y, w, h, item_id)
+        # See ImageItem.__init__ for why this matters for panning/zoom
+        # smoothness - it matters even more here, since this paint()
+        # draws every image/gif/text subitem's chrome directly rather
+        # than delegating to separate cached child items. update() (text
+        # edits, gif frame changes, resize, selection) still invalidates
+        # and re-renders the cache as normal.
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
         self._init_top_strip(top_strip_enabled, top_strip_color)
         self.subitems = subitems or []
         self.min_w, self.min_h = 160, 120
@@ -4217,6 +4332,28 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         # field) so paint() (called every repaint) doesn't rebuild one
         # from scratch every single frame; see _get_subitem_rich_doc.
         self._subitem_rich_doc_cache = {}
+
+        # -- decoded pixmap cache for "image" subitems --------------------
+        # paint() previously called base64_to_pixmap(item["data"]) - a
+        # base64 decode + full PNG decode - from scratch on every single
+        # repaint of the card, including every pan/zoom step. Unlike the
+        # standalone ImageItem (which caches this), image subitems here
+        # had no cache at all, making any board card containing an image
+        # the single most expensive thing on the canvas to pan/zoom past.
+        # Keyed by id(subitem dict), same lifetime rules as the caches
+        # above (see _prune_image_pixmap_cache); the scaled-to-box pixmap
+        # is cached separately per target size (see _get_or_create_image_pixmap).
+        self._image_pixmap_cache = {}
+
+        # -- scaled-to-box pixmap cache for image/gif subitems ------------
+        # Even with the decoded pixmap cached above, paint() was still
+        # calling pm.scaled() - a bilinear resample of a possibly large
+        # photo - on every single repaint, including every pan/zoom step.
+        # Cached per (id(subitem), target box size), and invalidated
+        # automatically if the source pixmap's content actually changed
+        # (tracked via QPixmap.cacheKey(), which changes on every new gif
+        # frame) so animated gif subitems keep animating correctly.
+        self._subitem_scaled_cache = {}
 
     def on_resized(self):
         self.title_item.setTextWidth(max(10, self._w - 20))
@@ -4638,6 +4775,49 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             if node.scene() is not None:
                 node.scene().removeItem(node)
 
+    def _get_scaled_subitem_pixmap(self, subitem, pm, target_size):
+        """Cached pm.scaled(target_size, ...) for an image/gif subitem -
+        see _subitem_scaled_cache above. Recomputed only when the target
+        box size changes or the source pixmap's content actually changed
+        (new gif frame / different image), not on every repaint."""
+        key = id(subitem)
+        cache_key = pm.cacheKey()
+        entry = self._subitem_scaled_cache.get(key)
+        if entry is not None and entry[0] == target_size and entry[1] == cache_key:
+            return entry[2]
+        scaled = pm.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._subitem_scaled_cache[key] = (target_size, cache_key, scaled)
+        return scaled
+
+    def _prune_subitem_scaled_cache(self):
+        """Drop cached scaled pixmaps (see _get_scaled_subitem_pixmap) for
+        any subitem no longer in self.subitems, mirroring the other
+        subitem caches' prune methods above."""
+        live_ids = {id(s) for s in self.subitems}
+        for key in [k for k in self._subitem_scaled_cache if k not in live_ids]:
+            del self._subitem_scaled_cache[key]
+
+    def _get_or_create_image_pixmap(self, subitem):
+        """Return the decoded (full-resolution) QPixmap for this "image"
+        subitem, decoding it from base64 only the first time it's
+        painted instead of on every single repaint - see
+        _image_pixmap_cache above for why this matters."""
+        key = id(subitem)
+        pm = self._image_pixmap_cache.get(key)
+        if pm is not None:
+            return pm
+        pm = base64_to_pixmap(subitem.get("data", ""))
+        self._image_pixmap_cache[key] = pm
+        return pm
+
+    def _prune_image_pixmap_cache(self):
+        """Drop cached pixmaps (see _get_or_create_image_pixmap) for any
+        subitem no longer in self.subitems, mirroring
+        _prune_video_proxies/_prune_gif_movies above."""
+        live_ids = {id(s) for s in self.subitems if s.get("kind") == "image"}
+        for key in [k for k in self._image_pixmap_cache if k not in live_ids]:
+            del self._image_pixmap_cache[key]
+
     def _get_or_create_gif_movie(self, subitem):
         """Return the {"movie", "buffer", "pixmap"} entry driving this
         "gif" subitem's animation, creating it the first time it's
@@ -4789,6 +4969,8 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 self._prune_video_proxies()
                 self._prune_gif_movies()
                 self._prune_rich_doc_cache()
+                self._prune_image_pixmap_cache()
+                self._prune_subitem_scaled_cache()
                 scene_pos = event.scenePos()
                 new_item = subitem_to_component(sub, scene_pos.x() - 100, scene_pos.y() - 60)
                 if new_item is not None and self.scene() is not None:
@@ -4850,7 +5032,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                     if pm.isNull():
                         pm = base64_to_pixmap(item.get("data", ""))
                 else:
-                    pm = base64_to_pixmap(item.get("data", ""))
+                    pm = self._get_or_create_image_pixmap(item)
                 # Size the reserved box itself to the media's own aspect
                 # ratio (instead of a fixed 120px height) so drawing it
                 # with KeepAspectRatio below fills the box exactly - no
@@ -4869,7 +5051,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 painter.setPen(Qt.NoPen)
                 painter.drawRect(r)
                 if not pm.isNull():
-                    scaled = pm.scaled(r.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    scaled = self._get_scaled_subitem_pixmap(item, pm, r.size().toSize())
                     px = r.x() + (r.width() - scaled.width()) / 2
                     py = r.y() + (r.height() - scaled.height()) / 2
                     painter.drawPixmap(int(px), int(py), scaled)
@@ -5985,6 +6167,8 @@ def deserialize_component(d):
             odd_row_text_color=d.get("odd_row_text_color"),
             header_fonts=d.get("header_fonts"), data_fonts=d.get("data_fonts"),
             header_htmls=d.get("header_htmls"), data_htmls=d.get("data_htmls"),
+            grid_line_color=d.get("grid_line_color"),
+            grid_line_width=d.get("grid_line_width"),
         )
     else:
         return None
@@ -6376,6 +6560,9 @@ class MindMapView(QGraphicsView):
         super().__init__(scene, parent)
         self.main_window = main_window
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        if HAS_OPENGL:
+            self.setViewport(QOpenGLWidget())
+        self.setCacheMode(QGraphicsView.CacheBackground)
         self.setDragMode(QGraphicsView.RubberBandDrag)
         self.setAcceptDrops(True)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
