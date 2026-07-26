@@ -2142,10 +2142,33 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         super().mouseDoubleClickEvent(event)
 
     def _build_context_menu(self, menu):
+        save_action = menu.addAction("Save Image\u2026")
+        menu.addSeparator()
+        self._save_media_action = save_action
         self._build_media_context_menu(menu)
 
     def _handle_context_action(self, action):
+        if action is getattr(self, "_save_media_action", None):
+            self._save_image_to_disk()
+            return
         self._handle_media_context_action(action)
+
+    def _save_image_to_disk(self):
+        """Context-menu handler: write the full-resolution pixmap to a
+        file the user picks on disk."""
+        if self.pixmap_orig.isNull():
+            QMessageBox.information(None, "Save Image", "There is no image to save.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            None, "Save Image", "image.png",
+            "PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp);;WEBP (*.webp)",
+        )
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".png"
+        if not self.pixmap_orig.save(path):
+            QMessageBox.warning(None, "Save Image", f"Failed to save image to:\n{path}")
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -2297,10 +2320,33 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         super().mouseDoubleClickEvent(event)
 
     def _build_context_menu(self, menu):
+        save_action = menu.addAction("Save GIF\u2026")
+        menu.addSeparator()
+        self._save_media_action = save_action
         self._build_media_context_menu(menu)
 
     def _handle_context_action(self, action):
+        if action is getattr(self, "_save_media_action", None):
+            self._save_gif_to_disk()
+            return
         self._handle_media_context_action(action)
+
+    def _save_gif_to_disk(self):
+        """Context-menu handler: write the raw GIF bytes to a file the
+        user picks on disk."""
+        if not self.gif_bytes:
+            QMessageBox.information(None, "Save GIF", "There is no GIF to save.")
+            return
+        path, _ = QFileDialog.getSaveFileName(None, "Save GIF", "image.gif", "GIF (*.gif)")
+        if not path:
+            return
+        if not path.lower().endswith(".gif"):
+            path += ".gif"
+        try:
+            with open(path, "wb") as f:
+                f.write(self.gif_bytes)
+        except OSError as e:
+            QMessageBox.warning(None, "Save GIF", f"Failed to save GIF to:\n{path}\n\n{e}")
 
     def paint(self, painter, option, widget=None):
         rect = self._media_rect()
@@ -2612,10 +2658,36 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         self.player_node.set_video_bytes(data)
 
     def _build_context_menu(self, menu):
+        save_action = menu.addAction("Save Video\u2026")
+        menu.addSeparator()
+        self._save_media_action = save_action
         self._build_media_context_menu(menu)
 
     def _handle_context_action(self, action):
+        if action is getattr(self, "_save_media_action", None):
+            self._save_video_to_disk()
+            return
         self._handle_media_context_action(action)
+
+    def _save_video_to_disk(self):
+        """Context-menu handler: write the raw video bytes to a file the
+        user picks on disk."""
+        if not self.video_bytes:
+            QMessageBox.information(None, "Save Video", "There is no video to save.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            None, "Save Video", "video.mp4",
+            "Video (*.mp4 *.mov *.avi *.webm *.mkv)",
+        )
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".mp4"
+        try:
+            with open(path, "wb") as f:
+                f.write(self.video_bytes)
+        except OSError as e:
+            QMessageBox.warning(None, "Save Video", f"Failed to save video to:\n{path}\n\n{e}")
 
     def paint(self, painter, option, widget=None):
         media = self._media_rect()
