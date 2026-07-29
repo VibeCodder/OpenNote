@@ -30,9 +30,11 @@ import time
 
 from PySide6.QtCore import (
     Qt, QRectF, QPointF, QPoint, QSize, QSizeF, QByteArray, QBuffer, QIODevice, QUrl, Signal, QTimer,
+    QSettings,
 )
 from PySide6.QtGui import (
-    QColor, QPen, QBrush, QPainter, QPainterPath, QPixmap, QImage, QFont, QFontMetrics,
+    QColor, QPen, QBrush, QPainter, QPainterPath, QPainterPathStroker, QPixmap, QImage, QFont,
+    QFontMetrics,
     QMovie, QPalette, QKeySequence, QAction, QGuiApplication,
     QIcon, QActionGroup, QTextCursor, QIntValidator, QTextCharFormat, QTextDocument,
     QAbstractTextDocumentLayout,
@@ -74,10 +76,31 @@ except Exception:
 # --------------------------------------------------------------------------
 
 HANDLE_SIZE = 12
-ARROW_Z_OFFSET = 1_000_000  # arrows always stack above every other component
+ARROW_Z_OFFSET = -1_000_000  # arrows default to a layer below every normal
+                              # component (see MindMapScene.bring_to_front) -
+                              # so a line tucks behind the boxes it connects
+                              # instead of drawing over them
+ANCHOR_HIGHLIGHT_Z = 1_000_000  # the white outline shown over a component
+                                  # while an arrow endpoint is dragged onto
+                                  # it must stay visible above absolutely
+                                  # everything, independent of ARROW_Z_OFFSET
+ARROW_ANCHOR_MARKER_Z = ANCHOR_HIGHLIGHT_Z - 1  # green anchor-point rings for
+                                  # a selected arrow's anchored endpoint(s) -
+                                  # see MindMapScene.update_anchor_endpoint_markers.
+                                  # Arrows themselves always paint below every
+                                  # normal component (ARROW_Z_OFFSET), so an
+                                  # anchored endpoint's marker - if drawn as
+                                  # part of the arrow's own paint() - ends up
+                                  # partly/fully hidden behind whatever it's
+                                  # anchored to. This sits just under the drag
+                                  # -time highlight but still above every
+                                  # normal component, so the marker stays
+                                  # visible on top of its target instead.
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 GIF_EXTS = {".gif"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
+RECENT_FILES_SETTINGS_KEY = "recentFiles"  # File > Recent, see MainWindow._add_recent_file
+MAX_RECENT_FILES = 5
 
 _TEMP_VIDEO_FILES = []
 
@@ -820,6 +843,40 @@ def _rich_html_from_doc_html(doc_html, base_family="Segoe UI", base_size=11.0):
     return _qtextdocument_to_web_html(doc, base_family=base_family, base_size=base_size)
 
 
+def _force_font_family_in_html(doc_html, family):
+    """Rewrite every run of a saved *_html string (Qt's own toHtml()
+    output, as stashed by serialize()/subitem editing) to use `family`,
+    overriding whatever specific font each run already carries.
+
+    This is what "Apply Font to All Components" actually needs and what
+    replace_all_font_families alone doesn't provide: toHtml() always
+    bakes an explicit font-family into every run it writes (even ones
+    that were never deliberately given a special font), so
+    QTextCharFormat.font().family() never reads back empty/"inherited" -
+    swapping only the item's separate "font_family" summary field (used
+    solely to build a fresh default QFont at load time) has no visible
+    effect on text that already has real content, since setHtml() below
+    always wins over that summary field once text exists. Forcing every
+    run's family here, then re-serializing, is what makes the new font
+    actually show up - in the app AND in the exported HTML, since the
+    browser-facing export (_qtextdocument_to_web_html) reads directly
+    from these same runs.
+
+    Returns the rewritten HTML, or the original value unchanged if it's
+    empty/falsy (nothing to rewrite)."""
+    if not doc_html:
+        return doc_html
+    doc = QTextDocument()
+    doc.setHtml(doc_html)
+    doc.setDefaultFont(QFont(family))
+    cur = QTextCursor(doc)
+    cur.select(QTextCursor.Document)
+    fmt = QTextCharFormat()
+    fmt.setFontFamily(family)
+    cur.mergeCharFormat(fmt)
+    return doc.toHtml()
+
+
 def _paint_rich_doc(painter, doc, rect, default_color):
     """Paint a QTextDocument (built from a subitem's stored *_html, or
     plain text as a fallback) at `rect`, honoring per-run background
@@ -887,6 +944,93 @@ def _font_from_dict(d, base_family="Segoe UI", base_size=10.0, base_bold=False):
     f.setItalic(d.get("italic", False))
     f.setUnderline(d.get("underline", False))
     return f
+
+
+# --------------------------------------------------------------------------
+# App preferences (Settings > Preferences) - persisted via QSettings so they
+# survive between runs. Only two things read/write these: PreferencesDialog
+# (the editor) and MainWindow's add_*/create_item_from_file component
+# creation methods (the consumer, applying them as the defaults a brand new
+# component starts out with - see _apply_new_component_prefs).
+# --------------------------------------------------------------------------
+
+PREF_ALIGN_OPTIONS = [("left", "Left"), ("center", "Center"), ("right", "Right")]
+PREF_ALIGN_TO_QT = {"left": Qt.AlignLeft, "center": Qt.AlignHCenter, "right": Qt.AlignRight}
+
+DEFAULT_PREFS = {
+    "default_show_title": True,
+    "default_show_description": True,
+    "default_title_alignment": "left",   # one of PREF_ALIGN_OPTIONS
+    "default_font_family": "Segoe UI",
+}
+
+
+def load_app_preferences():
+    s = QSettings("OpenNote", "OpenNote")
+    prefs = dict(DEFAULT_PREFS)
+    s.beginGroup("preferences")
+    prefs["default_show_title"] = _qsettings_bool(s, "default_show_title", DEFAULT_PREFS["default_show_title"])
+    prefs["default_show_description"] = _qsettings_bool(
+        s, "default_show_description", DEFAULT_PREFS["default_show_description"])
+    align = s.value("default_title_alignment", DEFAULT_PREFS["default_title_alignment"])
+    prefs["default_title_alignment"] = align if align in PREF_ALIGN_TO_QT else "left"
+    fam = s.value("default_font_family", DEFAULT_PREFS["default_font_family"])
+    prefs["default_font_family"] = fam or DEFAULT_PREFS["default_font_family"]
+    s.endGroup()
+    return prefs
+
+
+def save_app_preferences(prefs):
+    s = QSettings("OpenNote", "OpenNote")
+    s.beginGroup("preferences")
+    s.setValue("default_show_title", bool(prefs.get("default_show_title", True)))
+    s.setValue("default_show_description", bool(prefs.get("default_show_description", True)))
+    s.setValue("default_title_alignment", prefs.get("default_title_alignment", "left"))
+    s.setValue("default_font_family", prefs.get("default_font_family", "Segoe UI"))
+    s.endGroup()
+
+
+def _qsettings_bool(settings, key, default):
+    # QSettings round-trips bools as the strings "true"/"false" on some
+    # platforms/backends instead of real bool objects - normalize by hand
+    # rather than trusting the stored type.
+    v = settings.value(key, default)
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes")
+
+
+def replace_all_font_families(data, new_family):
+    """Recursively walk a serialized board's JSON (dict/list of dicts -
+    see MindMapScene.serialize/BoardCardItem.serialize), overwriting every
+    "font_family" value found anywhere (top-level items, their title_font/
+    description_font dicts, board-card subitems, table header/data cell
+    fonts, arrow labels, ...) with `new_family`, AND rewriting every run
+    inside every "*_html" field (text_html, title_html, description_html,
+    label_html, ...) to the same family via _force_font_family_in_html.
+
+    Both halves matter: the plain "font_family" keys are only ever read
+    back as the *starting* default font when a document is otherwise
+    empty, while the actual saved rich text (an item's real, already-
+    typed content) carries its own per-run font baked in by Qt's
+    toHtml() - swapping just the summary key left every existing note's
+    visible font completely unchanged. Deliberately schema-agnostic on
+    both counts - every font dict here uses the key "font_family" and
+    every rich text field's key ends in "_html", so this one walk covers
+    every component type without needing to special-case each one's
+    particular field names."""
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if k == "font_family" and isinstance(v, str):
+                data[k] = new_family
+            elif k.endswith("_html") and isinstance(v, str):
+                data[k] = _force_font_family_in_html(v, new_family)
+            else:
+                replace_all_font_families(v, new_family)
+    elif isinstance(data, list):
+        for v in data:
+            replace_all_font_families(v, new_family)
+    return data
 
 
 class EditableTextItem(QGraphicsTextItem):
@@ -1080,10 +1224,16 @@ class BaseComponentItem(QGraphicsObject):
         """Tell the scene to re-position any arrow endpoint anchored to
         this item - called whenever this item moves (itemChange above)
         or is resized (set_size below), so an anchored arrow tracks the
-        component live instead of only updating on the next drag."""
+        component live instead of only updating on the next drag. Passes
+        `self` along as the mover so ArrowItem.refresh_anchors can tell a
+        real target component moving (which should re-orbit an anchored
+        endpoint to keep facing the arrow's other end) apart from the
+        arrow itself moving - which fires this same hook too, since
+        ArrowItem is a BaseComponentItem like any other, but must NOT
+        re-orbit: see refresh_anchors for why."""
         scene = self.scene()
         if scene is not None and hasattr(scene, "refresh_anchored_arrows"):
-            scene.refresh_anchored_arrows()
+            scene.refresh_anchored_arrows(mover=self)
 
     def set_size(self, w, h):
         self.prepareGeometryChange()
@@ -2998,6 +3148,60 @@ class ArrowItem(BaseComponentItem):
             rect = rect.united(label_rect)
         return rect
 
+    def shape(self):
+        """A precise clickable/selectable outline hugging the actual
+        line, arrowhead(s), endpoint handles and label - NOT the full
+        rectangular boundingRect().
+
+        QGraphicsItem's default shape() (used by Qt for both mouse hit-
+        testing and rubber-band selection) just traces boundingRect().
+        For a diagonal arrow that rectangle covers a large wedge of
+        empty space on either side of the actual line - visually part
+        of the canvas, but "on" the item as far as Qt is concerned. Two
+        crossing arrows (a normal enough layout - see the board's own
+        crossed arrows into "Mutated zombies"/"Mantis") end up with
+        heavily overlapping boundingRects even though their visible
+        lines only touch at one point, so a click anywhere in that
+        shared empty wedge landed on whichever arrow Qt's stacking order
+        happened to prefer (usually the one already selected and
+        recently brought to front - see bring_to_front) instead of the
+        line actually under the cursor. Building the real hit-test
+        region from the line/heads/handles/label themselves - each
+        already known precisely - fixes that: a click only lands on an
+        arrow when it's genuinely near that arrow's visible ink.
+        """
+        tolerance = max(self.stroke_width + 10, self.ENDPOINT_R * 2.4)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(tolerance)
+        stroker.setCapStyle(Qt.RoundCap)
+        stroker.setJoinStyle(Qt.RoundJoin)
+        line_path = QPainterPath()
+        line_path.moveTo(self.p1)
+        line_path.lineTo(self.p2)
+        path = stroker.createStroke(line_path)
+
+        dx, dy = self.p2.x() - self.p1.x(), self.p2.y() - self.p1.y()
+        length = max(0.0001, math.hypot(dx, dy))
+        ux, uy = dx / length, dy / length
+        if self.style in ("single", "double"):
+            path.addPath(self._arrow_head_path(self.p2, ux, uy))
+        if self.style == "double":
+            path.addPath(self._arrow_head_path(self.p1, -ux, -uy))
+
+        # Endpoint drag handles - only actionable while already
+        # selected (see mousePressEvent/_endpoint_at), but folding them
+        # into the shape unconditionally is harmless and keeps this
+        # simple; they're normally already covered by the stroked line
+        # above anyway.
+        r = self.ENDPOINT_R * 2.4
+        path.addEllipse(self.p1, r, r)
+        path.addEllipse(self.p2, r, r)
+
+        label_rect = self._label_rect()
+        if label_rect is not None:
+            path.addRoundedRect(label_rect, 6, 6)
+        return path
+
     def set_stroke_width(self, width):
         """Use this (rather than setting stroke_width directly) so the
         item's cached geometry is invalidated first - required whenever
@@ -3054,17 +3258,12 @@ class ArrowItem(BaseComponentItem):
                 scene.show_anchor_highlight(target)
             if target is not None:
                 # Preview the edge point it would snap to if dropped here
-                # (see _anchor_scene_point). This must face the *current
-                # cursor position*, not the arrow's other, still-fixed
-                # endpoint - using the far endpoint here made the preview
-                # only ever land on whichever edge happened to face that
-                # fixed point (e.g. always bottom/right), no matter which
-                # side of the target the cursor was actually hovering
-                # over. The far endpoint is still what's used afterwards,
-                # once anchored, to keep the point facing the other end
-                # as things move (see refresh_anchors).
-                preview_anchor = {"item": target, "rx": 0.5, "ry": 0.5}
-                scene_pt = self._anchor_scene_point(preview_anchor, scene_pt)
+                # (see _border_point) - the same nearest-border-point
+                # computation used to actually commit the anchor on
+                # release (_set_anchor), so the preview always matches
+                # exactly where the endpoint will end up.
+                local_edge, _rx_ry, _side = self._border_point(target, scene_pt)
+                scene_pt = target.mapToScene(local_edge)
             if self._drag_endpoint == 1:
                 self._sync_geometry(scene_pt, self.mapToScene(self.p2))
             else:
@@ -3083,125 +3282,223 @@ class ArrowItem(BaseComponentItem):
     ANCHOR_HOVER_MARGIN = 40
 
     def _find_anchor_target(self, scene_pt):
-        """Return the topmost Board Card / Text Note / media component
-        whose rectangle - expanded by ANCHOR_HOVER_MARGIN on every side -
+        """Return the Board Card / Text Note / media component whose
+        rectangle - expanded by ANCHOR_HOVER_MARGIN on every side -
         contains `scene_pt`, or None. Used while dragging an endpoint to
-        decide what it would anchor to if dropped here."""
+        decide what it would anchor to if dropped here.
+
+        Among every candidate whose expanded rectangle contains
+        scene_pt, picks whichever one's actual (unexpanded) rectangle is
+        closest to scene_pt - not simply the topmost by z-order. Two
+        components placed near each other (a common layout - see the
+        board's own card row) each get their own ANCHOR_HOVER_MARGIN-
+        widened hover zone, and those zones readily overlap in the gap
+        between the components, especially for larger components since
+        a bigger rectangle's margin band is more likely to reach a
+        neighbor. Picking purely by z-order there could return whichever
+        component happens to sit higher in stacking order even though
+        the point is actually sitting right next to (and closer to) a
+        totally different one - which looks exactly like the arrow
+        snapping into a neighboring component's edge/corner instead of
+        the one the user was actually pointing at. Distance-to-actual-
+        rect first (falling back to z-order only for an exact tie, e.g.
+        scene_pt genuinely inside more than one real rectangle at once)
+        fixes that: whichever component's true border the point is
+        nearest to wins, matching what the user is visually next to."""
         scene = self.scene()
         if scene is None:
             return None
-        best, best_z = None, None
+        best, best_dist, best_z = None, None, None
         for it in scene.items():
             if it is self or it is self.label_item:
                 continue
             if not isinstance(it, ANCHOR_TARGET_TYPES):
                 continue
-            rect = it.sceneBoundingRect().adjusted(
+            rect = it.sceneBoundingRect()
+            expanded = rect.adjusted(
                 -self.ANCHOR_HOVER_MARGIN, -self.ANCHOR_HOVER_MARGIN,
                 self.ANCHOR_HOVER_MARGIN, self.ANCHOR_HOVER_MARGIN,
             )
-            if rect.contains(scene_pt) and (best is None or it.zValue() > best_z):
-                best, best_z = it, it.zValue()
+            if not expanded.contains(scene_pt):
+                continue
+            dx = max(rect.left() - scene_pt.x(), 0.0, scene_pt.x() - rect.right())
+            dy = max(rect.top() - scene_pt.y(), 0.0, scene_pt.y() - rect.bottom())
+            dist = math.hypot(dx, dy)
+            if (best is None or dist < best_dist - 1e-6
+                    or (abs(dist - best_dist) <= 1e-6 and it.zValue() > best_z)):
+                best, best_dist, best_z = it, dist, it.zValue()
         return best
 
-    def _set_anchor(self, endpoint, target, scene_pt):
+    @staticmethod
+    def _border_point(target, scene_pt):
+        """Nearest point on target's own rectangle border to `scene_pt`,
+        as both a local QPointF and the (rx, ry) fraction of target's
+        width/height it corresponds to.
+
+        `scene_pt` is mapped into target's local space first. If it
+        already sits inside target's box, the nearest of the four edges
+        is picked by the ordinary interior distances. If it's outside on
+        only one axis (e.g. above the box but still within its width),
+        that axis alone is snapped to its edge (0 or h/w) while the
+        other keeps its actual, unclamped position - unchanged from
+        before.
+
+        If it's outside on *both* axes at once (diagonally past a
+        corner - easy to do with a narrow-but-long component, since
+        approaching its top edge from above at any real angle very
+        easily drifts a little past its left/right edge too), the two
+        raw overshoots (how far past each edge's line the point already
+        is) are compared first, before anything gets clamped. Whichever
+        overshoot is smaller names the dominant edge - the point is much
+        closer to crossing that edge's line than the other, so that's
+        the edge it's actually approaching. Only that axis gets forced
+        to 0/h/w; the other keeps sliding continuously with the cursor,
+        merely kept within a modest margin of the box rather than
+        collapsed straight into the corner. Without this, both axes got
+        clamped into the corner as soon as the point was outside on
+        both, regardless of which overshoot was actually tiny - so any
+        drop point that was even fractionally outside the box on its
+        narrow axis (near-guaranteed for a narrow, very tall/long
+        component approached from an angle) landed on the exact same
+        corner no matter where along the long edge it was aimed, which
+        is why several arrows dropped at different points all ended up
+        stacked on top of each other at one corner.
+
+        Used both for the live drop preview while dragging an endpoint
+        and - via _set_anchor - to fix the exact border point an anchor
+        sticks to once dropped. Deliberately independent of the arrow's
+        other endpoint: earlier this instead re-projected toward
+        whatever the other endpoint currently faced, which kept sliding
+        the anchored point around the target's border any time the
+        *other*, unattached endpoint moved - so an anchored arrow never
+        stayed put unless nothing else in the drawing ever changed.
+        Anchoring here only ever depends on target's own geometry, so
+        the point holds still until target itself moves or resizes."""
         local = target.mapFromScene(scene_pt)
         w = max(1.0, target._w)
         h = max(1.0, target._h)
-        rx = max(0.0, min(1.0, local.x() / w))
-        ry = max(0.0, min(1.0, local.y() / h))
-        anchor = {"item": target, "rx": rx, "ry": ry}
+        raw_x, raw_y = local.x(), local.y()
+        outside_x = raw_x < 0.0 or raw_x > w
+        outside_y = raw_y < 0.0 or raw_y > h
+        if outside_x and outside_y:
+            # Diagonally past a corner - the smaller overshoot names the
+            # edge the point is actually closest to; only that axis
+            # collapses onto its edge, the other stays free but is still
+            # clamped into the box's own [0, w]/[0, h] range so the
+            # returned point always sits ON the target's actual border -
+            # never floating outside it, which is what left a visible
+            # gap between the arrowhead and the component for anything
+            # approaching at an angle.
+            over_x = -raw_x if raw_x < 0.0 else raw_x - w
+            over_y = -raw_y if raw_y < 0.0 else raw_y - h
+            if over_y <= over_x:
+                side = "top" if raw_y < 0.0 else "bottom"
+                ly = 0.0 if raw_y < 0.0 else h
+                lx = min(w, max(0.0, raw_x))
+            else:
+                side = "left" if raw_x < 0.0 else "right"
+                lx = 0.0 if raw_x < 0.0 else w
+                ly = min(h, max(0.0, raw_y))
+            rx = min(1.0, max(0.0, raw_x)) / w
+            ry = min(1.0, max(0.0, raw_y)) / h
+            return QPointF(lx, ly), (rx, ry), side
+        lx = min(w, max(0.0, raw_x))
+        ly = min(h, max(0.0, raw_y))
+        d_left, d_right, d_top, d_bottom = lx, w - lx, ly, h - ly
+        m = min(d_left, d_right, d_top, d_bottom)
+        if m == d_left:
+            lx = 0.0
+            side = "left"
+        elif m == d_right:
+            lx = w
+            side = "right"
+        elif m == d_top:
+            ly = 0.0
+            side = "top"
+        else:
+            ly = h
+            side = "bottom"
+        return QPointF(lx, ly), (lx / w, ly / h), side
+
+    def _set_anchor(self, endpoint, target, scene_pt):
+        _local_edge, (rx, ry), side = self._border_point(target, scene_pt)
+        anchor = {"item": target, "rx": rx, "ry": ry, "side": side}
         if endpoint == 1:
             self.anchor1 = anchor
         else:
             self.anchor2 = anchor
 
-    def _anchor_center_scene(self, anchor):
-        """Scene-space center of an anchor's target - used as the
-        "other end" reference when both of an arrow's endpoints are
-        anchored (see refresh_anchors)."""
-        target = anchor["item"]
-        w = max(1.0, target._w)
-        h = max(1.0, target._h)
-        return target.mapToScene(QPointF(w / 2.0, h / 2.0))
-
     def _anchor_scene_point(self, anchor, other_scene_pt):
-        """Where an anchored endpoint actually sits: the point on the
-        *outer border* of the target's rectangle, sliding along whichever
-        edge (top/bottom/left/right) the user actually dropped it on,
-        in the direction from the target's center towards
-        `other_scene_pt` (the arrow's other endpoint, or its target's
-        center if that end is anchored too).
+        """Where an anchored endpoint sits on its target's outer border:
+        the nearest point on the target's rectangle to `other_scene_pt`
+        (the arrow's other endpoint's actual current position), via the
+        same _border_point() computation used live while dragging an
+        endpoint into place - so the preview, the drop, and every later
+        refresh all agree on exactly the same point for the same inputs.
 
-        Which edge that is comes from rx/ry - the fixed fraction of the
-        target's width/height where the endpoint was dropped, recorded
-        once in _set_anchor and otherwise unused for placement - by
-        picking whichever of the four edges rx/ry sits closest to (e.g.
-        ry near 0 means it was dropped near the top, so this hugs the
-        top edge). Deriving the edge from that fixed, one-time fraction
-        rather than from the *current* tx/ty ray-cast comparison matters
-        because resizing the target shifts its geometric center (growth
-        extends the rect away from its fixed top-left corner): the old
-        ray-cast approach recomputed which edge was "closest" from
-        scratch on every refresh, so a resize alone - with neither the
-        target's position nor the other endpoint moving - could flip an
-        anchor from the top edge it was dropped on onto an unrelated
-        side edge. Locking the edge to rx/ry fixes that; the point still
-        slides along that edge (clamped to its segment) to keep facing
-        the other endpoint, preserving the original "orbiting" behavior.
-        """
+        Using the other endpoint's actual point (rather than its
+        target's geometric center, as an earlier version did) is what
+        lets an anchor "orbit" its own target correctly: as the other
+        end moves far enough that hugging the current edge would start
+        drawing the line back across the target's own body, the nearest
+        border point naturally slides onto a neighboring edge instead -
+        rotating the anchor to avoid the overlap - since _border_point
+        already handles a point sitting outside the box on one or both
+        axes without corner artifacts (see its own docstring). Center-
+        based projection didn't have that property: it overshoots and
+        clamps into a corner as soon as the two targets aren't roughly
+        aligned, which is a completely normal layout, not an edge case.
+
+        anchor's rx/ry/side are updated here to whatever was just
+        computed, so a saved board reloads already facing the way it
+        last did live, rather than snapping back to its original drop
+        edge on the next load.
+
+        Called from refresh_anchors only when the anchor's own target is
+        the item that just moved or resized (re-orbiting it to keep
+        facing the arrow's other end) - never for an unrelated scene
+        change, and never while the arrow's own endpoint is being
+        dragged, see refresh_anchors's `mover` check."""
         target = anchor["item"]
-        w = max(1.0, target._w)
-        h = max(1.0, target._h)
-        local_other = target.mapFromScene(other_scene_pt)
-        cx, cy = w / 2.0, h / 2.0
-        dx, dy = local_other.x() - cx, local_other.y() - cy
-        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
-            dx, dy = 0.0, -1.0  # other point sits on the center: pick a default facing
-        rx = anchor.get("rx", 0.5)
-        ry = anchor.get("ry", 0.5)
-        dists = {"left": rx, "right": 1.0 - rx, "top": ry, "bottom": 1.0 - ry}
-        min_dist = min(dists.values())
-        candidates = [s for s, d in dists.items() if abs(d - min_dist) < 1e-9]
-        if len(candidates) > 1:
-            # Tie (e.g. a legacy/center-dropped anchor with no clear
-            # closest edge) - fall back to whichever edge the current
-            # direction ray would hit first.
-            tx = (w / 2.0) / abs(dx) if abs(dx) > 1e-9 else float("inf")
-            ty = (h / 2.0) / abs(dy) if abs(dy) > 1e-9 else float("inf")
-            side = ("right" if dx > 0 else "left") if tx < ty else ("bottom" if dy > 0 else "top")
-        else:
-            side = candidates[0]
-        if side in ("left", "right"):
-            edge_x = w if side == "right" else 0.0
-            t = (edge_x - cx) / dx if abs(dx) > 1e-9 else 0.0
-            edge_y = min(h, max(0.0, cy + dy * t))
-            local_edge = QPointF(edge_x, edge_y)
-        else:
-            edge_y = h if side == "bottom" else 0.0
-            t = (edge_y - cy) / dy if abs(dy) > 1e-9 else 0.0
-            edge_x = min(w, max(0.0, cx + dx * t))
-            local_edge = QPointF(edge_x, edge_y)
+        local_edge, (rx, ry), side = self._border_point(target, other_scene_pt)
+        anchor["rx"], anchor["ry"], anchor["side"] = rx, ry, side
         return target.mapToScene(local_edge)
 
-    def refresh_anchors(self):
+    def refresh_anchors(self, mover=None):
         """Recompute this arrow's geometry from whichever endpoints are
-        anchored, so it keeps following its target(s) - hugging their
-        outer edge - after they move or resize. Called by the scene (see
+        anchored - but only actually re-pick a (possibly new) border
+        point for an anchored endpoint when `mover` is that endpoint's
+        own target, i.e. the component it's anchored to is what just
+        moved or resized. Any other change in the scene - including the
+        arrow's other, unrelated endpoint moving, or simply the direct
+        call right after a manual drop in mouseReleaseEvent - leaves an
+        anchored endpoint exactly where it already is instead of
+        re-picking the nearest border point. Previously this recomputed
+        both anchors on every single call, which meant an endpoint you
+        had just manually dropped at a specific spot on its target's
+        edge (see mouseReleaseEvent -> _set_anchor) got immediately
+        overridden by a *different* nearest-point search (this one
+        measured against the other endpoint's position rather than
+        where you actually released the mouse) the moment
+        refresh_anchors ran right after - visibly snapping the endpoint
+        away from where it was just placed. Called by the scene (see
         MindMapScene.refresh_anchored_arrows) whenever any component
         changes, and also right after an endpoint is (dis)connected in
-        mouseReleaseEvent - a no-op if neither end is anchored."""
+        mouseReleaseEvent - a no-op if neither end is anchored.
+
+        `mover` is whichever item's move/resize triggered this call, if
+        any (see BaseComponentItem._notify_arrows_moved). When that
+        mover is this very arrow - i.e. the user is dragging the
+        arrow's own (anchored or free) endpoint, or moving the whole
+        arrow - this deliberately does nothing at all, so a drag of the
+        arrow's own endpoint doesn't fight the drag by recomputing the
+        very point being moved."""
+        if mover is self:
+            return
         if self.anchor1 is None and self.anchor2 is None:
             return
         p1_scene = self.mapToScene(self.p1)
         p2_scene = self.mapToScene(self.p2)
-        # The reference each anchor orbits toward is the opposite end's
-        # current point - or, if that end is anchored too, its target's
-        # center, so two anchored components stay correctly edge-clamped
-        # against each other rather than drifting toward last frame's
-        # raw point.
-        ref_for_1 = self._anchor_center_scene(self.anchor2) if self.anchor2 else p2_scene
-        ref_for_2 = self._anchor_center_scene(self.anchor1) if self.anchor1 else p1_scene
         changed = False
         # While the user is actively dragging one of this arrow's own
         # endpoints, leave that endpoint alone here. This method also
@@ -3215,15 +3512,15 @@ class ArrowItem(BaseComponentItem):
             target = self.anchor1.get("item")
             if target is None or target.scene() is None:
                 self.anchor1 = None
-            else:
-                p1_scene = self._anchor_scene_point(self.anchor1, ref_for_1)
+            elif mover is target:
+                p1_scene = self._anchor_scene_point(self.anchor1, p2_scene)
                 changed = True
         if self.anchor2 is not None and self._drag_endpoint != 2:
             target = self.anchor2.get("item")
             if target is None or target.scene() is None:
                 self.anchor2 = None
-            else:
-                p2_scene = self._anchor_scene_point(self.anchor2, ref_for_2)
+            elif mover is target:
+                p2_scene = self._anchor_scene_point(self.anchor2, p1_scene)
                 changed = True
         if changed:
             self._sync_geometry(p1_scene, p2_scene)
@@ -3238,13 +3535,15 @@ class ArrowItem(BaseComponentItem):
         if pending1:
             target = id_map.get(pending1.get("item_id"))
             if target is not None:
-                self.anchor1 = {"item": target, "rx": pending1.get("rx", 0.5), "ry": pending1.get("ry", 0.5)}
+                self.anchor1 = {"item": target, "rx": pending1.get("rx", 0.5), "ry": pending1.get("ry", 0.5),
+                                 "side": pending1.get("side")}
         self._pending_anchor1 = None
         pending2 = self._pending_anchor2
         if pending2:
             target = id_map.get(pending2.get("item_id"))
             if target is not None:
-                self.anchor2 = {"item": target, "rx": pending2.get("rx", 0.5), "ry": pending2.get("ry", 0.5)}
+                self.anchor2 = {"item": target, "rx": pending2.get("rx", 0.5), "ry": pending2.get("ry", 0.5),
+                                 "side": pending2.get("side")}
         self._pending_anchor2 = None
 
     def mouseReleaseEvent(self, event):
@@ -3291,6 +3590,9 @@ class ArrowItem(BaseComponentItem):
         self.setPos(x0, y0)
         self._layout_label()
         self.update()
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "update_anchor_endpoint_markers"):
+            scene.update_anchor_endpoint_markers()
 
     def hoverMoveEvent(self, event):
         if self.isSelected() and self._endpoint_at(event.pos()) is not None:
@@ -3495,11 +3797,13 @@ class ArrowItem(BaseComponentItem):
         d["label_color"] = self.label_item.defaultTextColor().name()
         d["label_html"] = self.label_item.document().toHtml()
         d["anchor1"] = (
-            {"item_id": self.anchor1["item"].id, "rx": self.anchor1["rx"], "ry": self.anchor1["ry"]}
+            {"item_id": self.anchor1["item"].id, "rx": self.anchor1["rx"], "ry": self.anchor1["ry"],
+             "side": self.anchor1.get("side")}
             if self.anchor1 else None
         )
         d["anchor2"] = (
-            {"item_id": self.anchor2["item"].id, "rx": self.anchor2["rx"], "ry": self.anchor2["ry"]}
+            {"item_id": self.anchor2["item"].id, "rx": self.anchor2["rx"], "ry": self.anchor2["ry"],
+             "side": self.anchor2.get("side")}
             if self.anchor2 else None
         )
         return d
@@ -4340,6 +4644,11 @@ class SubitemDragGhost(QGraphicsObject):
 class BoardCardItem(TopStripMixin, BaseComponentItem):
     TYPE_NAME = "board"
     DEFAULT_COLOR = "#2b2b2b"
+    TITLE_H = 36  # default (single-line) height of the dark title bar at
+                  # the top of the card - grows via _recalc_title_height
+                  # when the title text wraps onto more than one line, so
+                  # a two-or-more-line title never gets clipped/overlapped
+                  # by the subitems laid out below it (see paint()).
     MEDIA_GAP = 18  # vertical gap between stacked image/gif/video subitems
     SUB_MEDIA_TITLE_H = 22  # title bar above an image/gif/video subitem,
                              # shown only when that subitem has a title
@@ -4369,6 +4678,10 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         self.subitems = subitems or []
         self.min_w, self.min_h = 160, 120
         self.setAcceptDrops(True)
+        # Actual height reserved for the title bar - starts at TITLE_H but
+        # grows (see _recalc_title_height) when the title text wraps onto
+        # more than one line, mirroring TextNoteItem._title_h.
+        self._title_h = self.TITLE_H
         self.title_item = EditableTextItem(self)
         self.title_item.setPos(10, 6)
         self.title_item.setFont(
@@ -4381,6 +4694,8 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         self.title_item.setTextWidth(max(10, w - 20))
         if title_html:
             self.title_item.document().setHtml(title_html)
+        self.title_item.document().contentsChanged.connect(self._on_title_text_changed)
+        self._recalc_title_height()
 
         # -- subitem drag-out / reorder state ---------------------------
         # Filled in during paint() so hit-testing always matches what is
@@ -4462,12 +4777,27 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         # frame) so animated gif subitems keep animating correctly.
         self._subitem_scaled_cache = {}
 
+    def _recalc_title_height(self):
+        """Grow (or shrink back) the title bar to fit however many lines
+        the title text currently wraps onto - see TextNoteItem's method
+        of the same name, which this mirrors. Without this the title bar
+        stayed a fixed single-line height, so a title wrapped onto two+
+        lines (e.g. via a manual line break) got clipped/overlapped by
+        the subitems laid out right below it."""
+        doc_h = self.title_item.document().size().height()
+        self._title_h = max(self.TITLE_H, doc_h + 12)
+
+    def _on_title_text_changed(self):
+        self._recalc_title_height()
+        self.update()
+
     def on_resized(self):
         self.title_item.setTextWidth(max(10, self._w - 20))
+        self._recalc_title_height()
         self.update()
 
     def mouseDoubleClickEvent(self, event):
-        if event.pos().y() < 36:
+        if event.pos().y() < self._title_h:
             self.title_item.setTextInteractionFlags(Qt.TextEditorInteraction)
             self.title_item.setFocus()
         else:
@@ -4747,15 +5077,30 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         ).height() + 4
         return max(18, h), title_font
 
-    def _sub_media_chrome(self, item):
+    def _sub_media_chrome(self, item, avail_w):
         """For an image/gif/video subitem, decide whether its title/desc
         bars should be drawn (on AND actually has text) and how tall each
         one is - shared by paint() and _estimate_content_height() so the
-        two never disagree about how much vertical space a subitem needs."""
+        two never disagree about how much vertical space a subitem needs.
+        Each bar grows past its minimum height once its text wraps to
+        more than one line, mirroring _paint_sub_media_title/_desc's own
+        font/width so the measured height always matches what's actually
+        painted."""
         show_title = bool(item.get("show_title", True)) and bool(item.get("title"))
         show_desc = bool(item.get("show_description", True)) and bool(item.get("description"))
-        title_h = self.SUB_MEDIA_TITLE_H if show_title else 0
-        desc_h = self.SUB_MEDIA_DESC_H if show_desc else 0
+        text_w = max(1.0, avail_w - 12)
+        title_h = 0
+        if show_title:
+            title_font = QFont("Segoe UI", 9, QFont.Bold)
+            title_doc = self._get_subitem_rich_doc(item, "title", item.get("title_html"),
+                                                     item.get("title", ""), title_font, text_w)
+            title_h = max(self.SUB_MEDIA_TITLE_H, title_doc.size().height() + 8)
+        desc_h = 0
+        if show_desc:
+            desc_font = QFont("Segoe UI", 8)
+            desc_doc = self._get_subitem_rich_doc(item, "description", item.get("description_html"),
+                                                    item.get("description", ""), desc_font, text_w)
+            desc_h = max(self.SUB_MEDIA_DESC_H, desc_doc.size().height() + 8)
         return show_title, show_desc, title_h, desc_h
 
     def _paint_sub_media_title(self, painter, rect, item):
@@ -4794,19 +5139,19 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         it. This intentionally only decides whether to grow - the actual
         per-frame layout/clipping in paint() remains the source of truth
         for what's drawn where."""
-        y = 42
+        y = self._title_h + 6
         pad = 8
         avail_w = max(1, self._w - pad * 2)
         for item in self.subitems:
             kind = item.get("kind")
             if kind in ("image", "gif"):
                 pm = base64_to_pixmap(item.get("data", ""))
-                _, _, title_h, desc_h = self._sub_media_chrome(item)
+                _, _, title_h, desc_h = self._sub_media_chrome(item, avail_w)
                 h = self._subitem_media_height(pm, avail_w, 10 ** 6) + title_h + desc_h
                 y += h + self.MEDIA_GAP
             elif kind == "video":
                 aspect = item.get("aspect") or (9 / 16)
-                _, _, title_h, desc_h = self._sub_media_chrome(item)
+                _, _, title_h, desc_h = self._sub_media_chrome(item, avail_w)
                 h = (self._subitem_media_height(None, avail_w, 10 ** 6, aspect=aspect)
                      + self.VIDEO_HANDLE_H + title_h + desc_h)
                 y += h + self.MEDIA_GAP
@@ -5115,11 +5460,11 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         painter.setClipPath(path)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#1e1e1e"))
-        painter.drawRect(QRectF(0, 0, self._w, 36))
+        painter.drawRect(QRectF(0, 0, self._w, self._title_h))
         painter.restore()
         self._paint_top_strip(painter, clip_path=path)
 
-        y = 42
+        y = self._title_h + 6
         pad = 8
         avail_w = self._w - pad * 2
         self._subitem_rects = []
@@ -5156,9 +5501,9 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 # with KeepAspectRatio below fills the box exactly - no
                 # cropping and no letterboxing, and it stays correct no
                 # matter how the card gets resized afterwards.
-                show_title, show_desc, title_h, desc_h = self._sub_media_chrome(item)
+                show_title, show_desc, title_h, desc_h = self._sub_media_chrome(item, avail_w)
                 media_h = self._subitem_media_height(pm, avail_w, remaining_h - title_h - desc_h)
-                title_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_TITLE_H)
+                title_click_rect = QRectF(pad, y, avail_w, title_h)
                 editing_title = idx == self._sub_edit_index and self._sub_edit_field == "title"
                 if show_title and not editing_title:
                     self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item)
@@ -5174,7 +5519,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                     py = r.y() + (r.height() - scaled.height()) / 2
                     painter.drawPixmap(int(px), int(py), scaled)
                 y += media_h
-                desc_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_DESC_H)
+                desc_click_rect = QRectF(pad, y, avail_w, desc_h)
                 editing_desc = idx == self._sub_edit_index and self._sub_edit_field == "description"
                 if show_desc and not editing_desc:
                     self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item)
@@ -5200,8 +5545,8 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 # player widget for clicks), instead of the old static
                 # "\u25B6 video" placeholder that had no playback at all.
                 aspect = item.get("aspect") or (9 / 16)
-                show_title, show_desc, title_h, desc_h = self._sub_media_chrome(item)
-                title_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_TITLE_H)
+                show_title, show_desc, title_h, desc_h = self._sub_media_chrome(item, avail_w)
+                title_click_rect = QRectF(pad, y, avail_w, title_h)
                 editing_title = idx == self._sub_edit_index and self._sub_edit_field == "title"
                 if show_title and not editing_title:
                     self._paint_sub_media_title(painter, QRectF(pad, y, avail_w, title_h), item)
@@ -5223,7 +5568,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 proxy.resize(avail_w, media_h)
                 proxy.show()
                 y += self.VIDEO_HANDLE_H + media_h
-                desc_click_rect = QRectF(pad, y, avail_w, self.SUB_MEDIA_DESC_H)
+                desc_click_rect = QRectF(pad, y, avail_w, desc_h)
                 editing_desc = idx == self._sub_edit_index and self._sub_edit_field == "description"
                 if show_desc and not editing_desc:
                     self._paint_sub_media_desc(painter, QRectF(pad, y, avail_w, desc_h), item)
@@ -6313,6 +6658,52 @@ def deserialize_component(d):
 # Scene
 # --------------------------------------------------------------------------
 
+class _ArrowAnchorEndpointMarkers(QGraphicsObject):
+    """Standalone overlay that paints the green anchor-point rings for
+    every currently anchored endpoint of the selected arrow(s), in scene
+    coordinates, above every normal component (see ARROW_ANCHOR_MARKER_Z).
+
+    ArrowItem itself always paints below every normal component (see
+    ARROW_Z_OFFSET), including its own endpoint circles - so an anchored
+    endpoint drawn there ends up partly or fully covered by whatever
+    component it's stuck to. This item is kept in sync (via
+    MindMapScene.update_anchor_endpoint_markers) instead of being part
+    of any single arrow, so it can sit in its own always-on-top layer
+    independent of the arrow's own z-order.
+    """
+    R = ArrowItem.ENDPOINT_R
+
+    def __init__(self):
+        super().__init__()
+        self._points = []
+        self.setZValue(ARROW_ANCHOR_MARKER_Z)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+
+    def set_points(self, points):
+        self.prepareGeometryChange()
+        self._points = list(points)
+        self.update()
+
+    def boundingRect(self):
+        if not self._points:
+            return QRectF()
+        pad = self.R + 6
+        xs = [p.x() for p in self._points]
+        ys = [p.y() for p in self._points]
+        return QRectF(min(xs) - pad, min(ys) - pad,
+                       max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad)
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+        for pt in self._points:
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            painter.setBrush(QColor("#34c759"))
+            painter.drawEllipse(pt, self.R, self.R)
+            painter.setPen(QPen(QColor("#34c759"), 1.5))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(pt, self.R + 3, self.R + 3)
+
+
 class MindMapScene(QGraphicsScene):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -6329,16 +6720,21 @@ class MindMapScene(QGraphicsScene):
         self._current_preview_item = None
         self._anchor_highlight_item = None
         self._anchors_refreshing = False
+        self._anchor_endpoint_markers = None
+        self.selectionChanged.connect(self.update_anchor_endpoint_markers)
+
     def bring_to_front(self, item):
         """Raise `item` above every other component in its own "band" so
-        clicking/dragging it always brings it visually to the front,
-        instead of leaving it stuck at whatever z-order it happened to be
-        created in. Arrows use their own band, offset well above every
-        normal component (see ARROW_Z_OFFSET), so an arrow always stacks
-        over every other component type - even one that was JUST brought
-        to front - matching Arrow's "always on top" behavior. Computed
-        fresh from the scene's actual current z-values (rather than a
-        stored counter) so it stays correct across load/delete/undo."""
+        clicking/dragging it always brings it visually to the front
+        *within its own band*, instead of leaving it stuck at whatever
+        z-order it happened to be created in. Arrows use their own band,
+        offset well below every normal component (see ARROW_Z_OFFSET),
+        so an arrow always stacks under every other component type -
+        even one that was JUST brought to front - matching Arrow's
+        default "tucks behind the components it connects" behavior.
+        Computed fresh from the scene's actual current z-values (rather
+        than a stored counter) so it stays correct across load/delete/
+        undo."""
         others = [it for it in self.items() if isinstance(it, BaseComponentItem) and it is not item]
         if isinstance(item, ArrowItem):
             band = [it.zValue() for it in others if isinstance(it, ArrowItem)]
@@ -6355,7 +6751,7 @@ class MindMapScene(QGraphicsScene):
             hl = QGraphicsRectItem()
             hl.setPen(QPen(QColor("#ffffff"), 2))
             hl.setBrush(Qt.NoBrush)
-            hl.setZValue(ARROW_Z_OFFSET + 1)
+            hl.setZValue(ANCHOR_HIGHLIGHT_Z)
             hl.setVisible(False)
             self.addItem(hl)
             self._anchor_highlight_item = hl
@@ -6376,21 +6772,58 @@ class MindMapScene(QGraphicsScene):
     def hide_anchor_highlight(self):
         self.show_anchor_highlight(None)
 
-    def refresh_anchored_arrows(self):
+    def _ensure_anchor_endpoint_markers(self):
+        markers = self._anchor_endpoint_markers
+        if markers is None:
+            markers = _ArrowAnchorEndpointMarkers()
+            self.addItem(markers)
+            self._anchor_endpoint_markers = markers
+        return markers
+
+    def update_anchor_endpoint_markers(self):
+        """Re-collect the anchored-endpoint scene points of every
+        currently selected arrow and hand them to the always-on-top
+        overlay (see _ArrowAnchorEndpointMarkers) so its green rings
+        stay visible above whatever component they're stuck to, no
+        matter that the arrow's own paint() runs underneath it.
+
+        Called whenever selection changes (connected in __init__),
+        whenever an anchored arrow's geometry is resynced
+        (ArrowItem._sync_geometry) - which covers both a live endpoint
+        drag and a component it's anchored to moving/resizing - and
+        after an item is removed from the scene.
+        """
+        points = []
+        for it in self.items():
+            if isinstance(it, ArrowItem) and it.isSelected():
+                if it.anchor1 is not None:
+                    points.append(it.mapToScene(it.p1))
+                if it.anchor2 is not None:
+                    points.append(it.mapToScene(it.p2))
+        markers = self._ensure_anchor_endpoint_markers()
+        markers.set_points(points)
+        markers.setVisible(bool(points))
+
+    def refresh_anchored_arrows(self, mover=None):
         """Re-sync every arrow that has an anchored endpoint - called by
         BaseComponentItem whenever a component moves or resizes, so
         anchored arrows keep following it live. Guarded against
         reentrancy since an arrow repositioning itself also triggers
-        this same notification."""
+        this same notification. `mover` is whichever item's own move/
+        resize triggered this call - passed straight through to each
+        arrow's refresh_anchors so it can tell a real target component
+        moving (re-orbit) apart from the arrow itself moving (leave its
+        anchored endpoint(s) alone) - see ArrowItem.refresh_anchors."""
         if self._anchors_refreshing:
             return
         self._anchors_refreshing = True
         try:
             for it in self.items():
                 if isinstance(it, ArrowItem):
-                    it.refresh_anchors()
+                    it.refresh_anchors(mover=mover)
         finally:
             self._anchors_refreshing = False
+        self.update_anchor_endpoint_markers()
 
     def removeItem(self, item):
         for it in self.items():
@@ -6400,6 +6833,10 @@ class MindMapScene(QGraphicsScene):
                 if it.anchor2 is not None and it.anchor2.get("item") is item:
                     it.anchor2 = None
         super().removeItem(item)
+        if item is self._anchor_endpoint_markers:
+            self._anchor_endpoint_markers = None
+        else:
+            self.update_anchor_endpoint_markers()
 
     # -- background dot grid ------------------------------------------
     # Dots are drawn in *scene* coordinates with a non-cosmetic pen, so
@@ -6680,6 +7117,20 @@ class MindMapScene(QGraphicsScene):
         for it in items:
             if isinstance(it, ArrowItem):
                 it.resolve_pending_anchors(id_map)
+        # A board saved by an older version stored arrows with the old
+        # always-on-top z-values (see ARROW_Z_OFFSET) baked right into
+        # the file - loading them as-is would keep those stale z-values
+        # forever, since nothing here calls bring_to_front() on load.
+        # Re-sorting every loaded arrow into today's below-components
+        # band (while preserving their relative order to each other)
+        # means an old save immediately renders arrows behind the
+        # components they connect, matching a freshly-drawn arrow,
+        # without waiting for the user to click each one individually.
+        arrow_items = sorted(
+            (it for it in items if isinstance(it, ArrowItem)), key=lambda it: it.zValue()
+        )
+        for i, it in enumerate(arrow_items):
+            it.setZValue(ARROW_Z_OFFSET + i)
 
 
 # --------------------------------------------------------------------------
@@ -7156,12 +7607,113 @@ class NumberStepper(QWidget):
             self.valueChanged.emit(v)
 
 
+class PreferencesDialog(QDialog):
+    """Settings > Preferences. Two independent things live here:
+
+    1. Defaults for brand-new components (Show Title / Show Description /
+       Title Alignment / Font) - only consulted at creation time (see
+       MainWindow._apply_new_component_prefs), never retroactive.
+    2. "Apply Font to All Components" - the opposite: immediately pushes a
+       chosen font onto every existing component, both on the board
+       currently open and every other .html board file in the same
+       project folder (see MainWindow.apply_font_to_all_boards)."""
+
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.setWindowTitle("Preferences")
+        self.setMinimumWidth(380)
+
+        layout = QVBoxLayout(self)
+
+        defaults_label = QLabel("New Component Defaults")
+        defaults_label.setStyleSheet("font-weight:600;")
+        layout.addWidget(defaults_label)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft)
+
+        prefs = main_window.prefs
+        self.title_checkbox = QCheckBox("Show Title")
+        self.title_checkbox.setChecked(bool(prefs.get("default_show_title", True)))
+        form.addRow(self.title_checkbox)
+
+        self.desc_checkbox = QCheckBox("Show Description")
+        self.desc_checkbox.setChecked(bool(prefs.get("default_show_description", True)))
+        form.addRow(self.desc_checkbox)
+
+        self.align_combo = QComboBox()
+        for value, label in PREF_ALIGN_OPTIONS:
+            self.align_combo.addItem(label, value)
+        idx = self.align_combo.findData(prefs.get("default_title_alignment", "left"))
+        self.align_combo.setCurrentIndex(max(0, idx))
+        form.addRow("Title Alignment:", self.align_combo)
+
+        self.font_combo = QFontComboBox()
+        self.font_combo.setCurrentFont(QFont(prefs.get("default_font_family", "Segoe UI")))
+        form.addRow("Default Font:", self.font_combo)
+
+        layout.addLayout(form)
+
+        apply_label = QLabel("Apply Font to All Components")
+        apply_label.setStyleSheet("font-weight:600; margin-top:8px;")
+        layout.addWidget(apply_label)
+        apply_hint = QLabel(
+            "Changes the font used by every component on the current "
+            "board and every other linked board in this project."
+        )
+        apply_hint.setWordWrap(True)
+        apply_hint.setStyleSheet("color:#888; font-size:11px;")
+        layout.addWidget(apply_hint)
+
+        apply_row = QHBoxLayout()
+        self.apply_font_combo = QFontComboBox()
+        self.apply_font_combo.setCurrentFont(QFont(prefs.get("default_font_family", "Segoe UI")))
+        apply_row.addWidget(self.apply_font_combo, 1)
+        set_btn = QPushButton("Set")
+        set_btn.clicked.connect(self._on_set_font_clicked)
+        apply_row.addWidget(set_btn)
+        layout.addLayout(apply_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_set_font_clicked(self):
+        family = self.apply_font_combo.currentFont().family()
+        count = self.main_window.apply_font_to_all_boards(family)
+        QMessageBox.information(
+            self, "Font Applied",
+            f"Set font to \u201c{family}\u201d on {count} board file(s)."
+        )
+
+    def _on_accept(self):
+        self.main_window.prefs["default_show_title"] = self.title_checkbox.isChecked()
+        self.main_window.prefs["default_show_description"] = self.desc_checkbox.isChecked()
+        self.main_window.prefs["default_title_alignment"] = self.align_combo.currentData()
+        self.main_window.prefs["default_font_family"] = self.font_combo.currentFont().family()
+        save_app_preferences(self.main_window.prefs)
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._title_base = "OpenNote \u2014 Milanote-style Mind Map"
         self.setWindowTitle(self._title_base)
         self.resize(1440, 900)
+
+        # -- app preferences (Settings > Preferences) ----------------------
+        # Persisted across runs via QSettings and consulted whenever a new
+        # component is created (see _new_component_font_defaults /
+        # _apply_new_component_prefs below) - NOT retroactive to existing
+        # components already on a board (that's what the separate
+        # "apply font to all components" action in PreferencesDialog is
+        # for, which walks every item on disk instead of just defaults
+        # used at creation time).
+        self.prefs = load_app_preferences()
+
         self.scene = MindMapScene(self)
         self.view = MindMapView(self.scene, self, self)
 
@@ -7302,6 +7854,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction("New Board", self.new_board, QKeySequence.New)
         file_menu.addAction("New Project (Choose Folder)...", self.new_project)
         file_menu.addAction("Open...", self.open_board, QKeySequence.Open)
+        self.recent_menu = file_menu.addMenu("Recent")
+        file_menu.aboutToShow.connect(self._rebuild_recent_menu)
         file_menu.addAction("Save", self.save_board, QKeySequence.Save)
         file_menu.addAction("Save As...", self.save_board_as, QKeySequence.SaveAs)
         file_menu.addSeparator()
@@ -7318,6 +7872,9 @@ class MainWindow(QMainWindow):
         edit_menu.addAction("Paste", self.paste_clipboard, QKeySequence.Paste)
         edit_menu.addAction("Duplicate", self.duplicate_selection, QKeySequence("Ctrl+D"))
         edit_menu.addAction("Delete", self.delete_selection, QKeySequence.Delete)
+
+        settings_menu = m.addMenu("&Settings")
+        settings_menu.addAction("Preferences...", self.open_preferences)
 
     def _build_toolbar(self):
         tb = QToolBar("Tools")
@@ -8557,20 +9114,69 @@ class MainWindow(QMainWindow):
     def _viewport_center_scene(self):
         return self.view.mapToScene(self.view.viewport().rect().center())
 
+    def _new_component_font_dict(self, size=None, bold=False):
+        d = {"font_family": self.prefs.get("default_font_family", "Segoe UI")}
+        if size is not None:
+            d["font_size"] = size
+        d["bold"] = bold
+        return d
+
+    def _apply_default_font(self, item):
+        """Apply Preferences > Default Font to a freshly created item -
+        for component types (Table, Arrow) whose constructors have no
+        font_family kwarg of their own, unlike Text Note/Text/media
+        items which already take one directly at construction time.
+        Uses the same _apply_text_font/font_targets machinery as the
+        toolbar's own Font control, so this reaches every cell of a
+        table or an arrow's label exactly like a manual font change
+        would."""
+        fam = self.prefs.get("default_font_family", "Segoe UI")
+        if fam:
+            _apply_text_font(item, family=fam)
+
+    def _apply_default_title_alignment(self, item):
+        """Apply the Preferences > Title Alignment default to a freshly
+        created item's title - constructors take font/text/visibility as
+        kwargs but have no alignment kwarg, so this is done as a small
+        extra step right after construction instead."""
+        ti = getattr(item, "title_item", None)
+        if ti is None:
+            return
+        align = PREF_ALIGN_TO_QT.get(self.prefs.get("default_title_alignment", "left"), Qt.AlignLeft)
+        cur = QTextCursor(ti.document())
+        cur.select(QTextCursor.Document)
+        bf = cur.blockFormat()
+        bf.setAlignment(align)
+        cur.mergeBlockFormat(bf)
+
     def add_text_note(self):
         pos = self._viewport_center_scene()
-        item = TextNoteItem(pos.x() - 110, pos.y() - 70)
+        fam = self.prefs.get("default_font_family", "Segoe UI")
+        item = TextNoteItem(
+            pos.x() - 110, pos.y() - 70,
+            show_title=self.prefs.get("default_show_title", True),
+            title_font=self._new_component_font_dict(size=12.0, bold=True),
+            font_family=fam,
+        )
         self.scene.addItem(item)
+        self._apply_default_title_alignment(item)
 
     def add_text(self):
         pos = self._viewport_center_scene()
-        item = PlainTextItem(pos.x() - 110, pos.y() - 25)
+        item = PlainTextItem(
+            pos.x() - 110, pos.y() - 25,
+            font_family=self.prefs.get("default_font_family", "Segoe UI"),
+        )
         self.scene.addItem(item)
 
     def add_board_card(self):
         pos = self._viewport_center_scene()
-        item = BoardCardItem(pos.x() - 140, pos.y() - 160)
+        item = BoardCardItem(
+            pos.x() - 140, pos.y() - 160,
+            title_font=self._new_component_font_dict(size=12.0, bold=True),
+        )
         self.scene.addItem(item)
+        self._apply_default_title_alignment(item)
 
     def add_board_link(self):
         """Create a shortcut card on the current board pointing at another
@@ -8642,6 +9248,7 @@ class MainWindow(QMainWindow):
         pos = self._viewport_center_scene()
         item = TableItem(pos.x() - 180, pos.y() - 100)
         self.scene.addItem(item)
+        self._apply_default_font(item)
 
     def add_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
@@ -8669,8 +9276,10 @@ class MainWindow(QMainWindow):
             style=style,
         )
         self.scene.addItem(item)
+        self.scene.bring_to_front(item)
         self.scene.clearSelection()
         item.setSelected(True)
+        self._apply_default_font(item)
 
     def create_item_from_file(self, path, scene_pos):
         ext = os.path.splitext(path)[1].lower()
@@ -8680,22 +9289,85 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not read file: {e}")
             return None
+        show_title = self.prefs.get("default_show_title", True)
+        show_desc = self.prefs.get("default_show_description", True)
+        title_font = self._new_component_font_dict(size=10.0, bold=True)
+        desc_font = self._new_component_font_dict(size=9.0)
         if ext in GIF_EXTS:
             item = GifItem(scene_pos.x() - 120, scene_pos.y() - 90, gif_bytes=data,
-                            title="Title", description="description...")
+                            title="Title", description="description...",
+                            show_title=show_title, show_description=show_desc,
+                            title_font=title_font, desc_font=desc_font)
         elif ext in VIDEO_EXTS:
             item = VideoItem(scene_pos.x() - 160, scene_pos.y() - 110, video_bytes=data,
-                              title="Title", description="description...")
+                              title="Title", description="description...",
+                              show_title=show_title, show_description=show_desc,
+                              title_font=title_font, desc_font=desc_font)
         elif ext in IMAGE_EXTS:
             pm = QPixmap()
             pm.loadFromData(data)
             item = ImageItem(scene_pos.x() - 120, scene_pos.y() - 90, pixmap=pm,
-                              title="Title", description="description...")
+                              title="Title", description="description...",
+                              show_title=show_title, show_description=show_desc,
+                              title_font=title_font, desc_font=desc_font)
         else:
             QMessageBox.information(self, "Unsupported file", f"Unsupported file type: {ext}")
             return None
         self.scene.addItem(item)
+        self._apply_default_title_alignment(item)
         return item
+
+    # -- preferences -------------------------------------------------------
+    def open_preferences(self):
+        dlg = PreferencesDialog(self)
+        dlg.exec()
+
+    def apply_font_to_all_boards(self, family):
+        """Set every component's font to `family` on the board currently
+        open AND every other .html board file living in the same project
+        folder (BoardLink shortcuts only ever point at sibling files
+        there - see _ensure_project_and_file/add_board_link). Returns how
+        many board files were updated in total."""
+        count = 0
+
+        # Current board: round-trip through serialize -> mutate -> load,
+        # the same path used by undo/open, so every component type and
+        # board-card subitem is rebuilt exactly the way it always is
+        # instead of needing to poke each live Qt item's font by hand.
+        data = self.scene.serialize()
+        replace_all_font_families(data, family)
+        self.scene.load(data)
+        self._reset_undo_history()
+        self._update_saved_snapshot()
+        if self.current_file:
+            self._write_html(self.current_file)
+        count += 1
+
+        project_dir = self.project_dir or (os.path.dirname(self.current_file) if self.current_file else None)
+        if project_dir and os.path.isdir(project_dir):
+            current_name = os.path.basename(self.current_file) if self.current_file else None
+            for name in os.listdir(project_dir):
+                if not name.lower().endswith(".html") or name == current_name:
+                    continue
+                path = os.path.join(project_dir, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        html = f.read()
+                    file_data = extract_scene_data(html)
+                    if file_data is None:
+                        continue
+                    replace_all_font_families(file_data, family)
+                    new_html = build_html_document(file_data)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(new_html)
+                    count += 1
+                except Exception:
+                    continue
+
+        self.prefs["default_font_family"] = family
+        save_app_preferences(self.prefs)
+        self.statusBar().showMessage(f"Applied font \u201c{family}\u201d to {count} board file(s)", 4000)
+        return count
 
     # -- clipboard ops -----------------------------------------------------
     def copy_selection(self):
@@ -9040,8 +9712,57 @@ class MainWindow(QMainWindow):
                 f.write(html)
             self.statusBar().showMessage(f"Saved: {path}", 4000)
             self._update_saved_snapshot()
+            self._add_recent_file(path)
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))
+
+    # -- File > Recent -----------------------------------------------------
+    def _get_recent_files(self):
+        """Up to MAX_RECENT_FILES most-recently opened/saved board paths,
+        most recent first - persisted via QSettings (see
+        _add_recent_file) so the list survives across runs. Entries whose
+        file no longer exists on disk are silently dropped here rather
+        than shown as a dead menu item."""
+        s = QSettings("OpenNote", "OpenNote")
+        files = s.value(RECENT_FILES_SETTINGS_KEY, [])
+        if isinstance(files, str):
+            files = [files]
+        return [f for f in files if f and os.path.exists(f)]
+
+    def _add_recent_file(self, path):
+        """Push `path` to the front of the Recent list, de-duplicating
+        against any existing entry for the same file and capping the
+        list at MAX_RECENT_FILES - called after every successful open
+        (_load_board_file) and save (_write_html)."""
+        path = os.path.normpath(os.path.abspath(path))
+        files = [os.path.normpath(f) for f in self._get_recent_files()]
+        files = [f for f in files if f != path]
+        files.insert(0, path)
+        files = files[:MAX_RECENT_FILES]
+        QSettings("OpenNote", "OpenNote").setValue(RECENT_FILES_SETTINGS_KEY, files)
+
+    def _rebuild_recent_menu(self):
+        """Repopulate File > Recent right before it's shown (see
+        file_menu.aboutToShow in _build_menu), so it always reflects the
+        latest list instead of going stale between opens/saves."""
+        self.recent_menu.clear()
+        files = self._get_recent_files()
+        if not files:
+            empty_act = self.recent_menu.addAction("No recent boards")
+            empty_act.setEnabled(False)
+            return
+        for path in files:
+            act = self.recent_menu.addAction(os.path.basename(path))
+            act.setToolTip(path)
+            act.triggered.connect(lambda checked=False, p=path: self._open_recent_file(p))
+
+    def _open_recent_file(self, path):
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Open failed", f"This board no longer exists:\n{path}")
+            return
+        if not self._confirm_discard_changes(title="Open board"):
+            return
+        self._load_board_file(path, error_title="Open failed")
 
     def open_board(self):
         if not self._confirm_discard_changes(title="Open board"):
@@ -9132,6 +9853,7 @@ class MainWindow(QMainWindow):
             self._update_breadcrumb_bar()
             self._update_saved_snapshot()
             self._reset_undo_history()
+            self._add_recent_file(path)
         except Exception as e:
             QMessageBox.critical(self, error_title, str(e))
 
