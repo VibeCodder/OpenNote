@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
     QToolBar, QFileDialog, QColorDialog, QMessageBox, QSlider, QComboBox,
     QPushButton, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QToolButton,
     QFontComboBox, QInputDialog, QCompleter, QCheckBox,
-    QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QGridLayout, QLineEdit,
+    QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QDoubleSpinBox, QGridLayout, QLineEdit,
     QSizePolicy, QTabWidget,
 )
 
@@ -962,6 +962,9 @@ DEFAULT_PREFS = {
     "default_show_description": True,
     "default_title_alignment": "left",   # one of PREF_ALIGN_OPTIONS
     "default_font_family": "Segoe UI",
+    "default_title_font_size": 12.0,
+    "default_description_font_size": 9.0,
+    "default_arrow_size": 4,
 }
 
 
@@ -976,6 +979,21 @@ def load_app_preferences():
     prefs["default_title_alignment"] = align if align in PREF_ALIGN_TO_QT else "left"
     fam = s.value("default_font_family", DEFAULT_PREFS["default_font_family"])
     prefs["default_font_family"] = fam or DEFAULT_PREFS["default_font_family"]
+    try:
+        prefs["default_title_font_size"] = float(
+            s.value("default_title_font_size", DEFAULT_PREFS["default_title_font_size"]))
+    except (TypeError, ValueError):
+        prefs["default_title_font_size"] = DEFAULT_PREFS["default_title_font_size"]
+    try:
+        prefs["default_description_font_size"] = float(
+            s.value("default_description_font_size", DEFAULT_PREFS["default_description_font_size"]))
+    except (TypeError, ValueError):
+        prefs["default_description_font_size"] = DEFAULT_PREFS["default_description_font_size"]
+    try:
+        prefs["default_arrow_size"] = int(
+            s.value("default_arrow_size", DEFAULT_PREFS["default_arrow_size"]))
+    except (TypeError, ValueError):
+        prefs["default_arrow_size"] = DEFAULT_PREFS["default_arrow_size"]
     s.endGroup()
     return prefs
 
@@ -987,6 +1005,9 @@ def save_app_preferences(prefs):
     s.setValue("default_show_description", bool(prefs.get("default_show_description", True)))
     s.setValue("default_title_alignment", prefs.get("default_title_alignment", "left"))
     s.setValue("default_font_family", prefs.get("default_font_family", "Segoe UI"))
+    s.setValue("default_title_font_size", float(prefs.get("default_title_font_size", 12.0)))
+    s.setValue("default_description_font_size", float(prefs.get("default_description_font_size", 9.0)))
+    s.setValue("default_arrow_size", int(prefs.get("default_arrow_size", 4)))
     s.endGroup()
 
 
@@ -5077,6 +5098,27 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         ).height() + 4
         return max(18, h), title_font
 
+    def _sub_text_body_height(self, item, avail_w, sub_font):
+        """Height needed for a "text" subitem's body - shared by paint()
+        and _estimate_content_height() so the two never disagree about
+        how much vertical space the body needs, mirroring
+        _sub_media_chrome/_sub_text_title_height's approach for the same
+        reason.
+
+        This measures the same QTextDocument that actually gets painted
+        (see _get_subitem_rich_doc/_paint_rich_doc) instead of running
+        QFontMetrics.boundingRect() on the plain text: the two don't
+        always agree on wrapped-line height, and boundingRect's estimate
+        could come out shorter than the QTextDocument's real layout for
+        a multi-line body. That mismatch was previously sizing the row
+        (and the clip rect used to paint it) too short, so the tail of a
+        multi-line Text Note subitem got clipped off - and every subitem
+        below it in the card then overlapped that too-short row instead
+        of starting below its real bottom edge."""
+        text = item.get("text", "")
+        doc = self._get_subitem_rich_doc(item, "text", item.get("text_html"), text, sub_font, avail_w)
+        return doc.size().height() + 4
+
     def _sub_media_chrome(self, item, avail_w):
         """For an image/gif/video subitem, decide whether its title/desc
         bars should be drawn (on AND actually has text) and how tall each
@@ -5159,10 +5201,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 sub_font = QFont(item.get("font_family") or "Segoe UI", 10)
                 sub_font.setBold(bool(item.get("bold")))
                 sub_font.setItalic(bool(item.get("italic")))
-                fm = QFontMetrics(sub_font)
-                needed_h = fm.boundingRect(
-                    QRectF(0, 0, avail_w, 10000).toRect(), Qt.TextWordWrap, item.get("text", "")
-                ).height() + 4
+                needed_h = self._sub_text_body_height(item, avail_w, sub_font)
                 title_h, _ = self._sub_text_title_height(item, avail_w)
                 y += max(20, needed_h) + title_h + 8
             elif kind == "checklist":
@@ -5180,6 +5219,70 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             if r.contains(local_pos):
                 return idx
         return None
+
+    def _toggle_subitem_checkbox_at(self, idx, local_pos):
+        """A click directly on a checklist glyph (\u2610/\u2611) at the
+        start of a line inside a "text" subitem toggles it, mirroring
+        TextNoteItem._toggle_checkbox_at for a standalone Text Note.
+
+        A "text" subitem's body is only ever drawn as a static rich-text
+        document in paint() (see _paint_rich_doc) rather than through a
+        live QGraphicsTextItem, so it never went through
+        TextNoteItem.mousePressEvent's checkbox handling at all - every
+        click anywhere on the subitem (including right on its checkbox)
+        was instead claimed unconditionally by mousePressEvent to start
+        a drag/reorder, which is why a checklist Text Note that could be
+        checked off fine on its own could no longer be checked off once
+        dropped into a Board Card. This is checked first, before that
+        drag/reorder capture, so a checkbox click is handled here instead."""
+        if idx is None or idx >= len(self.subitems):
+            return False
+        item = self.subitems[idx]
+        if item.get("kind") != "text" or not item.get("text"):
+            return False
+        rect = None
+        for i, r in self._subitem_rects:
+            if i == idx:
+                rect = r
+                break
+        if rect is None:
+            return False
+        pad = 8
+        avail_w = self._w - pad * 2
+        title_h, _ = self._sub_text_title_height(item, avail_w)
+        body_top = rect.y() + title_h
+        if local_pos.y() < body_top:
+            return False
+        sub_font = QFont(item.get("font_family") or "Segoe UI", 10)
+        sub_font.setBold(bool(item.get("bold")))
+        sub_font.setItalic(bool(item.get("italic")))
+        sub_font.setUnderline(bool(item.get("underline")))
+        body_doc = self._get_subitem_rich_doc(
+            item, "text", item.get("text_html"), item.get("text", ""), sub_font, avail_w)
+        body_pos = QPointF(local_pos.x() - rect.x(), local_pos.y() - body_top)
+        hit = body_doc.documentLayout().hitTest(body_pos, Qt.FuzzyHit)
+        if hit < 0:
+            return False
+        block = body_doc.findBlock(hit)
+        block_text = block.text()
+        if not block_text[:1] in (CHECK_UNCHECKED, CHECK_CHECKED):
+            return False
+        # Only react to clicks right on (or just after) the glyph itself,
+        # not anywhere else in the line's text.
+        if hit - block.position() > 2:
+            return False
+        new_char = CHECK_CHECKED if block_text[0] == CHECK_UNCHECKED else CHECK_UNCHECKED
+        cur = QTextCursor(block)
+        cur.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 1)
+        cur.insertText(new_char)
+        item["text"] = body_doc.toPlainText()
+        item["text_html"] = body_doc.toHtml()
+        # Force _get_subitem_rich_doc to rebuild from the now-updated
+        # text/html next time it's asked for this field, instead of
+        # handing back the (now stale-keyed) cache entry it made above.
+        self._subitem_rich_doc_cache.pop((id(item), "text"), None)
+        self.update()
+        return True
 
     @staticmethod
     def _subitem_media_height(pm, avail_w, remaining_h, aspect=None, min_h=40, max_h=None):
@@ -5378,6 +5481,9 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         ):
             idx = self._subitem_index_at(event.pos())
             if idx is not None:
+                if self._toggle_subitem_checkbox_at(idx, event.pos()):
+                    event.accept()
+                    return
                 self._drag_sub_index = idx
                 self._drag_sub_moved = False
                 self._drag_sub_start_pos = event.pos()
@@ -5605,10 +5711,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 # with nothing clipping it, so it visually bled underneath
                 # whatever subitem (e.g. an image) got painted after it.
                 title_h, title_font = self._sub_text_title_height(item, avail_w)
-                fm = QFontMetrics(sub_font)
-                needed_h = fm.boundingRect(
-                    QRectF(0, 0, avail_w, 10000).toRect(), Qt.TextWordWrap, text
-                ).height() + 4
+                needed_h = self._sub_text_body_height(item, avail_w, sub_font)
                 h = min(max(20, needed_h) + title_h, remaining_h)
                 r = QRectF(pad, y, avail_w, h)
                 editing_title = idx == self._sub_edit_index and self._sub_edit_field == "title"
@@ -6721,6 +6824,19 @@ class MindMapScene(QGraphicsScene):
         self._anchor_highlight_item = None
         self._anchors_refreshing = False
         self._anchor_endpoint_markers = None
+        # True for the whole duration of a rubber-band drag-select (see
+        # MindMapView.mousePressEvent/mouseReleaseEvent). Qt re-evaluates
+        # the rubber band's intersection with the scene and emits
+        # selectionChanged on essentially every mouseMoveEvent while
+        # dragging - on a board with many items that meant
+        # update_anchor_endpoint_markers, MainWindow.on_selection_changed
+        # (which does dozens of toolbar-widget updates) and
+        # MainWindow._flush_pending_undo_checkpoint (which can
+        # JSON-serialize the whole board) were all firing dozens of times
+        # a second, making the drag itself feel laggy. Those three
+        # handlers now bail out immediately while this is True, and the
+        # view runs them once, for real, right after the drag ends.
+        self.rubber_band_dragging = False
         self.selectionChanged.connect(self.update_anchor_endpoint_markers)
 
     def bring_to_front(self, item):
@@ -6793,6 +6909,11 @@ class MindMapScene(QGraphicsScene):
         drag and a component it's anchored to moving/resizing - and
         after an item is removed from the scene.
         """
+        if self.rubber_band_dragging:
+            # Skipped mid-drag for performance (see rubber_band_dragging);
+            # MindMapView re-calls this once for real right after the
+            # drag ends.
+            return
         points = []
         for it in self.items():
             if isinstance(it, ArrowItem) and it.isSelected():
@@ -6845,11 +6966,35 @@ class MindMapScene(QGraphicsScene):
     # screen, exactly like the reference screenshots.
     GRID_SPACING = 40
     DOT_SIZE = 2.4
+    MIN_SCREEN_SPACING = 18  # once GRID_SPACING would put dots closer than
+                              # this many *screen* pixels apart, double the
+                              # spacing (see drawBackground) - keeps the
+                              # dot count, and so the redraw cost, roughly
+                              # constant no matter how far zoomed out
 
     def drawBackground(self, painter, rect):
         super().drawBackground(painter, rect)
-        grid = self.GRID_SPACING
         painter.setRenderHint(QPainter.Antialiasing, False)
+
+        # `rect` is the exposed area in *scene* coordinates, which grows
+        # as ~1/scale when zooming out - so at a fixed GRID_SPACING the
+        # raw dot count grows quadratically the further out you zoom.
+        # At a moderate 20x zoom-out that's on the order of a quarter
+        # million dots to place on every single repaint (and several
+        # million at 100x) - each one previously its own separate
+        # drawPoint() call, which has real per-call overhead on top of
+        # that. That combination is exactly what made zooming far out
+        # visibly freeze the view. Doubling the spacing every time the
+        # on-screen gap between dots would otherwise fall under
+        # MIN_SCREEN_SPACING keeps the number of dots - and therefore
+        # the redraw cost - roughly flat at any zoom level, the same way
+        # Figma/Miro-style canvases keep their background grid affordable
+        # however far out you zoom.
+        scale = painter.transform().m11() or 1.0
+        grid = self.GRID_SPACING
+        while grid * scale < self.MIN_SCREEN_SPACING:
+            grid *= 2
+
         pen = QPen(QColor(255, 255, 255, 40))
         pen.setWidthF(self.DOT_SIZE)
         pen.setCapStyle(Qt.SquareCap)
@@ -6857,13 +7002,20 @@ class MindMapScene(QGraphicsScene):
 
         left = int(rect.left()) - (int(rect.left()) % grid)
         top = int(rect.top()) - (int(rect.top()) % grid)
+        # Collecting every dot into one list and drawing it with a
+        # single drawPoints() call is dramatically faster than the
+        # equivalent number of individual drawPoint() calls (each of
+        # which pays its own call overhead) - see the note above.
+        points = []
         x = left
         while x < rect.right():
             y = top
             while y < rect.bottom():
-                painter.drawPoint(QPointF(x, y))
+                points.append(QPointF(x, y))
                 y += grid
             x += grid
+        if points:
+            painter.drawPoints(points)
 
     # -- drawing mode ---------------------------------------------------
     def _effective_width(self):
@@ -7138,6 +7290,25 @@ class MindMapScene(QGraphicsScene):
 # --------------------------------------------------------------------------
 
 class MindMapView(QGraphicsView):
+    # The scene's own sceneRect() is what QGraphicsView derives its
+    # scrollbar range from, and a fixed one (the original board was
+    # created with a flat -5000,-5000,10000,10000) is a real, reachable
+    # wall - pan far enough in any direction and the scrollbar simply
+    # runs out of room, which is exactly the "panning stops and I can't
+    # go further" bug. There's no such thing as an actually-infinite
+    # QRectF (Qt's coordinates are still plain floats), so instead this
+    # keeps growing the scene rect on demand, in whatever direction the
+    # user is heading, well before they can ever reach its current edge
+    # - see _grow_scene_rect_if_needed, called after every pan, zoom,
+    # and viewport resize. In practice the usable area ends up far
+    # larger than anyone would ever pan a mind-map board across.
+    SCENE_RECT_MARGIN = 4000  # once the visible area gets within this many
+                               # scene units of sceneRect()'s current edge,
+                               # push that edge further out
+    SCENE_RECT_GROW = 20000   # how far each growth step pushes the edge -
+                               # large relative to MARGIN so this doesn't
+                               # keep re-triggering on every small pan
+
     def __init__(self, scene, main_window, parent=None):
         super().__init__(scene, parent)
         self.main_window = main_window
@@ -7151,11 +7322,61 @@ class MindMapView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
         self._panning = False
         self._pan_start = QPoint()
+        self._growing_scene_rect = False
+
+    def _grow_scene_rect_if_needed(self):
+        scene = self.scene()
+        if scene is None or self._growing_scene_rect:
+            return
+        viewport_rect = self.viewport().rect()
+        if not viewport_rect.isValid():
+            return
+        visible = self.mapToScene(viewport_rect).boundingRect()
+        rect = scene.sceneRect()
+        left, top = rect.left(), rect.top()
+        right, bottom = rect.right(), rect.bottom()
+        grew = False
+        if visible.left() - left < self.SCENE_RECT_MARGIN:
+            left -= self.SCENE_RECT_GROW
+            grew = True
+        if right - visible.right() < self.SCENE_RECT_MARGIN:
+            right += self.SCENE_RECT_GROW
+            grew = True
+        if visible.top() - top < self.SCENE_RECT_MARGIN:
+            top -= self.SCENE_RECT_GROW
+            grew = True
+        if bottom - visible.bottom() < self.SCENE_RECT_MARGIN:
+            bottom += self.SCENE_RECT_GROW
+            grew = True
+        if not grew:
+            return
+        # setSceneRect() recalculates the scrollbar ranges, which fires
+        # scrollContentsBy() again (see below) - guarded so that nested
+        # call finds nothing left to grow and just returns instead of
+        # recursing.
+        self._growing_scene_rect = True
+        try:
+            scene.setSceneRect(left, top, right - left, bottom - top)
+        finally:
+            self._growing_scene_rect = False
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        self._grow_scene_rect_if_needed()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._grow_scene_rect_if_needed()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._grow_scene_rect_if_needed()
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.ControlModifier:
             factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
             self.scale(factor, factor)
+            self._grow_scene_rect_if_needed()
         else:
             super().wheelEvent(event)
 
@@ -7188,6 +7409,16 @@ class MindMapView(QGraphicsView):
             self.setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
+        # Flagged for the whole press-to-release span whenever a left
+        # click could start a rubber-band drag-select, even though a
+        # click straight onto an item ends up just selecting/dragging it
+        # instead - harmless either way, since mouseReleaseEvent always
+        # clears the flag and runs one real selection-sync pass right
+        # after, so the only effect on a plain click is that sync moving
+        # from press to release (imperceptible). See
+        # MindMapScene.rubber_band_dragging for why this exists.
+        if event.button() == Qt.LeftButton and self.dragMode() == QGraphicsView.RubberBandDrag:
+            self.scene().rubber_band_dragging = True
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -7213,10 +7444,21 @@ class MindMapView(QGraphicsView):
         )
         super().mouseReleaseEvent(event)
         if was_rubber_band:
+            scene = self.scene()
+            scene.rubber_band_dragging = False
+            # Run the (deliberately skipped mid-drag - see
+            # MindMapScene.rubber_band_dragging) selection-sync handlers
+            # once for real now that the drag is actually over, so the
+            # toolbar/anchor-markers/undo-checkpoint all end up correct
+            # no matter how many selectionChanged emissions were
+            # swallowed while dragging.
+            scene.update_anchor_endpoint_markers()
+            self.main_window.on_selection_changed()
+            self.main_window._flush_pending_undo_checkpoint()
             # A rectangular selection just finished: if it caught more than
             # one freehand drawing, treat them as a single object from now
             # on (instead of the old nearest-object-guessing merge).
-            self.scene().merge_selected_drawings()
+            scene.merge_selected_drawings()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -7611,8 +7853,9 @@ class PreferencesDialog(QDialog):
     """Settings > Preferences. Two independent things live here:
 
     1. Defaults for brand-new components (Show Title / Show Description /
-       Title Alignment / Font) - only consulted at creation time (see
-       MainWindow._apply_new_component_prefs), never retroactive.
+       Title Alignment / Font / Title Size / Description Size) - only
+       consulted at creation time (see MainWindow._apply_new_component_prefs),
+       never retroactive.
     2. "Apply Font to All Components" - the opposite: immediately pushes a
        chosen font onto every existing component, both on the board
        currently open and every other .html board file in the same
@@ -7652,6 +7895,25 @@ class PreferencesDialog(QDialog):
         self.font_combo = QFontComboBox()
         self.font_combo.setCurrentFont(QFont(prefs.get("default_font_family", "Segoe UI")))
         form.addRow("Default Font:", self.font_combo)
+
+        self.title_size_spin = QDoubleSpinBox()
+        self.title_size_spin.setRange(4.0, 96.0)
+        self.title_size_spin.setDecimals(1)
+        self.title_size_spin.setSingleStep(0.5)
+        self.title_size_spin.setValue(float(prefs.get("default_title_font_size", 12.0)))
+        form.addRow("Default Title Size:", self.title_size_spin)
+
+        self.desc_size_spin = QDoubleSpinBox()
+        self.desc_size_spin.setRange(4.0, 96.0)
+        self.desc_size_spin.setDecimals(1)
+        self.desc_size_spin.setSingleStep(0.5)
+        self.desc_size_spin.setValue(float(prefs.get("default_description_font_size", 9.0)))
+        form.addRow("Default Description Size:", self.desc_size_spin)
+
+        self.arrow_size_spin = QSpinBox()
+        self.arrow_size_spin.setRange(1, 40)
+        self.arrow_size_spin.setValue(int(prefs.get("default_arrow_size", 4)))
+        form.addRow("Default Arrow Size:", self.arrow_size_spin)
 
         layout.addLayout(form)
 
@@ -7693,6 +7955,9 @@ class PreferencesDialog(QDialog):
         self.main_window.prefs["default_show_description"] = self.desc_checkbox.isChecked()
         self.main_window.prefs["default_title_alignment"] = self.align_combo.currentData()
         self.main_window.prefs["default_font_family"] = self.font_combo.currentFont().family()
+        self.main_window.prefs["default_title_font_size"] = self.title_size_spin.value()
+        self.main_window.prefs["default_description_font_size"] = self.desc_size_spin.value()
+        self.main_window.prefs["default_arrow_size"] = self.arrow_size_spin.value()
         save_app_preferences(self.main_window.prefs)
         self.accept()
 
@@ -8308,6 +8573,13 @@ class MainWindow(QMainWindow):
         return None
 
     def on_selection_changed(self):
+        if self.scene.rubber_band_dragging:
+            # Skipped mid-drag for performance - this does dozens of
+            # toolbar-widget updates, and Qt emits selectionChanged on
+            # nearly every mouseMoveEvent of a rubber-band drag. See
+            # MindMapScene.rubber_band_dragging / MindMapView for where
+            # this gets called once for real right after the drag ends.
+            return
         all_sel = self.scene.selectedItems()
         sel = [it for it in all_sel if isinstance(it, (DrawingItem, ArrowItem))]
         text_sel = [it for it in all_sel if isinstance(it, (TextNoteItem, PlainTextItem))]
@@ -9155,7 +9427,8 @@ class MainWindow(QMainWindow):
         item = TextNoteItem(
             pos.x() - 110, pos.y() - 70,
             show_title=self.prefs.get("default_show_title", True),
-            title_font=self._new_component_font_dict(size=12.0, bold=True),
+            title_font=self._new_component_font_dict(
+                size=self.prefs.get("default_title_font_size", 12.0), bold=True),
             font_family=fam,
         )
         self.scene.addItem(item)
@@ -9173,7 +9446,8 @@ class MainWindow(QMainWindow):
         pos = self._viewport_center_scene()
         item = BoardCardItem(
             pos.x() - 140, pos.y() - 160,
-            title_font=self._new_component_font_dict(size=12.0, bold=True),
+            title_font=self._new_component_font_dict(
+                size=self.prefs.get("default_title_font_size", 12.0), bold=True),
         )
         self.scene.addItem(item)
         self._apply_default_title_alignment(item)
@@ -9272,7 +9546,7 @@ class MainWindow(QMainWindow):
         item = ArrowItem.from_scene_points(
             p1, p2,
             color=self.scene.brush_color.name(),
-            stroke_width=self.scene.brush_width,
+            stroke_width=self.prefs.get("default_arrow_size", 4),
             style=style,
         )
         self.scene.addItem(item)
@@ -9291,8 +9565,10 @@ class MainWindow(QMainWindow):
             return None
         show_title = self.prefs.get("default_show_title", True)
         show_desc = self.prefs.get("default_show_description", True)
-        title_font = self._new_component_font_dict(size=10.0, bold=True)
-        desc_font = self._new_component_font_dict(size=9.0)
+        title_font = self._new_component_font_dict(
+            size=self.prefs.get("default_title_font_size", 12.0), bold=True)
+        desc_font = self._new_component_font_dict(
+            size=self.prefs.get("default_description_font_size", 9.0))
         if ext in GIF_EXTS:
             item = GifItem(scene_pos.x() - 120, scene_pos.y() - 90, gif_bytes=data,
                             title="Title", description="description...",
@@ -9443,6 +9719,12 @@ class MainWindow(QMainWindow):
         onto a different item commits that edit immediately. A no-op
         (and cheap) when nothing is pending, e.g. a plain click that
         didn't change anything."""
+        if self.scene.rubber_band_dragging:
+            # Skipped mid-drag - _commit_undo_checkpoint below would
+            # JSON-serialize the whole board, and this can otherwise run
+            # dozens of times a second during a rubber-band drag. Called
+            # once for real right after the drag ends (see MindMapView).
+            return
         if self._undo_commit_timer.isActive():
             self._commit_undo_checkpoint()
 
