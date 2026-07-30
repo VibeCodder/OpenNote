@@ -7625,8 +7625,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   viewport.addEventListener('wheel', function(e) {{
     e.preventDefault();
+    // Zoom anchored on the mouse cursor: convert the cursor's current
+    // screen position into canvas-space (scene) coordinates *before*
+    // changing scale, then re-solve originX/originY so that same
+    // canvas-space point stays under the cursor afterwards. Previously
+    // this only changed `scale` and left originX/originY untouched -
+    // since the transform is translate(originX,originY) scale(scale)
+    // with transform-origin:0 0, that meant canvas-space point (0,0)
+    // always stayed pinned to whatever screen position originX/originY
+    // happened to be, so zooming always anchored on that one fixed
+    // point instead of wherever the cursor (and the view, after
+    // panning) actually was.
+    var rect = viewport.getBoundingClientRect();
+    var mouseX = e.clientX - rect.left;
+    var mouseY = e.clientY - rect.top;
+    var canvasX = (mouseX - originX) / scale;
+    var canvasY = (mouseY - originY) / scale;
     var delta = e.deltaY < 0 ? 1.1 : 0.9;
     scale = Math.min(4, Math.max(0.15, scale * delta));
+    originX = mouseX - canvasX * scale;
+    originY = mouseY - canvasY * scale;
     apply();
   }}, {{ passive:false }});
 
