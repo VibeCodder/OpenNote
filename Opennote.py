@@ -27,6 +27,9 @@ import atexit
 import tempfile
 import uuid
 import time
+import gc
+import weakref
+import types as _types
 
 from PySide6.QtCore import (
     Qt, QRectF, QPointF, QPoint, QSize, QSizeF, QByteArray, QBuffer, QIODevice, QUrl, Signal, QTimer,
@@ -965,6 +968,16 @@ DEFAULT_PREFS = {
     "default_title_font_size": 12.0,
     "default_description_font_size": 9.0,
     "default_arrow_size": 4,
+    # -- background dot-grid rendering (see MindMapScene.drawBackground) --
+    # The grid-spacing-doubling trick already keeps the dot COUNT roughly
+    # constant at any zoom level, but building + drawing even that capped
+    # set of points still runs on every single repaint (i.e. continuously
+    # while panning/zooming). "optimize_grid_rendering" lets that fixed
+    # per-frame cost be skipped entirely once the view is zoomed out past
+    # grid_disable_zoom_percent, since the dots are barely visible at
+    # extreme zoom-out anyway.
+    "optimize_grid_rendering": True,
+    "grid_disable_zoom_percent": 15.0,  # skip the dot grid once zoom <= this %
 }
 
 
@@ -994,6 +1007,13 @@ def load_app_preferences():
             s.value("default_arrow_size", DEFAULT_PREFS["default_arrow_size"]))
     except (TypeError, ValueError):
         prefs["default_arrow_size"] = DEFAULT_PREFS["default_arrow_size"]
+    prefs["optimize_grid_rendering"] = _qsettings_bool(
+        s, "optimize_grid_rendering", DEFAULT_PREFS["optimize_grid_rendering"])
+    try:
+        prefs["grid_disable_zoom_percent"] = float(
+            s.value("grid_disable_zoom_percent", DEFAULT_PREFS["grid_disable_zoom_percent"]))
+    except (TypeError, ValueError):
+        prefs["grid_disable_zoom_percent"] = DEFAULT_PREFS["grid_disable_zoom_percent"]
     s.endGroup()
     return prefs
 
@@ -1008,6 +1028,8 @@ def save_app_preferences(prefs):
     s.setValue("default_title_font_size", float(prefs.get("default_title_font_size", 12.0)))
     s.setValue("default_description_font_size", float(prefs.get("default_description_font_size", 9.0)))
     s.setValue("default_arrow_size", int(prefs.get("default_arrow_size", 4)))
+    s.setValue("optimize_grid_rendering", bool(prefs.get("optimize_grid_rendering", True)))
+    s.setValue("grid_disable_zoom_percent", float(prefs.get("grid_disable_zoom_percent", 15.0)))
     s.endGroup()
 
 
@@ -1223,6 +1245,11 @@ class BaseComponentItem(QGraphicsObject):
         self._resizing = False
         self._resize_start = QPointF()
         self._start_geom = (self._w, self._h)
+        # See _raise_to_front_if_needed(): set False at the start of every
+        # mousePressEvent, then consumed (set True) the first time this
+        # press actually turns into a drag/resize - so a plain click (or
+        # double-click, e.g. opening a Board Card) never touches zValue.
+        self._raised_this_press = False
         # Board card this item is currently hovering over while being
         # dragged, if any - tracked so we can show/clear the insertion
         # preview line on the target card as the drag moves, instead of
@@ -1290,10 +1317,27 @@ class BaseComponentItem(QGraphicsObject):
             painter.drawRect(self.handle_rect())
 
     # -- mouse: resize / drag-drop-onto-board notification ------------
-    def mousePressEvent(self, event):
+    def _raise_to_front_if_needed(self):
+        """Bring this item to front - but only the first time it's
+        called for a given mouse press. zValue() is part of serialize()
+        (see the "z" field), so unconditionally raising on every
+        mousePressEvent - as this used to do - meant a plain click (or
+        a double-click to open a Board Card) could change the saved
+        JSON snapshot even though nothing the user would call an "edit"
+        actually happened, which made the app nag to save changes after
+        nothing more than navigating between boards. Now it only fires
+        once real dragging/resizing starts (see mouseMoveEvent), and the
+        flag is reset back to False at the top of the next
+        mousePressEvent."""
+        if self._raised_this_press:
+            return
+        self._raised_this_press = True
         scene = self.scene()
         if scene is not None and hasattr(scene, "bring_to_front"):
             scene.bring_to_front(self)
+
+    def mousePressEvent(self, event):
+        self._raised_this_press = False
         if self.isSelected() and self.handle_rect().contains(event.pos()):
             self._resizing = True
             self._resize_start = event.scenePos()
@@ -1304,6 +1348,7 @@ class BaseComponentItem(QGraphicsObject):
 
     def mouseMoveEvent(self, event):
         if self._resizing:
+            self._raise_to_front_if_needed()
             delta = event.scenePos() - self._resize_start
             w0, h0 = self._start_geom
             new_w, new_h = w0 + delta.x(), h0 + delta.y()
@@ -1320,6 +1365,7 @@ class BaseComponentItem(QGraphicsObject):
             self.set_size(new_w, new_h)
             event.accept()
             return
+        self._raise_to_front_if_needed()
         super().mouseMoveEvent(event)
         self._update_board_hover_preview(event.scenePos())
 
@@ -1822,7 +1868,7 @@ class TextNoteItem(TopStripMixin, BaseComponentItem):
                                                       base_family=tf.family(), base_size=tf.pointSizeF())
             title_html = f'<div style="margin-bottom:4px">{title_text}</div>'
         return (
-            f'<div class="comp text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
+            f'<div class="comp text-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;background:{bg_css};color:{text_color_css};'
             f'opacity:{self.opacity():.2f}">{self._top_strip_html()}{title_html}{text}</div>'
         )
@@ -1947,7 +1993,7 @@ class PlainTextItem(BaseComponentItem):
         # it must be set explicitly here for un-colored runs to inherit
         # it instead of falling back to the browser's default black.
         return (
-            f'<div class="comp plain-text-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
+            f'<div class="comp plain-text-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;color:{color_to_css(self.color)};'
             f'opacity:{self.opacity():.2f}">{text}</div>'
         )
@@ -2275,7 +2321,13 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         # _flush_pending_undo_checkpoint), so without this cache that
         # PNG re-encode was happening synchronously right as a drag
         # begins - the actual source of "dragging feels expensive".
-        self._b64_cache = None
+        # When loading from a saved board file, `b64` IS already the
+        # exact PNG bytes we want serialize() to hand back - seed the
+        # cache with it directly instead of throwing it away and making
+        # the very next serialize()/undo-snapshot decode-then-re-encode
+        # every single image on the board from scratch (this was the
+        # main reason opening a board with photos took so long).
+        self._b64_cache = b64 if pixmap is None else None
         self.min_w, self.min_h = 120, 140
         self.setAcceptDrops(True)
         self._init_title_desc(title, description, show_title, show_description,
@@ -2407,7 +2459,7 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         b64 = self._get_b64()
         title_html, desc_html = self._title_desc_html()
         return (
-            f'<div class="comp image-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
+            f'<div class="comp image-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;">{self._top_strip_html()}{title_html}'
             f'<img src="data:image/png;base64,{b64}" />{desc_html}</div>'
         )
@@ -2484,6 +2536,28 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
             self.movie.stop()
         self.gif_bytes = data
         self._setup_movie()
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemSceneHasChanged and value is None:
+            # This item just left the scene (a component deleted, or a
+            # whole board torn down by MindMapScene.clear_board() - e.g.
+            # navigating to another board and back). Same reasoning as
+            # VideoItem.itemChange: self.movie is a QMovie whose
+            # frameChanged is connected to self._on_frame, and that
+            # connection keeps this GifItem's Python wrapper (and thus
+            # its underlying C++ object) alive for as long as the movie
+            # keeps running - nothing here stopped it on scene removal.
+            # A frame delivered after removal still just no-ops safely
+            # against a scene-less item, but if it lands squarely in the
+            # middle of the scene's own C++ teardown it can hit a
+            # partially-destroyed item instead, which is undefined
+            # behavior - a native crash with no Python traceback, not a
+            # catchable exception. Stopping the movie here, synchronously
+            # and immediately, closes that window. Safe to call even if
+            # the movie was never started, and safe to call again later.
+            if self.movie is not None:
+                self.movie.stop()
+        return super().itemChange(change, value)
 
     def on_resized(self):
         self._layout_title_desc()
@@ -2580,7 +2654,7 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         b64 = base64.b64encode(self.gif_bytes).decode("ascii") if self.gif_bytes else ""
         title_html, desc_html = self._title_desc_html()
         return (
-            f'<div class="comp gif-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
+            f'<div class="comp gif-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;">{self._top_strip_html()}{title_html}'
             f'<img src="data:image/gif;base64,{b64}" />{desc_html}</div>'
         )
@@ -2626,8 +2700,16 @@ class VideoPlayerNode(QGraphicsObject):
         if HAS_MULTIMEDIA:
             self.video_item = QGraphicsVideoItem(self)
             self.video_item.setAspectRatioMode(Qt.KeepAspectRatio)
-            self.player = QMediaPlayer()
-            self.audio = QAudioOutput()
+            # Parented to self (a QObject, via QGraphicsObject) mainly
+            # as a second line of defense: the itemChange() override
+            # above is what actually stops playback and detaches the
+            # video output the instant this node leaves a scene, but
+            # giving these an explicit Qt parent also means a normal
+            # Qt-side deleteLater()/destructor cascade cleans them up
+            # correctly even in some other, unforeseen teardown path
+            # that doesn't go through removeItem().
+            self.player = QMediaPlayer(self)
+            self.audio = QAudioOutput(self)
             self.player.setAudioOutput(self.audio)
             self.player.setVideoOutput(self.video_item)
             self.player.playbackStateChanged.connect(self._on_playback_state_changed)
@@ -2697,6 +2779,36 @@ class VideoPlayerNode(QGraphicsObject):
 
     def boundingRect(self):
         return QRectF(0, 0, self._w, self._h)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemSceneHasChanged and value is None:
+            # This item (or an ancestor - e.g. the whole VideoItem, or
+            # the BoardCardItem a "video" subitem's node is parented
+            # to) just left the scene: a component deleted, or an
+            # entire board torn down (MindMapScene.clear_board(), e.g.
+            # navigating to another board and back). self.video_item is
+            # a genuine QGraphicsItem *child* of this node, so Qt's own
+            # C++ item-tree teardown destroys it automatically and in
+            # sync with this node. self.player/self.audio are not -
+            # QMediaPlayer()/QAudioOutput() above were created with no
+            # Qt parent at all, so nothing otherwise stops them from
+            # outliving self.video_item by even a fraction of a second.
+            # A still-playing player's decode/render backend runs on
+            # its own thread and can be mid-delivery of the *next*
+            # frame to that already-destroyed video sink the moment
+            # this fires - a native crash with no Python traceback,
+            # since it happens entirely on that backend thread rather
+            # than through any Python call Claude/CPython could catch.
+            # Stopping and detaching the output here, synchronously and
+            # immediately on scene removal, closes that window. Safe to
+            # call even when playback was already stopped, and safe to
+            # call again afterwards (e.g. BoardCardItem._prune_video_
+            # proxies also calls player.stop() directly for its own,
+            # narrower "dragged this subitem out" case).
+            if self.player is not None:
+                self.player.stop()
+                self.player.setVideoOutput(None)
+        return super().itemChange(change, value)
 
     def paint(self, painter, option, widget=None):
         painter.setPen(Qt.NoPen)
@@ -2916,7 +3028,7 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         b64 = base64.b64encode(self.video_bytes).decode("ascii") if self.video_bytes else ""
         title_html, desc_html = self._title_desc_html()
         return (
-            f'<div class="comp video-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
+            f'<div class="comp video-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;">{self._top_strip_html()}{title_html}'
             f'<video controls src="data:video/mp4;base64,{b64}"></video>{desc_html}</div>'
         )
@@ -3032,7 +3144,7 @@ class DrawingItem(BaseComponentItem):
             f'xmlns="http://www.w3.org/2000/svg">{"".join(svg_lines)}</svg>'
         )
         return (
-            f'<div class="comp drawing-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
+            f'<div class="comp drawing-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;">{svg}</div>'
         )
 
@@ -3167,6 +3279,19 @@ class ArrowItem(BaseComponentItem):
         label_rect = self._label_rect()
         if label_rect is not None:
             rect = rect.united(label_rect)
+        # A headless anchored end (see _render_endpoints) draws its
+        # shaft running into target's own center, which can sit outside
+        # the box above - that box is only padded out to the *handle's*
+        # position (on target's border), not all the way to its middle.
+        # Union in a small margin around each such center point too, so
+        # Qt actually knows to repaint/clip that stretch of shaft rather
+        # than silently cutting it off.
+        for anchor, which in ((self.anchor1, 1), (self.anchor2, 2)):
+            if anchor is not None and not self._endpoint_has_arrowhead(which):
+                target = self._live_anchor_target(anchor)
+                if target is not None:
+                    c = self.mapFromScene(target.sceneBoundingRect().center())
+                    rect = rect.united(QRectF(c.x() - m, c.y() - m, 2 * m, 2 * m))
         return rect
 
     def shape(self):
@@ -3196,18 +3321,19 @@ class ArrowItem(BaseComponentItem):
         stroker.setWidth(tolerance)
         stroker.setCapStyle(Qt.RoundCap)
         stroker.setJoinStyle(Qt.RoundJoin)
+        r_p1, r_p2 = self._render_endpoints()
         line_path = QPainterPath()
-        line_path.moveTo(self.p1)
-        line_path.lineTo(self.p2)
+        line_path.moveTo(r_p1)
+        line_path.lineTo(r_p2)
         path = stroker.createStroke(line_path)
 
-        dx, dy = self.p2.x() - self.p1.x(), self.p2.y() - self.p1.y()
+        dx, dy = r_p2.x() - r_p1.x(), r_p2.y() - r_p1.y()
         length = max(0.0001, math.hypot(dx, dy))
         ux, uy = dx / length, dy / length
         if self.style in ("single", "double"):
-            path.addPath(self._arrow_head_path(self.p2, ux, uy))
+            path.addPath(self._arrow_head_path(r_p2, ux, uy))
         if self.style == "double":
-            path.addPath(self._arrow_head_path(self.p1, -ux, -uy))
+            path.addPath(self._arrow_head_path(r_p1, -ux, -uy))
 
         # Endpoint drag handles - only actionable while already
         # selected (see mousePressEvent/_endpoint_at), but folding them
@@ -3239,9 +3365,7 @@ class ArrowItem(BaseComponentItem):
         return None
 
     def mousePressEvent(self, event):
-        scene = self.scene()
-        if scene is not None and hasattr(scene, "bring_to_front"):
-            scene.bring_to_front(self)
+        self._raised_this_press = False
         if self.isSelected():
             idx = self._endpoint_at(event.pos())
             if idx is not None:
@@ -3266,6 +3390,7 @@ class ArrowItem(BaseComponentItem):
 
     def mouseMoveEvent(self, event):
         if self._drag_endpoint is not None:
+            self._raise_to_front_if_needed()
             scene_pt = event.scenePos()
             if event.modifiers() & Qt.ControlModifier:
                 # Rotate around the endpoint that is *not* being dragged,
@@ -3279,7 +3404,7 @@ class ArrowItem(BaseComponentItem):
                 scene.show_anchor_highlight(target)
             if target is not None:
                 # Preview the edge point it would snap to if dropped here
-                # (see _border_point) - the same nearest-border-point
+                # (see _border_point) - the same center-orbit border
                 # computation used to actually commit the anchor on
                 # release (_set_anchor), so the preview always matches
                 # exactly where the endpoint will end up.
@@ -3352,94 +3477,145 @@ class ArrowItem(BaseComponentItem):
 
     @staticmethod
     def _border_point(target, scene_pt):
-        """Nearest point on target's own rectangle border to `scene_pt`,
-        as both a local QPointF and the (rx, ry) fraction of target's
-        width/height it corresponds to.
+        """Where the ray from target's own *center* toward `scene_pt`
+        crosses target's rectangle border, as both a local QPointF and
+        the (rx, ry) fraction of target's width/height it corresponds
+        to. This is what makes an anchored endpoint "orbit" its target:
+        the returned point always faces directly toward `scene_pt`, so
+        as scene_pt sweeps around target, this point continuously
+        slides around target's own perimeter in lockstep with it,
+        rather than jumping abruptly between edges the way a plain
+        nearest-point search can (nearest-point picks whichever edge is
+        closest in raw Euclidean distance, which doesn't always agree
+        with which edge is actually being "faced" - most noticeably for
+        a point sitting almost opposite one of target's corners).
 
-        `scene_pt` is mapped into target's local space first. If it
-        already sits inside target's box, the nearest of the four edges
-        is picked by the ordinary interior distances. If it's outside on
-        only one axis (e.g. above the box but still within its width),
-        that axis alone is snapped to its edge (0 or h/w) while the
-        other keeps its actual, unclamped position - unchanged from
-        before.
-
-        If it's outside on *both* axes at once (diagonally past a
-        corner - easy to do with a narrow-but-long component, since
-        approaching its top edge from above at any real angle very
-        easily drifts a little past its left/right edge too), the two
-        raw overshoots (how far past each edge's line the point already
-        is) are compared first, before anything gets clamped. Whichever
-        overshoot is smaller names the dominant edge - the point is much
-        closer to crossing that edge's line than the other, so that's
-        the edge it's actually approaching. Only that axis gets forced
-        to 0/h/w; the other keeps sliding continuously with the cursor,
-        merely kept within a modest margin of the box rather than
-        collapsed straight into the corner. Without this, both axes got
-        clamped into the corner as soon as the point was outside on
-        both, regardless of which overshoot was actually tiny - so any
-        drop point that was even fractionally outside the box on its
-        narrow axis (near-guaranteed for a narrow, very tall/long
-        component approached from an angle) landed on the exact same
-        corner no matter where along the long edge it was aimed, which
-        is why several arrows dropped at different points all ended up
-        stacked on top of each other at one corner.
+        `scene_pt` is mapped into target's local space first, and the
+        ray is cast from target's local center (w/2, h/2) through that
+        point. This is an ordinary box/ray intersection: for each axis
+        the ray is actually moving along, work out how far it has to
+        travel before reaching *that axis's own* edge, and stop at
+        whichever axis's distance is smaller - stopping at the nearer
+        one is what keeps the landing point on the box's real border
+        instead of overshooting past a corner. If `scene_pt` lands
+        exactly on target's own center - no direction to orbit toward
+        at all - this defaults to facing right.
 
         Used both for the live drop preview while dragging an endpoint
-        and - via _set_anchor - to fix the exact border point an anchor
-        sticks to once dropped. Deliberately independent of the arrow's
-        other endpoint: earlier this instead re-projected toward
-        whatever the other endpoint currently faced, which kept sliding
-        the anchored point around the target's border any time the
-        *other*, unattached endpoint moved - so an anchored arrow never
-        stayed put unless nothing else in the drawing ever changed.
-        Anchoring here only ever depends on target's own geometry, so
-        the point holds still until target itself moves or resizes."""
-        local = target.mapFromScene(scene_pt)
+        and - via _set_anchor - to fix the border point an anchor sticks
+        to once dropped, as well as - via _anchor_scene_point - to keep
+        re-facing that point whenever the arrow's other end later moves.
+        All three deliberately share this one center-relative
+        computation so the preview, the drop, and every later re-orbit
+        agree on exactly the same point for the same inputs."""
         w = max(1.0, target._w)
         h = max(1.0, target._h)
-        raw_x, raw_y = local.x(), local.y()
-        outside_x = raw_x < 0.0 or raw_x > w
-        outside_y = raw_y < 0.0 or raw_y > h
-        if outside_x and outside_y:
-            # Diagonally past a corner - the smaller overshoot names the
-            # edge the point is actually closest to; only that axis
-            # collapses onto its edge, the other stays free but is still
-            # clamped into the box's own [0, w]/[0, h] range so the
-            # returned point always sits ON the target's actual border -
-            # never floating outside it, which is what left a visible
-            # gap between the arrowhead and the component for anything
-            # approaching at an angle.
-            over_x = -raw_x if raw_x < 0.0 else raw_x - w
-            over_y = -raw_y if raw_y < 0.0 else raw_y - h
-            if over_y <= over_x:
-                side = "top" if raw_y < 0.0 else "bottom"
-                ly = 0.0 if raw_y < 0.0 else h
-                lx = min(w, max(0.0, raw_x))
-            else:
-                side = "left" if raw_x < 0.0 else "right"
-                lx = 0.0 if raw_x < 0.0 else w
-                ly = min(h, max(0.0, raw_y))
-            rx = min(1.0, max(0.0, raw_x)) / w
-            ry = min(1.0, max(0.0, raw_y)) / h
-            return QPointF(lx, ly), (rx, ry), side
-        lx = min(w, max(0.0, raw_x))
-        ly = min(h, max(0.0, raw_y))
-        d_left, d_right, d_top, d_bottom = lx, w - lx, ly, h - ly
-        m = min(d_left, d_right, d_top, d_bottom)
-        if m == d_left:
-            lx = 0.0
+        local = target.mapFromScene(scene_pt)
+        cx, cy = w / 2.0, h / 2.0
+        dx, dy = local.x() - cx, local.y() - cy
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            dx, dy = 1.0, 0.0
+        # How far (as a multiple of (dx, dy)) the ray travels before it
+        # would cross each axis's own edge line - only the axis the ray
+        # actually moves along has a finite crossing at all; whichever
+        # of the two is smaller is the one the ray reaches first, and
+        # that's the edge the point lands on.
+        t_candidates = []
+        if dx > 1e-9:
+            t_candidates.append((w - cx) / dx)
+        elif dx < -1e-9:
+            t_candidates.append((0.0 - cx) / dx)
+        if dy > 1e-9:
+            t_candidates.append((h - cy) / dy)
+        elif dy < -1e-9:
+            t_candidates.append((0.0 - cy) / dy)
+        t = min(t_candidates) if t_candidates else 0.0
+        lx = min(w, max(0.0, cx + dx * t))
+        ly = min(h, max(0.0, cy + dy * t))
+        if lx <= 1e-6:
             side = "left"
-        elif m == d_right:
-            lx = w
+        elif lx >= w - 1e-6:
             side = "right"
-        elif m == d_top:
-            ly = 0.0
+        elif ly <= 1e-6:
             side = "top"
         else:
-            ly = h
             side = "bottom"
         return QPointF(lx, ly), (lx / w, ly / h), side
+
+    def _endpoint_has_arrowhead(self, which):
+        """True if endpoint 1 or 2 actually draws an arrowhead of its
+        own: p2 has one whenever the arrow has a head at all (style
+        "single" or "double"), p1 only for a double-headed arrow. A
+        "line" style, or the tail end of a "single" arrow, is headless -
+        see _render_endpoints, which is where this distinction actually
+        matters."""
+        if which == 2:
+            return self.style in ("single", "double")
+        return self.style == "double"
+
+    def _render_endpoints(self):
+        """The local (p1, p2) pair to actually draw the shaft/head/hit-
+        test outline between - which is NOT always self.p1/self.p2.
+
+        self.p1/self.p2 double as the green drag-handle positions (see
+        paint()'s isSelected() block and _endpoint_at) and, for an
+        anchored end, sit exactly on target's border (see _border_point)
+        - they need to stay there so the handle stays grabbable and in
+        the same place the user left it, regardless of anything below.
+
+        But a headless anchored end (the tail of a single-headed arrow,
+        or either end of a Plain Line) has no arrowhead that needs a
+        precise point to sit on. For that end specifically, the drawn
+        shaft is instead run all the way to target's own center: since
+        target's own opaque box paints over the part of the shaft that
+        ends up underneath it, this reads as the line being anchored to
+        the component as a whole rather than merely grazing its edge -
+        while the green handle (see above) stays put on the border,
+        still exactly where it's always been, still the actual anchor
+        point that's saved/restored and still what you grab to detach
+        it. An anchored end *with* an arrowhead is unaffected: the head
+        still needs to stay visible, so it keeps stopping exactly at the
+        border point returned by _border_point.
+
+        Free (unanchored) endpoints are always returned as-is."""
+        p1, p2 = self.p1, self.p2
+        if self.anchor1 is not None and not self._endpoint_has_arrowhead(1):
+            target = self._live_anchor_target(self.anchor1)
+            if target is not None:
+                p1 = self.mapFromScene(target.sceneBoundingRect().center())
+        if self.anchor2 is not None and not self._endpoint_has_arrowhead(2):
+            target = self._live_anchor_target(self.anchor2)
+            if target is not None:
+                p2 = self.mapFromScene(target.sceneBoundingRect().center())
+        return p1, p2
+
+    @staticmethod
+    def _live_anchor_target(anchor):
+        """Return anchor["item"] if it's still a live, in-scene
+        component, or None if its target has been (or is mid-being)
+        destroyed - e.g. by MindMapScene.clear_board() tearing down a
+        board during navigation. `target.scene()` raises RuntimeError
+        rather than returning None once the target's underlying C++
+        object is actually deleted (as opposed to merely removed from
+        the scene, which is what the plain "target.scene() is not
+        None" check elsewhere in this class was already handling) -
+        that unhandled RuntimeError, raised from inside boundingRect()/
+        paint() while Qt itself is mid-repaint, is what crashed the app
+        instead of just quietly rendering the arrow as if this end were
+        unanchored the moment its target vanished. Every place that
+        reads an anchor's target for rendering/geometry should go
+        through this instead of touching anchor["item"] directly."""
+        if anchor is None:
+            return None
+        target = anchor.get("item")
+        if target is None:
+            return None
+        try:
+            if target.scene() is None:
+                return None
+        except RuntimeError:
+            return None
+        return target
 
     def _set_anchor(self, endpoint, target, scene_pt):
         _local_edge, (rx, ry), side = self._border_point(target, scene_pt)
@@ -3451,24 +3627,18 @@ class ArrowItem(BaseComponentItem):
 
     def _anchor_scene_point(self, anchor, other_scene_pt):
         """Where an anchored endpoint sits on its target's outer border:
-        the nearest point on the target's rectangle to `other_scene_pt`
-        (the arrow's other endpoint's actual current position), via the
-        same _border_point() computation used live while dragging an
+        the point where the ray from target's own center toward
+        `other_scene_pt` (the arrow's other endpoint's actual current
+        position) crosses target's rectangle, via the same
+        _border_point() computation used live while dragging an
         endpoint into place - so the preview, the drop, and every later
         refresh all agree on exactly the same point for the same inputs.
 
-        Using the other endpoint's actual point (rather than its
-        target's geometric center, as an earlier version did) is what
-        lets an anchor "orbit" its own target correctly: as the other
-        end moves far enough that hugging the current edge would start
-        drawing the line back across the target's own body, the nearest
-        border point naturally slides onto a neighboring edge instead -
-        rotating the anchor to avoid the overlap - since _border_point
-        already handles a point sitting outside the box on one or both
-        axes without corner artifacts (see its own docstring). Center-
-        based projection didn't have that property: it overshoots and
-        clamps into a corner as soon as the two targets aren't roughly
-        aligned, which is a completely normal layout, not an edge case.
+        This is what makes an anchored endpoint genuinely "orbit" its
+        own target: as the other end moves all the way around target,
+        this point continuously slides all the way around target's
+        border to keep facing it - see _border_point's own docstring for
+        the actual ray/box intersection this relies on.
 
         anchor's rx/ry/side are updated here to whatever was just
         computed, so a saved board reloads already facing the way it
@@ -3530,15 +3700,15 @@ class ArrowItem(BaseComponentItem):
         # snap it back onto the target, making it look impossible to pull
         # the anchored endpoint away at all.
         if self.anchor1 is not None and self._drag_endpoint != 1:
-            target = self.anchor1.get("item")
-            if target is None or target.scene() is None:
+            target = self._live_anchor_target(self.anchor1)
+            if target is None:
                 self.anchor1 = None
             elif mover is target:
                 p1_scene = self._anchor_scene_point(self.anchor1, p2_scene)
                 changed = True
         if self.anchor2 is not None and self._drag_endpoint != 2:
-            target = self.anchor2.get("item")
-            if target is None or target.scene() is None:
+            target = self._live_anchor_target(self.anchor2)
+            if target is None:
                 self.anchor2 = None
             elif mover is target:
                 p2_scene = self._anchor_scene_point(self.anchor2, p1_scene)
@@ -3704,7 +3874,8 @@ class ArrowItem(BaseComponentItem):
         pen.setStyle(self._qt_dash_style())
         painter.setPen(pen)
 
-        dx, dy = self.p2.x() - self.p1.x(), self.p2.y() - self.p1.y()
+        r_p1, r_p2 = self._render_endpoints()
+        dx, dy = r_p2.x() - r_p1.x(), r_p2.y() - r_p1.y()
         length = max(0.0001, math.hypot(dx, dy))
         ux, uy = dx / length, dy / length
 
@@ -3717,22 +3888,22 @@ class ArrowItem(BaseComponentItem):
         # letting the solid triangle cover the rest) keeps the point sharp
         # at any stroke width.
         back = self._head_back_distance()
-        line_p1, line_p2 = self.p1, self.p2
+        line_p1, line_p2 = r_p1, r_p2
         if self.style == "double":
             b = min(back, length * 0.45)
-            line_p1 = QPointF(self.p1.x() + ux * b, self.p1.y() + uy * b)
-            line_p2 = QPointF(self.p2.x() - ux * b, self.p2.y() - uy * b)
+            line_p1 = QPointF(r_p1.x() + ux * b, r_p1.y() + uy * b)
+            line_p2 = QPointF(r_p2.x() - ux * b, r_p2.y() - uy * b)
         elif self.style == "single":
             b = min(back, length * 0.9)
-            line_p2 = QPointF(self.p2.x() - ux * b, self.p2.y() - uy * b)
+            line_p2 = QPointF(r_p2.x() - ux * b, r_p2.y() - uy * b)
         painter.drawLine(line_p1, line_p2)
 
         painter.setBrush(col)
         painter.setPen(Qt.NoPen)
         if self.style in ("single", "double"):
-            painter.drawPath(self._arrow_head_path(self.p2, ux, uy))
+            painter.drawPath(self._arrow_head_path(r_p2, ux, uy))
         if self.style == "double":
-            painter.drawPath(self._arrow_head_path(self.p1, -ux, -uy))
+            painter.drawPath(self._arrow_head_path(r_p1, -ux, -uy))
 
         if self.isSelected():
             # Anchored endpoints are drawn differently from free ones (a
@@ -3831,7 +4002,8 @@ class ArrowItem(BaseComponentItem):
 
     def to_html(self):
         css_color = color_to_css(self.color)
-        dx, dy = self.p2.x() - self.p1.x(), self.p2.y() - self.p1.y()
+        r_p1, r_p2 = self._render_endpoints()
+        dx, dy = r_p2.x() - r_p1.x(), r_p2.y() - r_p1.y()
         length = max(0.0001, math.hypot(dx, dy))
         ux, uy = dx / length, dy / length
         size = max(8, self.stroke_width * 3)
@@ -3848,21 +4020,21 @@ class ArrowItem(BaseComponentItem):
         # Same fix as paint(): pull the shaft's endpoint back to the head's
         # flat base edge so the round line-cap doesn't blunt the tip.
         back = size * math.cos(spread)
-        line_p1x, line_p1y = self.p1.x(), self.p1.y()
-        line_p2x, line_p2y = self.p2.x(), self.p2.y()
+        line_p1x, line_p1y = r_p1.x(), r_p1.y()
+        line_p2x, line_p2y = r_p2.x(), r_p2.y()
         if self.style == "double":
             b = min(back, length * 0.45)
-            line_p1x, line_p1y = self.p1.x() + ux * b, self.p1.y() + uy * b
-            line_p2x, line_p2y = self.p2.x() - ux * b, self.p2.y() - uy * b
+            line_p1x, line_p1y = r_p1.x() + ux * b, r_p1.y() + uy * b
+            line_p2x, line_p2y = r_p2.x() - ux * b, r_p2.y() - uy * b
         elif self.style == "single":
             b = min(back, length * 0.9)
-            line_p2x, line_p2y = self.p2.x() - ux * b, self.p2.y() - uy * b
+            line_p2x, line_p2y = r_p2.x() - ux * b, r_p2.y() - uy * b
 
         heads = []
         if self.style in ("single", "double"):
-            heads.append(f'<polygon points="{head_polygon(self.p2.x(), self.p2.y(), ux, uy)}" fill="{css_color}"/>')
+            heads.append(f'<polygon points="{head_polygon(r_p2.x(), r_p2.y(), ux, uy)}" fill="{css_color}"/>')
         if self.style == "double":
-            heads.append(f'<polygon points="{head_polygon(self.p1.x(), self.p1.y(), -ux, -uy)}" fill="{css_color}"/>')
+            heads.append(f'<polygon points="{head_polygon(r_p1.x(), r_p1.y(), -ux, -uy)}" fill="{css_color}"/>')
         dash = self._dasharray()
         dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
         svg = (
@@ -3908,7 +4080,7 @@ class ArrowItem(BaseComponentItem):
                 f'{text}</div>'
             )
         return (
-            f'<div class="comp arrow-note" style="left:{self.pos().x()}px;'
+            f'<div class="comp arrow-note" data-id="{self.id}" style="left:{self.pos().x()}px;'
             f'top:{self.pos().y()}px;width:{self._w}px;height:{self._h}px;">{svg}{label_html}</div>'
         )
 
@@ -4573,7 +4745,7 @@ class TableItem(BaseComponentItem):
             f'<tbody>{"".join(body_rows)}</tbody></table>'
         )
         return (
-            f'<div class="comp table-note" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
+            f'<div class="comp table-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;opacity:{self.opacity():.2f}">{table_html}</div>'
         )
 
@@ -4797,6 +4969,41 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         # (tracked via QPixmap.cacheKey(), which changes on every new gif
         # frame) so animated gif subitems keep animating correctly.
         self._subitem_scaled_cache = {}
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemSceneHasChanged and value is None:
+            # This card just left the scene (deleted, or a whole board
+            # torn down by MindMapScene.clear_board() - e.g. navigating
+            # to another board and back). GifItem.itemChange and
+            # VideoPlayerNode.itemChange already do this for a
+            # *standalone* gif/video component's own single movie/player -
+            # but a BoardCardItem manages a whole dict of these per
+            # embedded subitem (self._gif_movies / self._video_proxies),
+            # and nothing was ever stopping *those* on scene removal.
+            # Each QMovie's frameChanged is connected to a closure
+            # (_get_or_create_gif_movie's _on_frame) that captures this
+            # card itself and calls self.update() on every frame - so an
+            # unstopped movie keeps this card (and everything it in turn
+            # holds/prunes) alive and animating indefinitely, invisibly,
+            # in the background. Repeatedly visiting a board with N
+            # embedded gif/video subitems and navigating away without
+            # this leaked N more still-running movies/players every
+            # single time - the accumulating panning/zoom sluggishness
+            # (see MindMapScene.clear_board's sceneRect note) as well as
+            # steadily climbing memory/CPU use the longer a session ran.
+            for entry in self._gif_movies.values():
+                movie = entry["movie"]
+                movie.stop()
+                try:
+                    movie.frameChanged.disconnect()
+                except (RuntimeError, TypeError):
+                    pass  # already disconnected / no receivers left
+            self._gif_movies = {}
+            for node in self._video_proxies.values():
+                if getattr(node, "player", None) is not None:
+                    node.player.stop()
+            self._video_proxies = {}
+        return super().itemChange(change, value)
 
     def _recalc_title_height(self):
         """Grow (or shrink back) the title bar to fit however many lines
@@ -5473,9 +5680,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         QGraphicsObject.hoverMoveEvent(self, event)
 
     def mousePressEvent(self, event):
-        scene = self.scene()
-        if scene is not None and hasattr(scene, "bring_to_front"):
-            scene.bring_to_front(self)
+        self._raised_this_press = False
         if event.button() == Qt.LeftButton and not (
             self.isSelected() and self.handle_rect().contains(event.pos())
         ):
@@ -5501,6 +5706,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                     event.accept()
                     return
                 self._drag_sub_moved = True
+                self._raise_to_front_if_needed()
                 if self.scene() is not None:
                     self._drag_ghost = SubitemDragGhost(self.subitems[self._drag_sub_index])
                     self.scene().addItem(self._drag_ghost)
@@ -5930,7 +6136,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         # here instead of silently inheriting .board-title's CSS default.
         title_color_css = color_to_css(self.title_item.defaultTextColor().name())
         return (
-            f'<div class="comp board-card" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
+            f'<div class="comp board-card" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;min-height:{self._h}px;background:{bg_css};">{self._top_strip_html()}'
             f'<div class="board-title" style="color:{title_color_css};">{title}</div>'
             f'<div class="board-body">{"".join(rows)}</div></div>'
@@ -6041,12 +6247,42 @@ class BoardLinkItem(BaseComponentItem):
     """
     TYPE_NAME = "board_link"
     DEFAULT_COLOR = "#233047"
+    # Same default text color as TextNoteItem, so the description field
+    # reads exactly like a Text Note's body text against this card's own
+    # dark background.
+    DEFAULT_DESC_COLOR = "#e8e8e8"
+    DESC_MIN_H = 30
 
     def __init__(self, x=0, y=0, w=220, h=120, title="Board", target_file="", item_id=None,
-                 thumb_mime=None, thumb_data=None):
+                 thumb_mime=None, thumb_data=None, description="", show_description=False,
+                 description_font=None, description_color=None, description_html=None):
         super().__init__(x, y, w, h, item_id)
         self.title = title or "Board"
         self.target_file = target_file or ""
+        # Optional toggleable description field - toggled via the same
+        # "Show Description" toolbar checkbox / context-menu entry idea
+        # as Text Note's "Title" toggle, and backed by the exact same
+        # EditableTextItem field TextNoteItem uses for its own body text
+        # (see TextNoteItem.text_item above), just parented to this card
+        # instead and painted below the title/subtitle.
+        self.show_description = bool(show_description)
+        self._desc_h = 0
+        self._desc_autosizing = False
+        self.description_item = EditableTextItem(self)
+        self.description_item.setDefaultTextColor(
+            QColor(description_color) if description_color else QColor(self.DEFAULT_DESC_COLOR)
+        )
+        self.description_item.setFont(
+            _font_from_dict(description_font, base_family="Segoe UI", base_size=11.0)
+            if description_font else QFont("Segoe UI", 11)
+        )
+        self.description_item.setPlainText(description)
+        self.description_item.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.description_item.document().setDocumentMargin(0)
+        if description_html:
+            self.description_item.document().setHtml(description_html)
+        self.description_item.setVisible(self.show_description)
+        self.description_item.document().contentsChanged.connect(self._on_description_changed)
         # Optional custom icon/thumbnail for this shortcut card - an
         # uploaded image or SVG file, stored (and exported) as a base64
         # `data:` URI exactly like any other embedded image. Set/changed
@@ -6089,6 +6325,64 @@ class BoardLinkItem(BaseComponentItem):
         self._count_stale = True
         self.update()
 
+    # -- description (toggleable text field, same mechanics as
+    #    TextNoteItem's own body text) -------------------------------
+    def _recalc_desc_height(self):
+        """Fit the description band to its current text - grows for a
+        longer description, same idea as TextNoteItem._recalc_title_height,
+        never shrinks below DESC_MIN_H."""
+        self.description_item.setTextWidth(max(10, self._w - 24))
+        if not self.show_description:
+            self._desc_h = 0
+            return
+        doc_h = self.description_item.document().size().height()
+        self._desc_h = max(self.DESC_MIN_H, doc_h + 14)
+
+    def _desc_bar_h(self):
+        return self._desc_h if self.show_description else 0
+
+    def font_targets(self, editing_item=None):
+        """What the toolbar's Font/B/I/U/Size controls (and the Color
+        button while editing - see MainWindow.pick_color) should restyle:
+        the description field, exactly like TextNoteItem.font_targets
+        returns its own single text_item."""
+        return [self.description_item]
+
+    def _grow_by_desc_delta(self, old_desc_h):
+        """Common tail of toggling/typing the description: fit the card's
+        own height to however much the description band just grew or
+        shrank, the same auto-sizing idea as TextNoteItem._on_text_changed
+        (grows for more text, shrinks back down for less, guarded against
+        re-entrant recalculation while resizing)."""
+        delta = self._desc_h - old_desc_h
+        if not delta:
+            return
+        self._desc_autosizing = True
+        try:
+            self.set_size(self._w, self._h + delta)
+        finally:
+            self._desc_autosizing = False
+
+    def _toggle_show_description(self):
+        self.show_description = not self.show_description
+        self.description_item.setVisible(self.show_description)
+        old_desc_h = self._desc_h
+        self._recalc_desc_height()
+        self._grow_by_desc_delta(old_desc_h)
+        self.update()
+
+    def _on_description_changed(self):
+        if self._desc_autosizing:
+            return
+        old_desc_h = self._desc_h
+        self._recalc_desc_height()
+        if self.show_description:
+            self._grow_by_desc_delta(old_desc_h)
+        self.update()
+
+    def on_resized(self):
+        self._recalc_desc_height()
+
     # -- thumbnail/icon ---------------------------------------------------
     def set_thumbnail(self, mime, data):
         """Set (mime, data) to a base64 `data:` payload to give this card
@@ -6118,7 +6412,27 @@ class BoardLinkItem(BaseComponentItem):
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
-                data = extract_scene_data(f.read())
+                html = f.read()
+        except Exception:
+            self._cached_count = None
+            return
+        # Fast path: just the small mindmap-meta tag - present on any
+        # board saved since this existed, and cheap regardless of how
+        # many/how large the images on the target board are, since it
+        # never touches the (potentially many-megabyte) main data blob.
+        meta = extract_scene_meta(html)
+        if meta is not None and "item_count" in meta:
+            self._cached_count = meta["item_count"]
+            return
+        # Fallback for a board saved by an older version of the app,
+        # before mindmap-meta existed: this decodes the *entire* target
+        # board, images included, purely to count its items - genuinely
+        # slow for a photo-heavy board, which is why paint() only ever
+        # calls this once per rename/creation (see _count_stale) rather
+        # than on every repaint. Re-saving the target file adds the meta
+        # tag, so this slow path is only ever hit once per such file.
+        try:
+            data = extract_scene_data(html)
             self._cached_count = len(data.get("items", [])) if data else 0
         except Exception:
             self._cached_count = None
@@ -6126,12 +6440,20 @@ class BoardLinkItem(BaseComponentItem):
     # -- painting -----------------------------------------------------
     def paint(self, painter, option, widget=None):
         self._refresh_count()
+        self._recalc_desc_height()
         rect = self.rect()
         painter.setRenderHint(QPainter.Antialiasing)
         bg = QColor(self.color or self.DEFAULT_COLOR)
         painter.setBrush(bg)
         painter.setPen(QPen(QColor("#4c8bf5"), 2) if self.isSelected() else QPen(QColor("#111111"), 1))
         painter.drawRoundedRect(rect, 10, 10)
+
+        # Leave room at the bottom for the (optional) description band,
+        # exactly like TextNoteItem reserves _title_bar_h() at the top -
+        # everything else below (thumbnail/title/subtitle) lays out
+        # inside content_h instead of the card's full height.
+        desc_h = self._desc_bar_h()
+        content_h = max(40.0, rect.height() - desc_h)
 
         missing = self.target_file and self._project_dir() and not os.path.exists(self._target_path() or "")
         thumb = self._get_thumb_pixmap()
@@ -6140,7 +6462,7 @@ class BoardLinkItem(BaseComponentItem):
             # Custom thumbnail: bleed it across the top of the card (clipped
             # to the card's own rounded outline) and push the title/subtitle
             # into the band below it.
-            img_h = max(40.0, rect.height() * 0.58)
+            img_h = max(40.0, content_h * 0.58)
             img_rect = QRectF(0, 0, rect.width(), img_h)
             painter.save()
             clip_path = QPainterPath()
@@ -6165,10 +6487,10 @@ class BoardLinkItem(BaseComponentItem):
 
             painter.setPen(QColor("#ffffff"))
             painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
-            title_rect = QRectF(12, img_h + 6, rect.width() - 24, rect.height() - img_h - 28)
+            title_rect = QRectF(12, img_h + 6, rect.width() - 24, content_h - img_h - 28)
             painter.drawText(title_rect, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, self.title)
 
-            sub_rect = QRectF(12, rect.height() - 20, rect.width() - 24, 16)
+            sub_rect = QRectF(12, content_h - 20, rect.width() - 24, 16)
         else:
             # small "shortcut" glyph in the top-left corner (plain layout,
             # used whenever no custom thumbnail has been set)
@@ -6183,10 +6505,10 @@ class BoardLinkItem(BaseComponentItem):
 
             painter.setPen(QColor("#ffffff"))
             painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
-            title_rect = QRectF(12, 38, rect.width() - 24, rect.height() - 60)
+            title_rect = QRectF(12, 38, rect.width() - 24, content_h - 60)
             painter.drawText(title_rect, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, self.title)
 
-            sub_rect = QRectF(12, rect.height() - 24, rect.width() - 24, 18)
+            sub_rect = QRectF(12, content_h - 24, rect.width() - 24, 18)
 
         painter.setFont(QFont("Segoe UI", 8))
         if missing:
@@ -6198,10 +6520,24 @@ class BoardLinkItem(BaseComponentItem):
             label = f"{count} card{'s' if count != 1 else ''}" if count is not None else "Open board \u2192"
             painter.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
 
+        if self.show_description:
+            painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
+            painter.drawLine(QPointF(12, content_h), QPointF(rect.width() - 12, content_h))
+            self.description_item.setPos(12, content_h + 6)
+            self.description_item.setTextWidth(max(10, rect.width() - 24))
+
         self.paint_handle(painter)
 
     # -- navigation -----------------------------------------------------
     def mouseDoubleClickEvent(self, event):
+        if self.show_description and event.pos().y() >= (self._h - self._desc_bar_h()):
+            self.description_item.setTextInteractionFlags(Qt.TextEditorInteraction)
+            self.description_item.setFocus()
+            cursor = self.description_item.textCursor()
+            cursor.select(QTextCursor.Document)
+            self.description_item.setTextCursor(cursor)
+            event.accept()
+            return
         self.open_board()
         event.accept()
 
@@ -6224,6 +6560,10 @@ class BoardLinkItem(BaseComponentItem):
     def _build_context_menu(self, menu):
         self._open_action = menu.addAction("Open Board")
         menu.addSeparator()
+        self._desc_menu_action = menu.addAction("Description")
+        self._desc_menu_action.setCheckable(True)
+        self._desc_menu_action.setChecked(self.show_description)
+        menu.addSeparator()
         self._rename_action = menu.addAction("Rename Board (File && References)\u2026")
         self._set_thumb_action = menu.addAction(
             "Change Thumbnail\u2026" if self.thumb_data else "Set Thumbnail\u2026"
@@ -6237,6 +6577,8 @@ class BoardLinkItem(BaseComponentItem):
     def _handle_context_action(self, action):
         if action == self._open_action:
             self.open_board()
+        elif action == self._desc_menu_action:
+            self._toggle_show_description()
         elif action == self._rename_action:
             self._rename_referenced_board()
         elif action == self._set_thumb_action:
@@ -6433,6 +6775,14 @@ class BoardLinkItem(BaseComponentItem):
         if self.thumb_data:
             d["thumb_mime"] = self.thumb_mime
             d["thumb_data"] = self.thumb_data
+        d["description"] = self.description_item.toPlainText()
+        d["show_description"] = self.show_description
+        d["description_font"] = _font_to_dict(self.description_item.font())
+        d["description_color"] = self.description_item.defaultTextColor().name()
+        # Full rich-text fidelity, same pattern as TextNoteItem.serialize's
+        # text_html - the plain "description" string above stays as a
+        # simple fallback for anything that only reads that.
+        d["description_html"] = self.description_item.document().toHtml()
         return d
 
     def to_html(self):
@@ -6443,13 +6793,25 @@ class BoardLinkItem(BaseComponentItem):
             # Embedded exactly like any other image in the app - a plain
             # base64 `data:` URI, self-contained inside the exported HTML.
             thumb_html = f'<img class="board-link-thumb" src="data:{self.thumb_mime};base64,{self.thumb_data}"/>'
+        desc_html = ""
+        if self.show_description and self.description_item.toPlainText().strip():
+            # Same helper TextNoteItem.to_html uses, so the exported
+            # description mirrors exactly what's shown in the app,
+            # per-character formatting included.
+            df = self.description_item.font()
+            desc_text = _qtextdocument_to_web_html(
+                self.description_item.document(), base_family=df.family(), base_size=df.pointSizeF()
+            )
+            desc_color_css = color_to_css(self.description_item.defaultTextColor().name())
+            desc_html = f'<div class="board-link-desc" style="color:{desc_color_css}">{desc_text}</div>'
         return (
-            f'<a class="comp board-link-card" href="{href}" '
+            f'<a class="comp board-link-card" data-id="{self.id}" href="{href}" '
             f'style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;">'
             f'{thumb_html}'
             f'<div class="board-link-title">{title}</div>'
-            f'<div class="board-link-sub">Open board \u2192</div></a>'
+            f'<div class="board-link-sub">Open board \u2192</div>'
+            f'{desc_html}</a>'
         )
 
 
@@ -6722,6 +7084,9 @@ def deserialize_component(d):
         item = BoardLinkItem(
             x, y, w, h, title=d.get("title", "Board"), target_file=d.get("target_file", ""),
             item_id=item_id, thumb_mime=d.get("thumb_mime"), thumb_data=d.get("thumb_data"),
+            description=d.get("description", ""), show_description=d.get("show_description", False),
+            description_font=d.get("description_font"), description_color=d.get("description_color"),
+            description_html=d.get("description_html"),
         )
     elif t == "table":
         item = TableItem(
@@ -6807,9 +7172,104 @@ class _ArrowAnchorEndpointMarkers(QGraphicsObject):
             painter.drawEllipse(pt, self.R + 3, self.R + 3)
 
 
+# --------------------------------------------------------------------------
+# Diagnostics (opt-in): board-switch item/memory snapshots, used to track
+# down the "panning/zoom gets heavier the more boards I open" report. Off
+# by default so normal usage never pays for it or spams stderr - set
+# OPENNOTE_DEBUG_PERF=1 in the environment to turn it on for a debugging
+# session. Called from MindMapScene.clear_board()/load() below.
+# --------------------------------------------------------------------------
+_PERF_DEBUG = os.environ.get("OPENNOTE_DEBUG_PERF") == "1"
+
+
+def _debug_perf_snapshot(label):
+    if not _PERF_DEBUG:
+        return
+    # gc.collect() first: without it, objects only involved in reference
+    # cycles (e.g. Qt signal/slot closures) may still be *pending*
+    # collection rather than actually unreachable, which would make a
+    # real leak look identical to a merely-not-yet-swept cycle in the
+    # counts below.
+    gc.collect()
+    counts = {}
+    for obj in gc.get_objects():
+        if isinstance(obj, BaseComponentItem):
+            name = type(obj).__name__
+            counts[name] = counts.get(name, 0) + 1
+    total = sum(counts.values())
+    rss_str = "n/a"
+    try:
+        import resource
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is KB on Linux, bytes on macOS.
+        rss_mb = rss_kb / 1024 if sys.platform != "darwin" else rss_kb / (1024 * 1024)
+        rss_str = f"{rss_mb:.1f} MB"
+    except Exception:
+        pass
+    detail = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    print(f"[PERF] {label}: live_component_items={total} ({detail}) | RSS={rss_str}",
+          file=sys.stderr)
+
+
+def _debug_describe_referrers(obj):
+    """For a leaked item still reachable after clear_board()'s teardown +
+    gc.collect(), walk gc.get_referrers() to name whatever's actually
+    holding onto it - a MainWindow/scene attribute (most likely: one of
+    the toolbar "current selection" caches like _other_selection /
+    _top_strip_selection, if it wasn't re-cleared by a selectionChanged
+    handler firing mid-teardown), a stray list, etc. One extra hop is
+    walked for list/tuple/set referrers so a "held in a list" result also
+    names the *owner* of that list, not just "some list somewhere"."""
+    if not _PERF_DEBUG:
+        return
+    findings = []
+    for ref in gc.get_referrers(obj):
+        if isinstance(ref, _types.FrameType):
+            continue  # this function's own locals, not a real leak
+        if isinstance(ref, dict):
+            owner = None
+            for o in gc.get_referrers(ref):
+                if isinstance(o, _types.FrameType):
+                    continue
+                if getattr(o, "__dict__", None) is ref:
+                    owner = o
+                    break
+            keys = [k for k, v in list(ref.items()) if v is obj]
+            findings.append(f"{type(owner).__name__ if owner else '?'}.__dict__ attr(s)={keys}")
+        elif isinstance(ref, (list, tuple, set)):
+            owner = None
+            owner_attr = None
+            for o in gc.get_referrers(ref):
+                if isinstance(o, _types.FrameType):
+                    continue
+                if isinstance(o, dict):
+                    for oo in gc.get_referrers(o):
+                        if isinstance(oo, _types.FrameType):
+                            continue
+                        if getattr(oo, "__dict__", None) is o:
+                            owner = oo
+                            owner_attr = [k for k, v in o.items() if v is ref]
+                            break
+            findings.append(
+                f"{type(ref).__name__}(len={len(ref)}) in "
+                f"{type(owner).__name__ if owner else '?'}.{owner_attr}"
+            )
+        else:
+            findings.append(type(ref).__name__)
+    print(f"[PERF-LEAK] {type(obj).__name__} id={id(obj)} still referenced by: {findings}",
+          file=sys.stderr)
+
+
 class MindMapScene(QGraphicsScene):
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Explicit reference to MainWindow (rather than relying on Qt's
+        # QObject parent() - parent here is only ever main_window in
+        # practice, but storing it directly keeps drawBackground's prefs
+        # lookup independent of that assumption). Set right after
+        # construction in MainWindow.__init__; may be None briefly during
+        # construction/tests, so drawBackground guards for that.
+        self.main_window = None
         self.setSceneRect(-5000, -5000, 10000, 10000)
         self.setBackgroundBrush(QColor("#101012"))
         self.draw_mode = False
@@ -6991,6 +7451,21 @@ class MindMapScene(QGraphicsScene):
         # Figma/Miro-style canvases keep their background grid affordable
         # however far out you zoom.
         scale = painter.transform().m11() or 1.0
+
+        # Even with the doubling trick above, the capped point set (still
+        # a couple thousand QPointF objects, built fresh in Python) is
+        # rebuilt and drawn on EVERY repaint - i.e. continuously while
+        # panning or zooming, not just once. Skipping it altogether once
+        # the view is zoomed out past the user's configured threshold
+        # (Preferences > "Optimize grid rendering") removes that constant
+        # per-frame cost, and the dots are barely perceptible at that
+        # zoom level anyway.
+        prefs = getattr(self.main_window, "prefs", None) if self.main_window else None
+        if prefs and prefs.get("optimize_grid_rendering", True):
+            threshold_pct = prefs.get("grid_disable_zoom_percent", 15.0)
+            if scale * 100.0 <= threshold_pct:
+                return
+
         grid = self.GRID_SPACING
         while grid * scale < self.MIN_SCREEN_SPACING:
             grid *= 2
@@ -7251,20 +7726,100 @@ class MindMapScene(QGraphicsScene):
         return [it for it in self.items() if isinstance(it, BaseComponentItem)]
 
     def serialize(self):
-        return {"items": [it.serialize() for it in self.all_component_items()]}
+        # Sorted by id (a fixed, stable identifier - see
+        # BaseComponentItem.__init__/new_id()) rather than left in
+        # self.items()'s own traversal order: that order is Qt's current
+        # stacking order, and for two items that happen to share the
+        # same zValue(), its tie-break isn't guaranteed to stay fixed
+        # across calls - it can shift once Qt's internal scene index
+        # gets rebuilt, which the very first repaint after a board loads
+        # is enough to trigger. Since z-order is already captured
+        # per-item in each dict's own "z" field, this list's ordering
+        # carries no meaning of its own - but leaving it unstable meant
+        # two JSON snapshots of the exact same, entirely unedited board
+        # could still come out different purely because of *when* they
+        # were taken, which is what made _has_unsaved_changes() keep
+        # reporting phantom changes and prompting to save after every
+        # single navigation, whether anything was actually edited or not.
+        items = sorted(self.all_component_items(), key=lambda it: it.id)
+        return {"items": [it.serialize() for it in items]}
 
     def clear_board(self):
-        for it in list(self.all_component_items()):
-            self.removeItem(it)
+        # Drop selection/focus up front, before anything is actually
+        # removed: with nothing selected/focused, removing an item never
+        # has to shrink a *live* selection or move focus off a component
+        # that's about to be destroyed, which is what fired
+        # selectionChanged/focusItemChanged (and every handler hanging
+        # off them, in MainWindow and elsewhere) once per removed item,
+        # mid-teardown, on an already-partially-cleared scene - the
+        # main source of the crash-on-navigate-away bug (see
+        # MainWindow._load_board_file, which additionally resets its
+        # own stale item references before calling here).
+        _debug_perf_snapshot("clear_board: before teardown")
+        self.clearFocus()
+        self.clearSelection()
+        # weakref, not a plain list: a normal list of the items here would
+        # itself keep every one of them alive for as long as this list is
+        # in scope, which would make the leak-detection snapshots below
+        # always report "still referenced" even when nothing is actually
+        # wrong - the whole point is to observe what's left over once
+        # *this* function's own references are gone too.
+        _wrefs = [weakref.ref(it) for it in self.all_component_items()]
+        for wr in _wrefs:
+            it = wr()
+            if it is not None:
+                self.removeItem(it)
+        it = None
+        _debug_perf_snapshot("clear_board: after removeItem, before gc")
+        if _PERF_DEBUG:
+            gc.collect()
+            reported_types = set()
+            for wr in _wrefs:
+                obj = wr()
+                if obj is not None and type(obj) not in reported_types:
+                    reported_types.add(type(obj))
+                    _debug_describe_referrers(obj)
+            obj = None
+        _wrefs = None
+        # MindMapView._grow_scene_rect_if_needed() only ever grows
+        # sceneRect (see its own docstring) and this same MindMapScene
+        # instance is reused for every board opened in the session - so
+        # without resetting it here, panning/zooming around on ANY
+        # board (including one you've since navigated away from) left
+        # sceneRect permanently bloated for every board opened
+        # afterwards too. A huge sceneRect means a correspondingly huge
+        # internal spatial index (Qt's BSP tree, which is what panning/
+        # zoom's visible-item culling relies on), which is why panning
+        # and zooming kept getting more sluggish the more boards you
+        # visited in one sitting - and, combined with a GPU-backed
+        # QOpenGLWidget viewport and per-item DeviceCoordinateCache, is
+        # also a very plausible route to the degenerate (zero/garbage
+        # size) paint-device cache states seen at extreme zoom-out.
+        # Resetting back to the same default MindMapScene.__init__()
+        # starts with means each newly loaded board's viewport/scrollbar
+        # geometry is only ever grown from its own actual content again.
+        self.setSceneRect(-5000, -5000, 10000, 10000)
+        if _PERF_DEBUG:
+            _debug_perf_snapshot("clear_board: after sceneRect reset (should show 0 items if nothing leaked)")
 
-    def load(self, data):
+    def load(self, data, progress_callback=None):
+        """progress_callback(done, total), if given, is called after each
+        item is deserialized/added - used by MainWindow to drive the
+        bottom-left "Loading <board>... N%" status label while opening or
+        navigating to a board (see MainWindow._load_board_file). total is
+        the item count up front, so callers can turn it straight into a
+        percentage without tracking anything themselves."""
         self.clear_board()
         items = []
-        for d in data.get("items", []):
+        item_dicts = data.get("items", [])
+        total = len(item_dicts)
+        for i, d in enumerate(item_dicts, 1):
             item = deserialize_component(d)
             if item:
                 self.addItem(item)
                 items.append(item)
+            if progress_callback is not None:
+                progress_callback(i, total)
         id_map = {it.id: it for it in items}
         for it in items:
             if isinstance(it, ArrowItem):
@@ -7283,6 +7838,7 @@ class MindMapScene(QGraphicsScene):
         )
         for i, it in enumerate(arrow_items):
             it.setZValue(ARROW_Z_OFFSET + i)
+        _debug_perf_snapshot(f"load(): after adding {len(items)} items from file")
 
 
 # --------------------------------------------------------------------------
@@ -7357,6 +7913,10 @@ class MindMapView(QGraphicsView):
         self._growing_scene_rect = True
         try:
             scene.setSceneRect(left, top, right - left, bottom - top)
+            if _PERF_DEBUG:
+                r = scene.sceneRect()
+                print(f"[PERF] sceneRect grew to {r.width():.0f}x{r.height():.0f} "
+                      f"(area={r.width() * r.height():.3e})", file=sys.stderr)
         finally:
             self._growing_scene_rect = False
 
@@ -7377,6 +7937,7 @@ class MindMapView(QGraphicsView):
             factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
             self.scale(factor, factor)
             self._grow_scene_rect_if_needed()
+            self.main_window._update_zoom_label()
         else:
             super().wheelEvent(event)
 
@@ -7398,6 +7959,7 @@ class MindMapView(QGraphicsView):
         if scale:
             self.resetTransform()
             self.scale(scale, scale)
+            self.main_window._update_zoom_label()
         cx, cy = state.get("center_x"), state.get("center_y")
         if cx is not None and cy is not None:
             self.centerOn(cx, cy)
@@ -7554,6 +8116,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .board-link-thumb {{ display:block; flex:0 0 auto; width:calc(100% + 24px); height:55%; object-fit:cover; margin:-12px -12px 8px -12px; }}
   .board-link-title {{ font-weight:700; font-size:15px; color:#fff; }}
   .board-link-sub {{ font-size:11px; color:#9aa4b2; margin-top:4px; }}
+  .board-link-desc {{ font-size:13px; color:#e8e8e8; margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,.16); white-space:pre-wrap; word-break:break-word; }}
   #breadcrumb {{ position:fixed; top:0; left:0; right:0; z-index:20; background:#1b1b1b; border-bottom:1px solid #000; padding:8px 14px; font-size:13px; color:#aaa; }}
   #breadcrumb a {{ color:#8ab4ff; text-decoration:none; }}
   #breadcrumb a:hover {{ text-decoration:underline; }}
@@ -7570,6 +8133,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 </div>
 <div id="hint">Read-only view &mdash; scroll to zoom, drag to pan. Open with the OpenNote app to edit.</div>
+<script type="application/json" id="mindmap-meta">{meta_json}</script>
 <script type="application/json" id="mindmap-data">{json_data}</script>
 <script>
 (function() {{
@@ -7663,6 +8227,140 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   window.addEventListener('resize', fitInitialView);
 
   fitInitialView();
+
+  // --- Snapped-arrow correction ------------------------------------
+  // Every arrow's p1/p2 baked into its <svg> were computed against the
+  // *Qt* size of whatever it's anchored to (see ArrowItem.to_html() in
+  // the app). A card's actual rendered box in a browser can come out a
+  // different size than it was in Qt - most visibly board-card, whose
+  // CSS uses min-height (not height) so it can auto-grow to fit real
+  // browser font metrics (see the .board-body CSS comment above). When
+  // that happens the baked anchor point no longer sits on the card's
+  // true on-screen border/center, and a "snapped" arrow visibly drifts
+  // off the card it's supposed to be attached to.
+  //
+  // This pass re-derives each anchored endpoint from the target's
+  // *actual* rendered box (offsetLeft/Top/Width/Height - these are
+  // plain unscaled canvas-space pixels, unaffected by the pan/zoom
+  // transform on #canvas, since that transform is purely visual) using
+  // the same rx/ry border fraction (or dead-center, for a headless end)
+  // the app itself computed, then redraws that arrow's line/head(s)/
+  // label to match - so the exported page self-corrects regardless of
+  // any Qt-vs-browser layout difference, instead of trusting numbers
+  // that were only ever true back in the app.
+  try {{
+    var mmDataEl = document.getElementById('mindmap-data');
+    var mmData = mmDataEl ? JSON.parse(mmDataEl.textContent) : null;
+    var items = (mmData && mmData.items) || [];
+    var byId = {{}};
+    document.querySelectorAll('.comp[data-id]').forEach(function(el) {{
+      byId[el.getAttribute('data-id')] = el;
+    }});
+
+    function endpointHasHead(style, which) {{
+      if (which === 2) return style === 'single' || style === 'double';
+      return style === 'double';
+    }}
+
+    // Mirrors ArrowItem.to_html()'s head_polygon()/dasharray/trim math.
+    function buildArrowSvg(d, p1, p2) {{
+      var dx = p2.x - p1.x, dy = p2.y - p1.y;
+      var length = Math.max(0.0001, Math.hypot(dx, dy));
+      var ux = dx / length, uy = dy / length;
+      var strokeWidth = d.stroke_width || 4;
+      var size = Math.max(8, strokeWidth * 3);
+      var spread = 28 * Math.PI / 180;
+      var color = d.color || '#ffffff';
+
+      function headPolygon(tipX, tipY, dirx, diry) {{
+        var angle = Math.atan2(diry, dirx);
+        var lx = tipX - size * Math.cos(angle - spread);
+        var ly = tipY - size * Math.sin(angle - spread);
+        var rx = tipX - size * Math.cos(angle + spread);
+        var ry = tipY - size * Math.sin(angle + spread);
+        return tipX.toFixed(1) + ',' + tipY.toFixed(1) + ' ' +
+               lx.toFixed(1) + ',' + ly.toFixed(1) + ' ' +
+               rx.toFixed(1) + ',' + ry.toFixed(1);
+      }}
+
+      var back = size * Math.cos(spread);
+      var lp1x = p1.x, lp1y = p1.y, lp2x = p2.x, lp2y = p2.y;
+      if (d.style === 'double') {{
+        var b = Math.min(back, length * 0.45);
+        lp1x = p1.x + ux * b; lp1y = p1.y + uy * b;
+        lp2x = p2.x - ux * b; lp2y = p2.y - uy * b;
+      }} else if (d.style === 'single') {{
+        var b2 = Math.min(back, length * 0.9);
+        lp2x = p2.x - ux * b2; lp2y = p2.y - uy * b2;
+      }}
+
+      var heads = '';
+      if (d.style === 'single' || d.style === 'double') {{
+        heads += '<polygon points="' + headPolygon(p2.x, p2.y, ux, uy) + '" fill="' + color + '"/>';
+      }}
+      if (d.style === 'double') {{
+        heads += '<polygon points="' + headPolygon(p1.x, p1.y, -ux, -uy) + '" fill="' + color + '"/>';
+      }}
+      var dashAttr = '';
+      if (d.line_style === 'dashed') {{
+        dashAttr = ' stroke-dasharray="' + (strokeWidth * 2.5).toFixed(1) + ',' + (strokeWidth * 1.5).toFixed(1) + '"';
+      }} else if (d.line_style === 'dashdot') {{
+        dashAttr = ' stroke-dasharray="' + (strokeWidth * 2.5).toFixed(1) + ',' + (strokeWidth * 1.3).toFixed(1) +
+                   ',' + (strokeWidth * 0.6).toFixed(1) + ',' + (strokeWidth * 1.3).toFixed(1) + '"';
+      }}
+      return '<line x1="' + lp1x.toFixed(1) + '" y1="' + lp1y.toFixed(1) + '" x2="' + lp2x.toFixed(1) +
+             '" y2="' + lp2y.toFixed(1) + '" stroke="' + color + '" stroke-width="' + strokeWidth +
+             '" stroke-linecap="square"' + dashAttr + '/>' + heads;
+    }}
+
+    items.forEach(function(d) {{
+      if (d.type !== 'arrow' || (!d.anchor1 && !d.anchor2)) return;
+      var arrowEl = byId[d.id];
+      if (!arrowEl) return;
+      var svg = arrowEl.querySelector('svg');
+      if (!svg) return;
+
+      // Local (arrow-relative) points, defaulting to whatever was baked
+      // in - only overwritten below for an end that's actually anchored
+      // *and* whose target we can actually find in this document.
+      var p1 = {{ x: (d.p1 && d.p1[0]) || 0, y: (d.p1 && d.p1[1]) || 0 }};
+      var p2 = {{ x: (d.p2 && d.p2[0]) || 0, y: (d.p2 && d.p2[1]) || 0 }};
+      var changed = false;
+
+      [[d.anchor1, 1], [d.anchor2, 2]].forEach(function(pair) {{
+        var anchor = pair[0], which = pair[1];
+        if (!anchor) return;
+        var targetEl = byId[anchor.item_id];
+        if (!targetEl) return;
+        var tLeft = targetEl.offsetLeft, tTop = targetEl.offsetTop;
+        var tW = targetEl.offsetWidth, tH = targetEl.offsetHeight;
+        var scenePt;
+        if (endpointHasHead(d.style, which)) {{
+          scenePt = {{ x: tLeft + anchor.rx * tW, y: tTop + anchor.ry * tH }};
+        }} else {{
+          scenePt = {{ x: tLeft + tW / 2, y: tTop + tH / 2 }};
+        }}
+        var local = {{ x: scenePt.x - d.x, y: scenePt.y - d.y }};
+        if (which === 1) {{ p1 = local; }} else {{ p2 = local; }}
+        changed = true;
+      }});
+
+      if (changed) {{
+        svg.innerHTML = buildArrowSvg(d, p1, p2);
+        var labelEl = arrowEl.querySelector('.arrow-label');
+        if (labelEl) {{
+          var midX = (p1.x + p2.x) / 2, midY = (p1.y + p2.y) / 2;
+          labelEl.style.left = midX + 'px';
+          labelEl.style.top = midY + 'px';
+        }}
+      }}
+    }});
+  }} catch (e) {{
+    // Anchor correction is a best-effort visual touch-up; if anything
+    // above goes wrong, fall back silently to the baked-in geometry
+    // rather than breaking the rest of the exported page.
+    console.warn('Snapped-arrow correction skipped:', e);
+  }}
 }})();
 </script>
 </body>
@@ -7684,21 +8382,46 @@ def build_html_document(data):
     # clicked to raise it) - see BaseComponentItem/ArrowItem/BoardCardItem
     # mousePressEvent -> MindMapScene.bring_to_front.
     items_sorted = sorted(data.get("items", []), key=lambda d: d.get("z", 0))
+    built_items = []
     for d in items_sorted:
         item = deserialize_component(d)
         if item:
-            comps_html.append(item.to_html())
-            x, y = d.get("x", 0), d.get("y", 0)
-            w, h = d.get("w", 100), d.get("h", 100)
-            xs0.append(x)
-            ys0.append(y)
-            xs1.append(x + w)
-            ys1.append(y + h)
+            built_items.append((item, d))
+    # Anchored arrow endpoints (self.anchor1/anchor2) only exist as
+    # {"item_id","rx","ry"} dicts right after deserialize_component() -
+    # resolve_pending_anchors() needs every item to already be built
+    # first (an arrow's target may appear later in item order), same as
+    # MindMapScene.load() does. Without this, every exported arrow's
+    # anchor1/anchor2 stay None, so ArrowItem._render_endpoints() - used
+    # by to_html() - never takes the "headless anchored end -> target's
+    # own center" branch that paint() takes live in the app, and a
+    # snapped endpoint lands on the plain stored border point instead,
+    # which is what made snapped arrows drift out of place in the
+    # exported HTML.
+    id_map = {item.id: item for item, _ in built_items}
+    for item, _ in built_items:
+        if isinstance(item, ArrowItem):
+            item.resolve_pending_anchors(id_map)
+    for item, d in built_items:
+        comps_html.append(item.to_html())
+        x, y = d.get("x", 0), d.get("y", 0)
+        w, h = d.get("w", 100), d.get("h", 100)
+        xs0.append(x)
+        ys0.append(y)
+        xs1.append(x + w)
+        ys1.append(y + h)
     if xs0:
         bounds = {"x0": min(xs0), "y0": min(ys0), "x1": max(xs1), "y1": max(ys1)}
     else:
         bounds = {"x0": 0, "y0": 0, "x1": 800, "y1": 600}
     json_data = json.dumps(data).replace("</script>", "<\\/script>")
+    # Kept separate from json_data (rather than just adding a key to
+    # `data` itself) so a reader that only wants this - see
+    # BoardLinkItem._refresh_count() - can grab it with a cheap, tiny
+    # regex+json.loads instead of having to parse (and, worse, fully
+    # decode every embedded image's base64 text inside) the entire,
+    # potentially many-megabyte main data blob just to read one number.
+    meta_json = json.dumps({"item_count": len(data.get("items", []))})
     bounds_json = json.dumps(bounds)
     view_json = json.dumps(data.get("view"))
     breadcrumb = data.get("breadcrumb") or []
@@ -7721,8 +8444,8 @@ def build_html_document(data):
         breadcrumb_html = ""
         body_class = ""
     html = HTML_TEMPLATE.format(
-        components="\n".join(comps_html), json_data=json_data, bounds_json=bounds_json,
-        view_json=view_json, breadcrumb_html=breadcrumb_html,
+        components="\n".join(comps_html), json_data=json_data, meta_json=meta_json,
+        bounds_json=bounds_json, view_json=view_json, breadcrumb_html=breadcrumb_html,
     )
     if body_class:
         html = html.replace("<body>", f"<body{body_class}>", 1)
@@ -7732,6 +8455,28 @@ def build_html_document(data):
 def extract_scene_data(html):
     m = re.search(
         r'<script type="application/json" id="mindmap-data">(.*?)</script>',
+        html, re.DOTALL,
+    )
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return None
+
+
+def extract_scene_meta(html):
+    """The small, cheap-to-parse sibling of extract_scene_data(): reads
+    only the lightweight `mindmap-meta` tag (currently just
+    {"item_count": N}) a board file was saved with, without going
+    anywhere near the (for a photo-heavy board, potentially many
+    megabytes of base64-encoded image data) main `mindmap-data` blob.
+
+    Returns None if the tag is missing entirely - true for any board
+    saved by a version of the app before this tag existed - so callers
+    can fall back to the slower extract_scene_data() just that once."""
+    m = re.search(
+        r'<script type="application/json" id="mindmap-meta">(.*?)</script>',
         html, re.DOTALL,
     )
     if not m:
@@ -7935,6 +8680,34 @@ class PreferencesDialog(QDialog):
 
         layout.addLayout(form)
 
+        perf_label = QLabel("Performance")
+        perf_label.setStyleSheet("font-weight:600; margin-top:8px;")
+        layout.addWidget(perf_label)
+
+        perf_form = QFormLayout()
+        perf_form.setLabelAlignment(Qt.AlignLeft)
+
+        self.optimize_grid_checkbox = QCheckBox("Optimize grid rendering")
+        self.optimize_grid_checkbox.setToolTip(
+            "Skips drawing the background dot grid once you're zoomed out "
+            "past the threshold below, instead of rebuilding and redrawing "
+            "it on every single frame while panning/zooming."
+        )
+        self.optimize_grid_checkbox.setChecked(bool(prefs.get("optimize_grid_rendering", True)))
+        self.optimize_grid_checkbox.toggled.connect(self._on_optimize_grid_toggled)
+        perf_form.addRow(self.optimize_grid_checkbox)
+
+        self.grid_zoom_threshold_spin = QDoubleSpinBox()
+        self.grid_zoom_threshold_spin.setRange(1.0, 100.0)
+        self.grid_zoom_threshold_spin.setDecimals(0)
+        self.grid_zoom_threshold_spin.setSingleStep(5.0)
+        self.grid_zoom_threshold_spin.setSuffix(" %")
+        self.grid_zoom_threshold_spin.setValue(float(prefs.get("grid_disable_zoom_percent", 15.0)))
+        self.grid_zoom_threshold_spin.setEnabled(self.optimize_grid_checkbox.isChecked())
+        perf_form.addRow("Disable grid when zoom-out reaches:", self.grid_zoom_threshold_spin)
+
+        layout.addLayout(perf_form)
+
         apply_label = QLabel("Apply Font to All Components")
         apply_label.setStyleSheet("font-weight:600; margin-top:8px;")
         layout.addWidget(apply_label)
@@ -7960,6 +8733,9 @@ class PreferencesDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _on_optimize_grid_toggled(self, checked):
+        self.grid_zoom_threshold_spin.setEnabled(checked)
+
     def _on_set_font_clicked(self):
         family = self.apply_font_combo.currentFont().family()
         count = self.main_window.apply_font_to_all_boards(family)
@@ -7976,7 +8752,10 @@ class PreferencesDialog(QDialog):
         self.main_window.prefs["default_title_font_size"] = self.title_size_spin.value()
         self.main_window.prefs["default_description_font_size"] = self.desc_size_spin.value()
         self.main_window.prefs["default_arrow_size"] = self.arrow_size_spin.value()
+        self.main_window.prefs["optimize_grid_rendering"] = self.optimize_grid_checkbox.isChecked()
+        self.main_window.prefs["grid_disable_zoom_percent"] = self.grid_zoom_threshold_spin.value()
         save_app_preferences(self.main_window.prefs)
+        self.main_window.scene.update()
         self.accept()
 
 
@@ -7998,6 +8777,7 @@ class MainWindow(QMainWindow):
         self.prefs = load_app_preferences()
 
         self.scene = MindMapScene(self)
+        self.scene.main_window = self
         self.view = MindMapView(self.scene, self, self)
 
         # -- breadcrumb bar (nested-boards navigation) -----------------
@@ -8104,6 +8884,17 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Ready \u2014 Middle-mouse drag to pan \u00b7 Ctrl+Wheel to zoom \u00b7 Ctrl+D duplicate \u00b7 Drag a card onto a Board to nest it"
         )
+        # -- status bar: zoom % (bottom-right, permanent) and board-load
+        # progress (bottom-left, normal widget so it sits to the left of/
+        # underneath any showMessage() text) - see _update_zoom_label /
+        # _set_loading_progress_label / _on_board_load_progress.
+        self.loading_label = QLabel()
+        self.statusBar().addWidget(self.loading_label)
+        self.zoom_label = QLabel()
+        self.statusBar().addPermanentWidget(self.zoom_label)
+        self._loading_progress_shown_pct = -1
+        self._loading_progress_last_paint = 0.0
+        self._update_zoom_label()
         self._update_breadcrumb_bar()
         # -- unsaved-changes tracking -------------------------------------
         # A snapshot of the last saved (or freshly loaded/started) state,
@@ -8394,6 +9185,16 @@ class MainWindow(QMainWindow):
         self.media_desc_checkbox.toggled.connect(self.on_media_desc_toggled)
         self.media_desc_checkbox_action.setVisible(False)
 
+        # Board Link's own toggleable description field - same toggle
+        # idea as Text Note's "Title" checkbox above, just for Board
+        # Link cards (see BoardLinkItem.show_description).
+        self.board_link_desc_checkbox = QCheckBox("  Description")
+        self.board_link_desc_checkbox.setStyleSheet(checkbox_style)
+        self.board_link_desc_checkbox.setFocusPolicy(Qt.NoFocus)
+        self.board_link_desc_checkbox_action = draw_tb.addWidget(self.board_link_desc_checkbox)
+        self.board_link_desc_checkbox.toggled.connect(self.on_board_link_desc_toggled)
+        self.board_link_desc_checkbox_action.setVisible(False)
+
         # Top Strip - available on Text Note, Image, GIF, Video and Board
         # Card (see TopStripMixin) - so this one checkbox covers several
         # otherwise-unrelated component types at once, unlike the
@@ -8634,8 +9435,17 @@ class MainWindow(QMainWindow):
         if editing_item is not None:
             self._last_edited_text_item = editing_item
         elif self._last_edited_text_item is not None:
-            parent = self._last_edited_text_item.parentItem()
-            if parent not in all_sel:
+            try:
+                parent = self._last_edited_text_item.parentItem()
+                still_referenced = parent in all_sel
+            except RuntimeError:
+                # Obiekt C++ już usunięty - dzieje się tak, gdy
+                # scene.load()/clear_board() kasuje starą planszę (np.
+                # powrót do głównego boarda) w trakcie gdy to wciąż był
+                # "sticky" ostatnio edytowany tekst, a selectionChanged/
+                # focusItemChanged odpalają się w trakcie tego teardownu.
+                still_referenced = False
+            if not still_referenced:
                 self._last_edited_text_item = None
         arrow_sel = [it for it in all_sel if isinstance(it, ArrowItem)]
         # An arrow's label joins the font-toolbar selection while its text
@@ -8686,12 +9496,16 @@ class MainWindow(QMainWindow):
             if not still_active:
                 self._active_text_board_card = None
         board_text_sel = [self._active_text_board_card] if self._active_text_board_card is not None else []
+        # Board Link's own description field (see BoardLinkItem.font_targets)
+        # should get the same Font/B/I/U/Size toolbar treatment as a Text
+        # Note's body text while it's being edited.
+        board_link_sel = [it for it in all_sel if isinstance(it, BoardLinkItem)]
         # Anything with a font to edit via the toolbar's Font/B/I/U/Size
         # controls - Text Note, plain Text, Table (whose cells each carry
         # their own font - see TableItem.font_targets), media items, an
-        # arrow's label, and a BoardCardItem's text subitem, each while
-        # being edited.
-        font_sel = text_sel + table_sel + media_sel + arrow_label_sel + board_text_sel
+        # arrow's label, a BoardCardItem's text subitem, and a Board
+        # Link's description field, each while being edited.
+        font_sel = text_sel + table_sel + media_sel + arrow_label_sel + board_text_sel + board_link_sel
         # Every other component type (Image/GIF/Video/BoardCard, ...) -
         # these only ever have a single "color" (border/fill), so the
         # Color button can restyle them directly whenever one is the
@@ -8763,11 +9577,20 @@ class MainWindow(QMainWindow):
             self.top_strip_checkbox.setChecked(top_strip_sel[0].top_strip_enabled)
             self.top_strip_checkbox.blockSignals(False)
 
+        self._board_link_selection = board_link_sel or None
+        self.board_link_desc_checkbox_action.setVisible(bool(board_link_sel))
+        if board_link_sel:
+            self.board_link_desc_checkbox.blockSignals(True)
+            self.board_link_desc_checkbox.setChecked(board_link_sel[0].show_description)
+            self.board_link_desc_checkbox.blockSignals(False)
+
         # Only show the leading separator (and its extra spacing) when at
         # least one of the checkboxes it introduces is actually visible -
         # otherwise it'd leave a stray divider mark on the toolbar even
         # with nothing selected.
-        self.checkbox_group_sep.setVisible(bool(text_note_sel or arrow_sel or media_sel or top_strip_sel))
+        self.checkbox_group_sep.setVisible(
+            bool(text_note_sel or arrow_sel or media_sel or top_strip_sel or board_link_sel)
+        )
 
         if editing_item is not None:
             # In-place text editing (or a text selection within it) takes
@@ -9381,6 +10204,13 @@ class MainWindow(QMainWindow):
             if it.top_strip_enabled != checked:
                 it._toggle_top_strip()
 
+    def on_board_link_desc_toggled(self, checked):
+        if not getattr(self, "_board_link_selection", None):
+            return
+        for it in self._board_link_selection:
+            if it.show_description != checked:
+                it._toggle_show_description()
+
     def toggle_draw_mode(self, checked):
         self.scene.draw_mode = checked
         self.view.setDragMode(QGraphicsView.NoDrag if checked else QGraphicsView.RubberBandDrag)
@@ -9765,26 +10595,50 @@ class MainWindow(QMainWindow):
         self._redo_stack.clear()
         self._update_undo_redo_actions()
 
-    def _reset_undo_history(self):
+    def _reset_undo_history(self, snapshot=None):
         """Start a fresh undo timeline at the current board state - used
         at startup and whenever the board content is replaced wholesale
         (New Board, New Project, Open, navigating to another board)
-        rather than edited in place."""
+        rather than edited in place. Pass a precomputed `snapshot` when
+        the caller already has one (e.g. _load_board_file) to avoid
+        serializing the whole board a second time."""
         self._undo_commit_timer.stop()
         self._undo_stack = []
         self._redo_stack = []
-        self._undo_baseline = self._current_snapshot()
+        self._undo_baseline = snapshot if snapshot is not None else self._current_snapshot()
         self._update_undo_redo_actions()
 
     def _update_undo_redo_actions(self):
         self.undo_action.setEnabled(bool(self._undo_stack))
         self.redo_action.setEnabled(bool(self._redo_stack))
 
+    def _reset_transient_item_refs(self):
+        """Null out every MainWindow-side reference that can point
+        directly at a component (or one of its child text items) -
+        called right before scene.load() wholesale-replaces the board's
+        contents (a fresh Open/navigate, or an undo/redo), so nothing is
+        left dangling at a destroyed item once clear_board()'s own
+        local references (the only thing keeping such items alive
+        through the teardown) go out of scope. See _load_board_file for
+        the fuller explanation of why this matters."""
+        self._last_edited_text_item = None
+        self._active_label_arrow = None
+        self._active_text_board_card = None
+        self._editing_selection = None
+        self._text_selection = None
+        self._font_selection = None
+        self._arrow_selection = None
+        self._other_selection = None
+        self._text_note_selection = None
+        self._media_selection = None
+        self._top_strip_selection = None
+
     def _restore_undo_snapshot(self, snapshot_json):
         self._undo_restoring = True
         try:
             data = json.loads(snapshot_json)
             self.scene.clearSelection()
+            self._reset_transient_item_refs()
             self.scene.load(data)
         finally:
             self._undo_restoring = False
@@ -9829,8 +10683,8 @@ class MainWindow(QMainWindow):
             # "nothing to warn about".
             return None
 
-    def _update_saved_snapshot(self):
-        self._saved_snapshot = self._current_snapshot()
+    def _update_saved_snapshot(self, snapshot=None):
+        self._saved_snapshot = snapshot if snapshot is not None else self._current_snapshot()
         self._refresh_title_bar()
 
     def _has_unsaved_changes(self):
@@ -10132,6 +10986,57 @@ class MainWindow(QMainWindow):
             return
         self._load_board_file(path, error_title="Navigation failed")
 
+    # -- status bar: zoom % (bottom-right) and board-load progress
+    # (bottom-left) --------------------------------------------------------
+    def _update_zoom_label(self):
+        """Refresh the permanent bottom-right status bar label with the
+        view's current zoom level. Called from MindMapView after every
+        place the view's scale actually changes (Ctrl+Wheel zoom and
+        apply_view_state, which restores a board's saved zoom/pan) rather
+        than polled, since QGraphicsView has no transform-changed signal
+        to hook into."""
+        pct = round(self.view.transform().m11() * 100)
+        self.zoom_label.setText(f"Zoom: {pct}%")
+
+    def _set_loading_progress_label(self, board_name, pct):
+        """Update (or, with board_name=None, clear) the permanent
+        bottom-left status bar label used while a board is loading. Kept
+        separate from _on_board_load_progress so _load_board_file can
+        also use it for the very first (0%) and final (cleared) states
+        without going through the done/total percentage math."""
+        if board_name is None:
+            self.loading_label.clear()
+        else:
+            self.loading_label.setText(f"Loading {board_name}\u2026 {pct}%")
+        # scene.load() below is one long synchronous call - without
+        # pumping the event loop here the label text above would just
+        # sit in Qt's paint queue and never actually reach the screen
+        # until loading was already finished, defeating the point of a
+        # progress indicator.
+        QApplication.processEvents()
+
+    def _on_board_load_progress(self, board_name, done, total):
+        """progress_callback passed to MindMapScene.load - see there.
+        Throttled by elapsed wall-clock time (not percentage) so it
+        repaints often enough to actually be visible on a large, slow
+        board without paying a processEvents() call per item on a huge
+        one - and, crucially, so a small/fast board (most boards: the
+        whole load finishes in a handful of milliseconds) doesn't try to
+        force multiple repaints into a window shorter than a single
+        frame. There is nothing wrong with the label barely flashing on
+        those - the load genuinely is closer to instant than the ~16ms
+        it'd take to even see it."""
+        now = time.perf_counter()
+        is_last = done >= total
+        if not is_last and (now - self._loading_progress_last_paint) < 0.05:
+            return
+        self._loading_progress_last_paint = now
+        pct = int(done * 100 / total) if total else 100
+        if pct == self._loading_progress_shown_pct:
+            return
+        self._loading_progress_shown_pct = pct
+        self._set_loading_progress_label(board_name, pct)
+
     def _load_board_file(self, path, error_title="Open failed"):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -10140,7 +11045,34 @@ class MainWindow(QMainWindow):
             if data is None:
                 QMessageBox.warning(self, error_title, "No board data found in this HTML file.")
                 return
-            self.scene.load(data)
+            # See _reset_transient_item_refs's docstring: scene.load()
+            # below only protects the scene's *own* selection/focus
+            # (MindMapScene.clear_board) - it has no way to know about
+            # these MainWindow-side "sticky" references left pointing
+            # at a component that's about to be destroyed, which is
+            # what actually crashed the app on navigating away rather
+            # than just misbehaving.
+            self._reset_transient_item_refs()
+            basename_for_progress = os.path.basename(path)
+            self._loading_progress_shown_pct = -1
+            self._loading_progress_last_paint = 0.0
+            self._set_loading_progress_label(basename_for_progress, 0)
+            n_items = len(data.get("items", []))
+            _load_t0 = time.perf_counter()
+            try:
+                self.scene.load(
+                    data,
+                    progress_callback=lambda done, total, name=basename_for_progress:
+                        self._on_board_load_progress(name, done, total),
+                )
+            finally:
+                self._set_loading_progress_label(None, None)
+            if _PERF_DEBUG:
+                elapsed_ms = (time.perf_counter() - _load_t0) * 1000
+                print(f"[PERF] scene.load(): {n_items} items in {elapsed_ms:.1f} ms "
+                      f"({elapsed_ms / n_items:.3f} ms/item)" if n_items else
+                      f"[PERF] scene.load(): 0 items in {elapsed_ms:.1f} ms",
+                      file=sys.stderr)
             self.view.apply_view_state(data.get("view"))
             self.current_file = path
             self.project_dir = os.path.dirname(path)
@@ -10151,8 +11083,14 @@ class MainWindow(QMainWindow):
             self._set_base_title(f"OpenNote \u2014 {basename}")
             self.statusBar().showMessage(f"Opened: {path}", 4000)
             self._update_breadcrumb_bar()
-            self._update_saved_snapshot()
-            self._reset_undo_history()
+            # Liczymy snapshot JSON planszy raz, zamiast dwa razy pod
+            # rząd (_update_saved_snapshot i _reset_undo_history
+            # osobno serializowały cały board zaraz po wczytaniu) -
+            # dla dużych boardów ze zdjęciami to niepotrzebnie
+            # podwajało koszt (patrz też _b64_cache w ImageItem).
+            snapshot = self._current_snapshot()
+            self._update_saved_snapshot(snapshot)
+            self._reset_undo_history(snapshot)
             self._add_recent_file(path)
         except Exception as e:
             QMessageBox.critical(self, error_title, str(e))
