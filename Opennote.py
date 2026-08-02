@@ -6666,22 +6666,6 @@ class BoardLinkItem(BaseComponentItem):
         #    itself), then walk every *other* sibling .html file in the
         #    project folder and update any board_link item or breadcrumb
         #    segment that still points at the old filename/name.
-        def _retarget(data):
-            changed = False
-            for it in data.get("items", []):
-                if it.get("type") == "board_link" and it.get("target_file") == old_target_file:
-                    it["target_file"] = new_target_file
-                    if it.get("title") == old_name_no_ext:
-                        it["title"] = safe_new_name
-                    changed = True
-            for seg in (data.get("breadcrumb") or []):
-                if seg.get("file") == old_target_file:
-                    seg["file"] = new_target_file
-                    if seg.get("name") == old_name_no_ext:
-                        seg["name"] = safe_new_name
-                    changed = True
-            return changed
-
         try:
             with open(new_path, "r", encoding="utf-8") as f:
                 data = extract_scene_data(f.read()) or {"items": []}
@@ -6694,27 +6678,10 @@ class BoardLinkItem(BaseComponentItem):
         except Exception:
             pass
 
-        updated = 0
-        for fname in os.listdir(proj):
-            if not fname.lower().endswith(".html"):
-                continue
-            fpath = os.path.join(proj, fname)
-            if os.path.normpath(fpath) == os.path.normpath(new_path):
-                continue
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    data = extract_scene_data(f.read())
-            except Exception:
-                continue
-            if data is None:
-                continue
-            if _retarget(data):
-                try:
-                    with open(fpath, "w", encoding="utf-8") as f:
-                        f.write(build_html_document(data))
-                    updated += 1
-                except Exception:
-                    pass
+        updated = _apply_rename_to_project_siblings(
+            proj, old_target_file, old_name_no_ext, new_target_file, safe_new_name,
+            skip_path=new_path,
+        )
 
         # 3. Update this card, and - if this board is the one currently on
         #    screen - every other in-memory BoardLinkItem/breadcrumb entry
@@ -8465,6 +8432,62 @@ def extract_scene_data(html):
         return None
 
 
+def _retarget_board_references(data, old_target_file, old_name_no_ext, new_target_file, new_name):
+    """Rewrite every board_link item and breadcrumb segment in a single
+    board's serialized `data` that still points at `old_target_file` so
+    it points at `new_target_file` (and its display name) instead.
+    Returns True if anything in `data` was changed. Shared by both
+    BoardLinkItem._rename_referenced_board() (renaming a board reached
+    via a shortcut card) and MainWindow.rename_main_board() (renaming
+    the project's root board), so a rename made either way rewrites
+    references identically everywhere."""
+    changed = False
+    for it in data.get("items", []):
+        if it.get("type") == "board_link" and it.get("target_file") == old_target_file:
+            it["target_file"] = new_target_file
+            if it.get("title") == old_name_no_ext:
+                it["title"] = new_name
+            changed = True
+    for seg in (data.get("breadcrumb") or []):
+        if seg.get("file") == old_target_file:
+            seg["file"] = new_target_file
+            if seg.get("name") == old_name_no_ext:
+                seg["name"] = new_name
+            changed = True
+    return changed
+
+
+def _apply_rename_to_project_siblings(proj, old_target_file, old_name_no_ext, new_target_file, new_name, skip_path=None):
+    """Walk every .html file directly inside project folder `proj` (other
+    than `skip_path`, typically the just-renamed file itself, already
+    handled by the caller) and rewrite any reference to
+    `old_target_file` found in it. Returns how many files were actually
+    changed on disk."""
+    updated = 0
+    skip_norm = os.path.normpath(skip_path) if skip_path else None
+    for fname in os.listdir(proj):
+        if not fname.lower().endswith(".html"):
+            continue
+        fpath = os.path.join(proj, fname)
+        if skip_norm and os.path.normpath(fpath) == skip_norm:
+            continue
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = extract_scene_data(f.read())
+        except Exception:
+            continue
+        if data is None:
+            continue
+        if _retarget_board_references(data, old_target_file, old_name_no_ext, new_target_file, new_name):
+            try:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(build_html_document(data))
+                updated += 1
+            except Exception:
+                pass
+    return updated
+
+
 def extract_scene_meta(html):
     """The small, cheap-to-parse sibling of extract_scene_data(): reads
     only the lightweight `mindmap-meta` tag (currently just
@@ -8932,6 +8955,8 @@ class MainWindow(QMainWindow):
         file_menu.aboutToShow.connect(self._rebuild_recent_menu)
         file_menu.addAction("Save", self.save_board, QKeySequence.Save)
         file_menu.addAction("Save As...", self.save_board_as, QKeySequence.SaveAs)
+        file_menu.addSeparator()
+        file_menu.addAction("Refactor (Rename) Main Board...", self.rename_main_board)
         file_menu.addSeparator()
         file_menu.addAction("Exit", self.close)
 
@@ -10855,6 +10880,115 @@ class MainWindow(QMainWindow):
             self.project_dir = os.path.dirname(path)
             self._set_base_title(f"OpenNote \u2014 {basename}")
             self._update_breadcrumb_bar()
+
+    def rename_main_board(self):
+        """File > Refactor (Rename) Main Board: renames the project's
+        root board (breadcrumb[0] - the very first board of this
+        project, the one every other board's breadcrumb chain ultimately
+        traces back to) and rewrites every reference to it - board_link
+        cards and breadcrumb segments - across every sibling .html file
+        in the project folder, plus its own filename on disk, so nothing
+        is left pointing at the old name."""
+        if not self.current_file or not self.project_dir or not self.breadcrumb:
+            QMessageBox.information(
+                self, "Cannot rename",
+                "Save this board first so it belongs to a project folder."
+            )
+            return
+        proj = self.project_dir
+        root_seg = self.breadcrumb[0]
+        old_target_file = root_seg.get("file")
+        if not old_target_file:
+            QMessageBox.information(
+                self, "Cannot rename", "The main board hasn't been saved yet."
+            )
+            return
+        old_path = os.path.join(proj, old_target_file)
+        is_current = os.path.normpath(self.current_file) == os.path.normpath(old_path)
+        if not is_current and not os.path.exists(old_path):
+            QMessageBox.warning(
+                self, "Cannot rename", "The main board file could not be found on disk."
+            )
+            return
+
+        old_name_no_ext = os.path.splitext(old_target_file)[0]
+        new_name, ok = QInputDialog.getText(
+            self, "Rename main board", "New board name:", text=old_name_no_ext
+        )
+        if not ok or not new_name.strip():
+            return
+        safe_new_name = sanitize_board_filename(new_name)
+        new_target_file = safe_new_name + ".html"
+        if new_target_file == old_target_file:
+            return
+        new_path = os.path.join(proj, new_target_file)
+        if os.path.exists(new_path):
+            QMessageBox.warning(
+                self, "Rename failed",
+                f"A file named \u201c{new_target_file}\u201d already exists in the project folder.",
+            )
+            return
+
+        # 1. Write the renamed root board's own file. If it's the board
+        #    currently open on screen, save straight from the live scene
+        #    (so this also carries over any not-yet-saved edits) instead
+        #    of whatever's on disk; otherwise it isn't loaded anywhere
+        #    right now, so just read, retarget, and rewrite it in place.
+        self.breadcrumb[0] = {"name": safe_new_name, "file": new_target_file}
+        try:
+            if is_current:
+                data = self.scene.serialize()
+                data["view"] = self.view.current_view_state()
+                data["breadcrumb"] = self.breadcrumb
+                with open(new_path, "w", encoding="utf-8") as f:
+                    f.write(build_html_document(data))
+                if os.path.exists(old_path) and os.path.normpath(old_path) != os.path.normpath(new_path):
+                    os.remove(old_path)
+                self.current_file = new_path
+                self._set_base_title(f"OpenNote \u2014 {new_target_file}")
+            else:
+                os.rename(old_path, new_path)
+                with open(new_path, "r", encoding="utf-8") as f:
+                    data = extract_scene_data(f.read()) or {"items": []}
+                breadcrumb = data.get("breadcrumb") or [{}]
+                breadcrumb[0] = {"name": safe_new_name, "file": new_target_file}
+                data["breadcrumb"] = breadcrumb
+                with open(new_path, "w", encoding="utf-8") as f:
+                    f.write(build_html_document(data))
+        except Exception as e:
+            QMessageBox.critical(self, "Rename failed", str(e))
+            return
+
+        # 2. Walk every other sibling .html file in the project and fix
+        #    up any board_link card or breadcrumb segment still pointing
+        #    at the old root filename/name.
+        updated = _apply_rename_to_project_siblings(
+            proj, old_target_file, old_name_no_ext, new_target_file, safe_new_name,
+            skip_path=new_path,
+        )
+
+        # 3. If the board currently on screen isn't the root itself, its
+        #    own in-memory breadcrumb (an ancestor entry, since it's a
+        #    descendant of the root) and any BoardLinkItem cards on
+        #    screen pointing at the old root filename need the same fix
+        #    applied live, then persist that board too.
+        if not is_current:
+            for i, seg in enumerate(self.breadcrumb):
+                if seg.get("file") == old_target_file:
+                    self.breadcrumb[i] = {"name": safe_new_name, "file": new_target_file}
+            for it in self.scene.items():
+                if isinstance(it, BoardLinkItem) and it.target_file == old_target_file:
+                    it.target_file = new_target_file
+                    if it.title == old_name_no_ext:
+                        it.title = safe_new_name
+                    it.mark_count_stale()
+            if self.current_file:
+                self._write_html(self.current_file)
+
+        self._update_breadcrumb_bar()
+        self.statusBar().showMessage(
+            f"Renamed main board to \u201c{new_target_file}\u201d ({updated} other file(s) updated)", 5000
+        )
 
     def _write_html(self, path):
         data = self.scene.serialize()
