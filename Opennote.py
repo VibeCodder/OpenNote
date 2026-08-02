@@ -20,6 +20,7 @@ Run:
 import sys
 import os
 import re
+import copy
 import math
 import json
 import base64
@@ -83,6 +84,12 @@ ARROW_Z_OFFSET = -1_000_000  # arrows default to a layer below every normal
                               # component (see MindMapScene.bring_to_front) -
                               # so a line tucks behind the boxes it connects
                               # instead of drawing over them
+DRAWING_Z_OFFSET = 500_000  # freehand Draw strokes default to a layer above
+                              # every normal component (see
+                              # MindMapScene.bring_to_front) so a sketch stays
+                              # visible on top no matter what gets added or
+                              # brought to front afterward - the opposite of
+                              # ARROW_Z_OFFSET's "always tucks behind"
 ANCHOR_HIGHLIGHT_Z = 1_000_000  # the white outline shown over a component
                                   # while an arrow endpoint is dragged onto
                                   # it must stay visible above absolutely
@@ -1163,13 +1170,46 @@ class EditableTextItem(QGraphicsTextItem):
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event):
+        if (event.key() == Qt.Key_V and event.modifiers() & Qt.ControlModifier
+                and event.modifiers() & Qt.ShiftModifier):
+            self._paste_plain_text(event)
+            return
+        if event.matches(QKeySequence.Paste):
+            self._paste_preserving_alignment(event)
+            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-            parent = self.parentItem()
-            mode = getattr(parent, "list_mode", None)
-            if mode:
-                prefix = BULLET_CHAR if mode == "bullet" else CHECK_UNCHECKED
-                cursor = self.textCursor()
-                block_text = cursor.block().text()
+            cursor = self.textCursor()
+            block_text = cursor.block().text()
+            # Which prefix (if any) should continue onto the next line.
+            # The current line's own leading glyph is checked *first* -
+            # this is what lets Enter correctly continue a bullet/
+            # checklist no matter what is hosting this editor (a
+            # standalone TextNoteItem, a Board Card's in-place subitem
+            # editor via _SubitemTextEdit, ...). Falling back to a
+            # "list_mode" flag that only ever lived on TextNoteItem
+            # itself meant a checklist Text Note lost auto-continue the
+            # moment it was nested inside a Board Card (whose subitem
+            # editor has no such flag) - and even after being dragged
+            # back out, since subitem_to_component() rebuilds a brand
+            # new TextNoteItem whose list_mode always starts back at
+            # None regardless of the text's actual checklist content.
+            line_prefix = None
+            for p in (BULLET_CHAR, CHECK_UNCHECKED, CHECK_CHECKED):
+                if block_text.startswith(p + " "):
+                    line_prefix = p
+                    break
+            if line_prefix is None:
+                # Nothing typed on this line yet (e.g. right after
+                # switching list mode on via the toolbar/context menu on
+                # an empty note) - fall back to the owning TextNoteItem's
+                # own list_mode for that one case, since there's no
+                # glyph yet to read it from.
+                parent = self.parentItem()
+                mode = getattr(parent, "list_mode", None)
+                if mode:
+                    line_prefix = BULLET_CHAR if mode == "bullet" else CHECK_UNCHECKED
+            if line_prefix:
+                prefix = BULLET_CHAR if line_prefix == BULLET_CHAR else CHECK_UNCHECKED
                 # Pressing Enter on an already-empty bullet/checklist line
                 # exits list mode instead of adding yet another empty one,
                 # matching how bullet lists behave in most editors.
@@ -1183,6 +1223,53 @@ class EditableTextItem(QGraphicsTextItem):
                 event.accept()
                 return
         super().keyPressEvent(event)
+
+    def _paste_plain_text(self, event):
+        """Ctrl+Shift+V: paste the clipboard's *plain* text only, using
+        whatever character formatting is already active at the cursor -
+        i.e. exactly as if every character had been typed by hand -
+        instead of a normal paste, which carries over the clipboard
+        content's own formatting (font, colors, bold/italic runs, links,
+        ...) from wherever it was copied from.
+
+        QTextCursor.insertText(str) (with no explicit QTextCharFormat)
+        already does this: it stamps the inserted text with the
+        cursor's current charFormat and starts a fresh block on each
+        "\\n", exactly matching normal keyboard typing - so this is just
+        that, fed the clipboard's text instead of a keystroke."""
+        text = QApplication.clipboard().text()
+        event.accept()
+        if not text:
+            return
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        cursor = self.textCursor()
+        cursor.insertText(text)
+        self.setTextCursor(cursor)
+
+    def _paste_preserving_alignment(self, event):
+        """Qt's default paste applies whatever paragraph alignment the
+        clipboard's rich-text content happens to carry - almost always
+        left, since that's what most sources (browsers, other apps)
+        default to - silently overwriting whatever alignment the field
+        already had, even if it was set to Center/Right beforehand.
+
+        Remember the alignment in force before the paste, let Qt do the
+        actual insert as normal, then re-apply that alignment across
+        exactly the range that just got pasted in (covering every
+        paragraph if the pasted text itself spanned several), so
+        pasting never fights the field's existing formatting."""
+        cursor = self.textCursor()
+        align = cursor.blockFormat().alignment()
+        start = min(cursor.position(), cursor.anchor())
+        super().keyPressEvent(event)
+        end = self.textCursor().position()
+        fix_cursor = QTextCursor(self.document())
+        fix_cursor.setPosition(start)
+        fix_cursor.setPosition(max(start, end), QTextCursor.KeepAnchor)
+        block_fmt = fix_cursor.blockFormat()
+        block_fmt.setAlignment(align)
+        fix_cursor.mergeBlockFormat(block_fmt)
+        event.accept()
 
     def mouseMoveEvent(self, event):
         if self.textInteractionFlags() == Qt.NoTextInteraction:
@@ -1384,6 +1471,13 @@ class BaseComponentItem(QGraphicsObject):
         the insertion line in exactly that case."""
         if isinstance(self, BoardCardItem):
             return
+        if isinstance(self, DrawingItem) and not self.allow_board_card:
+            # This sketch hasn't opted in (see the "Allow to be Board
+            # Card element" toolbar checkbox) - never show the
+            # insertion-line preview for it, so it's visually clear
+            # while dragging that it simply can't be dropped into a
+            # card, matching item_drag_released's own refusal below.
+            return
         scene = self.scene()
         if scene is None:
             return
@@ -1392,11 +1486,39 @@ class BaseComponentItem(QGraphicsObject):
             if isinstance(other, BoardCardItem) and other is not self:
                 target = other
                 break
+        if target is None:
+            # Plain point hit-testing above only ever finds a card
+            # whose boundingRect() actually contains the cursor. A card
+            # that's been resized down tight enough that its content
+            # already reaches its own bottom edge (no free space left
+            # under the last subitem) has no point *inside* its bounds
+            # that maps to "insert after the last item" - the cursor
+            # would have to land on the very last pixel row, which in
+            # practice you can't hit. Give every board card's bottom
+            # edge a small forgiving strip below it (same width as the
+            # card) so hovering just under a tightly-packed card still
+            # counts as "insert at the end of that card" instead of the
+            # insertion line silently never appearing.
+            margin = 24.0
+            for other in scene.items():
+                if isinstance(other, BoardCardItem) and other is not self:
+                    r = other.mapRectToScene(other.rect())
+                    band = QRectF(r.left(), r.bottom(), r.width(), margin)
+                    if band.contains(cursor_scene_pos):
+                        target = other
+                        break
         prev = self._hover_board
         if prev is not None and prev is not target:
             prev.clear_insert_preview()
         if target is not None:
-            target.show_insert_preview(target.mapFromScene(cursor_scene_pos).y())
+            local_y = target.mapFromScene(cursor_scene_pos).y()
+            # Clamp into the card's own local range so the fallback in
+            # paint() (which draws the line at the bottom of the last
+            # subitem's rect once no exact slot is found) is what
+            # actually resolves this - a raw local_y from the margin
+            # strip above would be > the card's own height.
+            local_y = min(local_y, target.rect().height())
+            target.show_insert_preview(local_y)
         self._hover_board = target
 
     def mouseReleaseEvent(self, event):
@@ -3041,7 +3163,7 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
 class DrawingItem(BaseComponentItem):
     TYPE_NAME = "drawing"
 
-    def __init__(self, x=0, y=0, w=100, h=100, strokes=None, item_id=None):
+    def __init__(self, x=0, y=0, w=100, h=100, strokes=None, item_id=None, allow_board_card=False):
         super().__init__(x, y, w, h, item_id)
         # See ImageItem.__init__ for why this matters for panning/zoom
         # smoothness - here it avoids rebuilding a QPainterPath from every
@@ -3052,6 +3174,14 @@ class DrawingItem(BaseComponentItem):
         self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
         self.strokes = strokes or []
         self.min_w, self.min_h = 20, 20
+        # Off by default (see the "Allow to be Board Card element"
+        # toolbar checkbox, shown while a drawing is selected): dragging
+        # a sketch onto a Board Card rasterizes it into a flat image
+        # subitem (see component_to_subitem), which most sketches aren't
+        # meant for. A drawing only becomes droppable into a card once
+        # this is explicitly turned on for it - see
+        # MindMapScene._update_board_hover_preview / item_drag_released.
+        self.allow_board_card = allow_board_card
 
     def add_stroke(self, color, width, points):
         self.strokes.append({"color": color, "width": width, "points": points})
@@ -3125,6 +3255,7 @@ class DrawingItem(BaseComponentItem):
     def serialize(self):
         d = super().serialize()
         d["strokes"] = self.strokes
+        d["allow_board_card"] = self.allow_board_card
         return d
 
     def to_html(self):
@@ -3753,6 +3884,15 @@ class ArrowItem(BaseComponentItem):
             self._drag_hover_target = None
             self._drag_endpoint = None
             self.refresh_anchors()
+            # Re-band this arrow now that its anchor state may have just
+            # changed - see MindMapScene.bring_to_front: an arrow only
+            # tucks behind other components once at least one endpoint
+            # is actually anchored, so snapping an endpoint onto a
+            # target here should drop it into that band immediately
+            # (and pulling the last anchor loose should bring it back
+            # into the normal band), not just at creation time.
+            if scene is not None and hasattr(scene, "bring_to_front"):
+                scene.bring_to_front(self)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -5408,9 +5548,11 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 sub_font = QFont(item.get("font_family") or "Segoe UI", 10)
                 sub_font.setBold(bool(item.get("bold")))
                 sub_font.setItalic(bool(item.get("italic")))
+                sub_font.setUnderline(bool(item.get("underline")))
                 needed_h = self._sub_text_body_height(item, avail_w, sub_font)
                 title_h, _ = self._sub_text_title_height(item, avail_w)
-                y += max(20, needed_h) + title_h + 8
+                strip_h = (self.TOP_STRIP_H + 4) if item.get("top_strip_enabled") else 0
+                y += strip_h + max(20, needed_h) + title_h + 8
             elif kind == "checklist":
                 y += 22 * len(item.get("items", [])) + 6
         return y + pad
@@ -5740,22 +5882,33 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                     self._drag_ghost.scene().removeItem(self._drag_ghost)
                 self._drag_ghost = None
             if moved and will_detach:
-                sub = self.subitems.pop(idx)
-                self._prune_video_proxies()
-                self._prune_gif_movies()
-                self._prune_rich_doc_cache()
-                self._prune_image_pixmap_cache()
-                self._prune_subitem_scaled_cache()
-                scene_pos = event.scenePos()
-                new_item = subitem_to_component(sub, scene_pos.x() - 100, scene_pos.y() - 60)
-                if new_item is not None and self.scene() is not None:
-                    self.scene().addItem(new_item)
-                    self.scene().clearSelection()
-                    new_item.setSelected(True)
+                self._detach_subitem(idx, event.scenePos())
             self.update()
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def _detach_subitem(self, idx, scene_pos):
+        """Pop subitem `idx` off this card and turn it back into a
+        standalone, freely movable canvas component centered on
+        `scene_pos` - shared by the drag-it-out-of-the-card gesture
+        (mouseReleaseEvent above) and the "Convert Back to Drawing"
+        context-menu entry (contextMenuEvent below), which is really
+        the same operation just triggered without a drag."""
+        sub = self.subitems.pop(idx)
+        self._prune_video_proxies()
+        self._prune_gif_movies()
+        self._prune_rich_doc_cache()
+        self._prune_image_pixmap_cache()
+        self._prune_subitem_scaled_cache()
+        new_item = subitem_to_component(sub, scene_pos.x() - 100, scene_pos.y() - 60)
+        if new_item is not None and self.scene() is not None:
+            self.scene().addItem(new_item)
+            self.scene().bring_to_front(new_item)
+            self.scene().clearSelection()
+            new_item.setSelected(True)
+        self.update()
+        return new_item
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.Antialiasing)
@@ -5977,7 +6130,15 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                     line_y = r.top()
                     break
             if line_y is None:
-                line_y = self._subitem_rects[-1][1].bottom() if self._subitem_rects else 42
+                # Appending past every existing subitem (including when
+                # the card has been resized taller than its content, so
+                # there's empty space below the last row): snap the line
+                # all the way down to the card's own bottom edge rather
+                # than the bottom of the last subitem's rect, so hovering
+                # anywhere in that empty space - all the way down to the
+                # true bottom edge - reads as "insert at the very end"
+                # instead of the line sitting stranded above the cursor.
+                line_y = self._h - pad
             painter.setPen(QPen(QColor("#4c8bf5"), 3))
             painter.drawLine(QPointF(pad, line_y), QPointF(self._w - pad, line_y))
 
@@ -6007,6 +6168,19 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             elif ext in IMAGE_EXTS:
                 self.add_subitem({"kind": "image", "data": b64})
         event.acceptProposedAction()
+
+    def contextMenuEvent(self, event):
+        idx = self._subitem_index_at(event.pos())
+        if idx is not None:
+            sub = self.subitems[idx]
+            if sub.get("kind") == "image" and sub.get("drawing_strokes"):
+                menu = QMenu()
+                convert_action = menu.addAction("Convert Back to Drawing")
+                chosen = menu.exec(event.screenPos())
+                if chosen == convert_action:
+                    self._detach_subitem(idx, event.scenePos())
+                return
+        super().contextMenuEvent(event)
 
     def _build_context_menu(self, menu):
         self._build_top_strip_context_menu(menu)
@@ -6905,7 +7079,20 @@ def component_to_subitem(item):
             p.drawPath(path)
         p.end()
         pm = QPixmap.fromImage(img)
-        return {"kind": "image", "data": pixmap_to_base64(pm)}
+        # Dropping a Draw sketch onto a Board Card only has a rasterized
+        # "image" subitem kind to land in - there's no vector "drawing"
+        # subitem kind. Stash the original stroke data (and the canvas
+        # size it was drawn at) alongside the flattened pixmap so the
+        # card's "Convert Back to Drawing" context menu entry can
+        # reconstruct a real, still-editable DrawingItem later instead
+        # of only ever being able to pull the flat picture back out.
+        return {
+            "kind": "image",
+            "data": pixmap_to_base64(pm),
+            "drawing_strokes": copy.deepcopy(item.strokes),
+            "drawing_w": item._w,
+            "drawing_h": item._h,
+        }
     return None
 
 
@@ -6914,6 +7101,15 @@ def subitem_to_component(subitem, x, y):
     a standalone, freely movable canvas component (used when a subitem is
     dragged out of its board card)."""
     kind = subitem.get("kind")
+    if kind == "image" and subitem.get("drawing_strokes"):
+        # This "image" subitem started life as a Draw sketch that got
+        # rasterized when it was dropped onto the card (see
+        # component_to_subitem) - the original vector strokes were kept
+        # around specifically so it can come back as a real, still-
+        # editable DrawingItem instead of a flat picture.
+        w = subitem.get("drawing_w") or 100
+        h = subitem.get("drawing_h") or 100
+        return DrawingItem(x, y, w, h, strokes=copy.deepcopy(subitem.get("drawing_strokes", [])))
     if kind == "image":
         return ImageItem(x, y, b64=subitem.get("data"),
                           title=subitem.get("title", ""), description=subitem.get("description", ""),
@@ -7022,7 +7218,8 @@ def deserialize_component(d):
                           title_color=d.get("title_color"), desc_color=d.get("description_color"),
                           title_html=d.get("title_html"), desc_html=d.get("description_html"))
     elif t == "drawing":
-        item = DrawingItem(x, y, w, h, strokes=d.get("strokes", []), item_id=item_id)
+        item = DrawingItem(x, y, w, h, strokes=d.get("strokes", []), item_id=item_id,
+                            allow_board_card=d.get("allow_board_card", False))
     elif t == "arrow":
         p1 = d.get("p1")
         p2 = d.get("p2")
@@ -7266,24 +7463,52 @@ class MindMapScene(QGraphicsScene):
         self.rubber_band_dragging = False
         self.selectionChanged.connect(self.update_anchor_endpoint_markers)
 
+    @staticmethod
+    def _is_anchored_arrow(it):
+        """True once an arrow has at least one endpoint snapped to a
+        component - see bring_to_front()'s docstring for why that's the
+        signal used to decide which z-order band it belongs in."""
+        return isinstance(it, ArrowItem) and (it.anchor1 is not None or it.anchor2 is not None)
+
     def bring_to_front(self, item):
         """Raise `item` above every other component in its own "band" so
         clicking/dragging it always brings it visually to the front
         *within its own band*, instead of leaving it stuck at whatever
-        z-order it happened to be created in. Arrows use their own band,
-        offset well below every normal component (see ARROW_Z_OFFSET),
-        so an arrow always stacks under every other component type -
-        even one that was JUST brought to front - matching Arrow's
-        default "tucks behind the components it connects" behavior.
+        z-order it happened to be created in.
+
+        A freshly created, not-yet-snapped arrow behaves like any other
+        new component: it shares the normal band and lands on top, same
+        as a new Text Note/Image/etc. Only once at least one of its
+        endpoints is actually anchored to a component (see
+        ArrowItem._set_anchor, called from mouseReleaseEvent when an
+        endpoint is dropped onto a target) does it drop into its own
+        band, offset well below every normal component (see
+        ARROW_Z_OFFSET), so an anchored arrow always stacks under every
+        other component type - even one that was JUST brought to front -
+        matching Arrow's "tucks behind the components it connects"
+        behavior. mouseReleaseEvent re-calls bring_to_front() right
+        after (un)anchoring so this takes effect the moment an endpoint
+        is snapped onto (or pulled off of) a target, not just at
+        creation time.
+        Freehand Draw strokes are the mirror image: their band sits
+        above every normal component (see DRAWING_Z_OFFSET), so a
+        sketch always stays visible on top even after some other
+        component gets added or brought to front later on.
         Computed fresh from the scene's actual current z-values (rather
         than a stored counter) so it stays correct across load/delete/
         undo."""
         others = [it for it in self.items() if isinstance(it, BaseComponentItem) and it is not item]
-        if isinstance(item, ArrowItem):
-            band = [it.zValue() for it in others if isinstance(it, ArrowItem)]
+        if self._is_anchored_arrow(item):
+            band = [it.zValue() for it in others if self._is_anchored_arrow(it)]
             floor = ARROW_Z_OFFSET
+        elif isinstance(item, DrawingItem):
+            band = [it.zValue() for it in others if isinstance(it, DrawingItem)]
+            floor = DRAWING_Z_OFFSET
         else:
-            band = [it.zValue() for it in others if not isinstance(it, ArrowItem)]
+            band = [
+                it.zValue() for it in others
+                if not self._is_anchored_arrow(it) and not isinstance(it, DrawingItem)
+            ]
             floor = 0
         item.setZValue(max(band, default=floor - 1) + 1)
 
@@ -7610,6 +7835,7 @@ class MindMapScene(QGraphicsScene):
                     }],
                 )
                 self.addItem(item)
+                self.bring_to_front(item)
             self._current_stroke_points = []
             event.accept()
             return
@@ -7649,6 +7875,7 @@ class MindMapScene(QGraphicsScene):
             self.removeItem(it)
         merged = DrawingItem(x0, y0, w, h, strokes=merged_strokes)
         self.addItem(merged)
+        self.bring_to_front(merged)
         self.clearSelection()
         merged.setSelected(True)
         return merged
@@ -7656,6 +7883,12 @@ class MindMapScene(QGraphicsScene):
     # -- drag a component onto a board card to nest it -----------------
     def item_drag_released(self, item, hover_board=None):
         if isinstance(item, BoardCardItem):
+            return
+        if isinstance(item, DrawingItem) and not item.allow_board_card:
+            # Mirrors _update_board_hover_preview's own refusal above -
+            # without this, a sketch dropped squarely on a card while
+            # its preview line simply never appeared would still have
+            # silently nested itself here anyway.
             return
         other = hover_board if (hover_board is not None and hover_board.scene() is self) else None
         if other is None:
@@ -9182,6 +9415,17 @@ class MainWindow(QMainWindow):
 
         self.checkbox_group_sep = draw_tb.addSeparator()
 
+        # Off by default (see DrawingItem.allow_board_card) - dragging a
+        # sketch onto a Board Card would otherwise silently flatten it
+        # into a plain image subitem, which isn't always wanted. Shown
+        # only while a Drawing is selected (see on_selection_changed).
+        self.allow_board_card_checkbox = QCheckBox("  Allow to be Board Card element")
+        self.allow_board_card_checkbox.setStyleSheet(checkbox_style)
+        self.allow_board_card_checkbox.setFocusPolicy(Qt.NoFocus)
+        self.allow_board_card_checkbox_action = draw_tb.addWidget(self.allow_board_card_checkbox)
+        self.allow_board_card_checkbox.toggled.connect(self.on_allow_board_card_toggled)
+        self.allow_board_card_checkbox_action.setVisible(False)
+
         self.title_checkbox = QCheckBox("  Title")
         self.title_checkbox.setStyleSheet(checkbox_style)
         self.title_checkbox.setFocusPolicy(Qt.NoFocus)
@@ -9572,6 +9816,14 @@ class MainWindow(QMainWindow):
             self.title_checkbox.blockSignals(True)
             self.title_checkbox.setChecked(text_note_sel[0].show_title)
             self.title_checkbox.blockSignals(False)
+
+        drawing_sel = [it for it in all_sel if isinstance(it, DrawingItem)]
+        self._drawing_selection = drawing_sel or None
+        self.allow_board_card_checkbox_action.setVisible(bool(drawing_sel))
+        if drawing_sel:
+            self.allow_board_card_checkbox.blockSignals(True)
+            self.allow_board_card_checkbox.setChecked(drawing_sel[0].allow_board_card)
+            self.allow_board_card_checkbox.blockSignals(False)
 
         self.arrow_label_checkbox_action.setVisible(bool(arrow_sel))
         if arrow_sel:
@@ -10201,6 +10453,12 @@ class MainWindow(QMainWindow):
             if it.show_title != checked:
                 it._toggle_show_title()
 
+    def on_allow_board_card_toggled(self, checked):
+        if not getattr(self, "_drawing_selection", None):
+            return
+        for it in self._drawing_selection:
+            it.allow_board_card = checked
+
     def on_arrow_label_toggled(self, checked):
         if not self._arrow_selection:
             return
@@ -10305,6 +10563,7 @@ class MainWindow(QMainWindow):
             font_family=fam,
         )
         self.scene.addItem(item)
+        self.scene.bring_to_front(item)
         self._apply_default_title_alignment(item)
 
     def add_text(self):
@@ -10314,6 +10573,7 @@ class MainWindow(QMainWindow):
             font_family=self.prefs.get("default_font_family", "Segoe UI"),
         )
         self.scene.addItem(item)
+        self.scene.bring_to_front(item)
 
     def add_board_card(self):
         pos = self._viewport_center_scene()
@@ -10323,6 +10583,7 @@ class MainWindow(QMainWindow):
                 size=self.prefs.get("default_title_font_size", 12.0), bold=True),
         )
         self.scene.addItem(item)
+        self.scene.bring_to_front(item)
         self._apply_default_title_alignment(item)
 
     def add_board_link(self):
@@ -10378,6 +10639,7 @@ class MainWindow(QMainWindow):
             thumb_mime=dlg.thumb_mime, thumb_data=dlg.thumb_data,
         )
         self.scene.addItem(item)
+        self.scene.bring_to_front(item)
         self.statusBar().showMessage(f"Linked board: {target_file}", 4000)
 
     def _write_board_file(self, path, data, breadcrumb):
@@ -10395,6 +10657,7 @@ class MainWindow(QMainWindow):
         pos = self._viewport_center_scene()
         item = TableItem(pos.x() - 180, pos.y() - 100)
         self.scene.addItem(item)
+        self.scene.bring_to_front(item)
         self._apply_default_font(item)
 
     def add_image(self):
@@ -10463,6 +10726,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Unsupported file", f"Unsupported file type: {ext}")
             return None
         self.scene.addItem(item)
+        self.scene.bring_to_front(item)
         self._apply_default_title_alignment(item)
         return item
 
@@ -10535,6 +10799,7 @@ class MainWindow(QMainWindow):
                 item = deserialize_component(nd)
                 if item:
                     self.scene.addItem(item)
+                    self.scene.bring_to_front(item)
                     item.setSelected(True)
             return
         # fall back to OS clipboard image
@@ -10545,6 +10810,7 @@ class MainWindow(QMainWindow):
             item = ImageItem(pos.x() - 120, pos.y() - 90, pixmap=QPixmap.fromImage(img),
                               title="Title", description="description...")
             self.scene.addItem(item)
+            self.scene.bring_to_front(item)
 
     def duplicate_selection(self):
         items = [it for it in self.scene.selectedItems() if isinstance(it, BaseComponentItem)]
@@ -10557,6 +10823,7 @@ class MainWindow(QMainWindow):
             new_item = deserialize_component(d)
             if new_item:
                 self.scene.addItem(new_item)
+                self.scene.bring_to_front(new_item)
                 new_item.setSelected(True)
 
     def delete_selection(self):
