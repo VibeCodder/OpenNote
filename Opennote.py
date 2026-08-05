@@ -202,6 +202,14 @@ class _MultiColorDialog(QDialog):
             picker = QColorDialog(color, self)
             picker.setWindowFlags(Qt.Widget)
             picker.setOption(QColorDialog.NoButtons, True)
+            # Without this, Qt tries to render the platform's *native*
+            # color picker (the real OS dialog, e.g. Windows' own picker)
+            # squeezed into a plain child widget here - which the native
+            # dialog generally can't actually do, so the tab it's placed
+            # in just renders empty instead of showing any color picker
+            # at all. Forcing Qt's own cross-platform picker widget is
+            # what makes embedding it inside a QTabWidget like this work.
+            picker.setOption(QColorDialog.DontUseNativeDialog, True)
             tab_widget.addTab(picker, label)
             self._pickers.append(picker)
 
@@ -209,6 +217,11 @@ class _MultiColorDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        # Safety net alongside DontUseNativeDialog above: makes sure the
+        # dialog opens at a sensible, usable size even if a picker widget
+        # ever reports a degenerate size hint on some platform, instead
+        # of the dialog collapsing down to barely visible.
+        self.resize(520, 480)
 
     def selected_colors(self):
         return [p.currentColor() for p in self._pickers]
@@ -1694,20 +1707,21 @@ class TopStripMixin:
 
     def _open_color_dialog(self):
         """Overrides BaseComponentItem._open_color_dialog (the context
-        menu's "Change Color..." entry point) - falls back to the normal
-        single-color dialog via super() unless the strip is on."""
-        if getattr(self, "top_strip_enabled", False):
-            bg, strip = open_bg_strip_color_dialog(
-                None,
-                QColor(self.color) if getattr(self, "color", None) else QColor(getattr(self, "DEFAULT_COLOR", None) or "#ffffff"),
-                QColor(self.top_strip_color),
-                bg_label=self.COLOR_TAB_LABEL,
-            )
-            if bg is not None:
-                self.set_color(bg)
-                self.set_top_strip_color(strip)
-            return
-        super()._open_color_dialog()
+        menu's "Change Color..." entry point). Always opens the two-tab
+        Background/Top Strip dialog, same as MainWindow.pick_color does
+        for the toolbar Color button - both color roles are offered
+        together regardless of whether the strip is currently switched
+        on, so "Change Color..." can set/preview a strip color even
+        before the checkbox has ever been ticked."""
+        bg, strip = open_bg_strip_color_dialog(
+            None,
+            QColor(self.color) if getattr(self, "color", None) else QColor(getattr(self, "DEFAULT_COLOR", None) or "#ffffff"),
+            QColor(self.top_strip_color),
+            bg_label=self.COLOR_TAB_LABEL,
+        )
+        if bg is not None:
+            self.set_color(bg)
+            self.set_top_strip_color(strip)
 
 
 # --------------------------------------------------------------------------
@@ -2338,17 +2352,24 @@ class MediaCardMixin:
         # not just the plain text - the title/description items are live
         # QGraphicsTextItems the whole time, so their document is always
         # up to date here.
+        #
+        # Both bars also get their own Background fill inlined here (see
+        # self.color / set_color, and .media-title/.media-desc's #1e1e1e
+        # default in the exported <style> block, which this simply
+        # overrides) so a customized background actually shows up in the
+        # exported HTML instead of only on the live canvas.
+        bg_css = color_to_css(self.color) if self.color else "#1e1e1e"
         title_html = ""
         if self.show_title and self.title_item.toPlainText().strip():
             tf = self.title_item.font()
-            title_style = self._font_style_css(tf, self.title_item.defaultTextColor().name())
+            title_style = self._font_style_css(tf, self.title_item.defaultTextColor().name()) + f";background:{bg_css}"
             title_text = _qtextdocument_to_web_html(
                 self.title_item.document(), base_family=tf.family(), base_size=tf.pointSizeF())
             title_html = f'<div class="media-title" style="{title_style}">{title_text}</div>'
         desc_html = ""
         if self.show_description and self.description_item.toPlainText().strip():
             df = self.description_item.font()
-            desc_style = self._font_style_css(df, self.description_item.defaultTextColor().name())
+            desc_style = self._font_style_css(df, self.description_item.defaultTextColor().name()) + f";background:{bg_css}"
             desc_text = _qtextdocument_to_web_html(
                 self.description_item.document(), base_family=df.family(), base_size=df.pointSizeF())
             desc_html = f'<div class="media-desc" style="{desc_style}">{desc_text}</div>'
@@ -4974,6 +4995,70 @@ class SubitemDragGhost(QGraphicsObject):
         painter.drawText(QRectF(0, -18, self._w, 16), Qt.AlignHCenter | Qt.AlignVCenter, caption)
 
 
+class _SubitemFontProxy:
+    """Lightweight stand-in for a Board Card "text" subitem's default
+    font, used by the shared _apply_text_font/_representative_font
+    toolbar machinery (see BoardCardItem.font_targets) whenever that
+    subitem is merely *selected* with a single click - not double-clicked
+    into edit. This is what lets Font/B/I/U act on a single-click-selected
+    subitem exactly like a standalone Text Note's own selected-but-not-
+    editing whole-field styling, without keeping a live QGraphicsTextItem/
+    QTextDocument around for every never-edited subitem (which is exactly
+    what BoardCardItem's manual paint()-based rendering exists to avoid -
+    see the class docstring above). Writes land straight back into the
+    subitem dict, the same fields paint()/serialize()/to_html() already
+    read - so they show up immediately, survive being dragged back out
+    into a standalone component, and export to HTML identically."""
+
+    def __init__(self, subitem, field):
+        self._sub = subitem
+        self._field = field
+        # Cached on the instance, not recreated per call: PySide6 doesn't
+        # keep a QTextDocument's Python wrapper alive just because a
+        # QTextCursor was built from it (there's no Qt-level parent/
+        # ownership relationship for a document with no parent), so
+        # returning a brand-new one from document()/textCursor() every
+        # call let it get garbage-collected out from under the still-in-
+        # use QTextCursor the instant the call that created it returned -
+        # a use-after-free that crashed the whole app. Keeping exactly
+        # one QTextDocument per proxy, referenced by the proxy itself for
+        # as long as it lives, fixes that.
+        self._doc = None
+
+    def font(self):
+        sub = self._sub
+        f = QFont(sub.get("font_family") or "Segoe UI", 10)
+        f.setBold(bool(sub.get("bold")))
+        f.setItalic(bool(sub.get("italic")))
+        f.setUnderline(bool(sub.get("underline")))
+        return f
+
+    def setFont(self, f):
+        sub = self._sub
+        sub["font_family"] = f.family()
+        sub["bold"] = f.bold()
+        sub["italic"] = f.italic()
+        sub["underline"] = f.underline()
+        # A whole-field change overwrites any earlier per-character rich
+        # text run formatting - the same "no selection = whole field"
+        # rule _apply_run_format documents for every other text
+        # component - so a stale bold/colored run from an earlier real
+        # edit can't keep overriding the new font forever.
+        sub.pop(f"{self._field}_html", None)
+
+    def document(self):
+        if self._doc is None:
+            self._doc = QTextDocument()
+        self._doc.setPlainText(self._sub.get(self._field, "") or "")
+        return self._doc
+
+    def textCursor(self):
+        return QTextCursor(self.document())
+
+    def opacity(self):
+        return 1.0
+
+
 class BoardCardItem(TopStripMixin, BaseComponentItem):
     TYPE_NAME = "board"
     DEFAULT_COLOR = "#2b2b2b"
@@ -5039,6 +5124,19 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         self._drag_sub_start_pos = QPointF()
         self._drag_sub_will_detach = False
         self._drag_ghost = None       # floating SubitemDragGhost while dragging
+
+        # -- single-click "select this subitem" state -------------------
+        # Set when a subitem is clicked (without being dragged/detached)
+        # so it gets the same top-toolbar editing (Color, Font/B/I/U for
+        # text subitems) a standalone component gets when simply
+        # selected - as opposed to double-clicking it, which still opens
+        # the in-place text editor below (_sub_edit_item). Only one
+        # subitem across the whole app is ever selected this way at a
+        # time - see MindMapScene.select_board_subitem/
+        # clear_board_subitem_selection, which is what actually owns
+        # this value (kept here too so paint()/mouse handlers on this
+        # card don't need to reach back into the scene for it).
+        self._selected_sub_index = None
 
         # -- in-place text-subitem editing state -------------------------
         self._sub_edit_item = None    # the _SubitemTextEdit overlay, while editing
@@ -5165,6 +5263,12 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         self.update()
 
     def mouseDoubleClickEvent(self, event):
+        if self._selected_sub_index is not None:
+            scene = self.scene()
+            if scene is not None and hasattr(scene, "clear_board_subitem_selection"):
+                scene.clear_board_subitem_selection()
+            else:
+                self._selected_sub_index = None
         if event.pos().y() < self._title_h:
             self.title_item.setTextInteractionFlags(Qt.TextEditorInteraction)
             self.title_item.setFocus()
@@ -5359,6 +5463,10 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             return [self.title_item]
         if editing_item is not None and editing_item is self._sub_edit_item:
             return [self._sub_edit_item]
+        if editing_item is None and self._selected_sub_index is not None:
+            idx = self._selected_sub_index
+            if idx < len(self.subitems) and self.subitems[idx].get("kind") == "text":
+                return [_SubitemFontProxy(self.subitems[idx], "text")]
         return []
 
     def _on_subitem_text_font_changed(self):
@@ -5439,10 +5547,18 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             _font_from_dict(item.get("title_font"), base_family="Segoe UI", base_size=11.0, base_bold=True)
             if item.get("title_font") else QFont("Segoe UI", 11, QFont.Bold)
         )
-        fm = QFontMetrics(title_font)
-        h = fm.boundingRect(
-            QRectF(0, 0, avail_w, 10000).toRect(), Qt.TextWordWrap, item.get("title", "")
-        ).height() + 4
+        # Measure the same rich QTextDocument that actually gets painted
+        # (see _get_subitem_rich_doc/paint()'s kind == "text" branch)
+        # instead of QFontMetrics.boundingRect() on the plain text - the
+        # two don't always agree on wrapped-line height (bold/color runs,
+        # rounding), and boundingRect's estimate could come out shorter
+        # than the real layout once the title wraps onto two or more
+        # lines. That mismatch previously sized the title row too short,
+        # clipping the last line off - mirrors the identical fix already
+        # applied to _sub_text_body_height for the same reason.
+        title_doc = self._get_subitem_rich_doc(
+            item, "title", item.get("title_html"), item.get("title", ""), title_font, avail_w)
+        h = title_doc.size().height() + 4
         return max(18, h), title_font
 
     def _sub_text_body_height(self, item, avail_w, sub_font):
@@ -5494,7 +5610,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
 
     def _paint_sub_media_title(self, painter, rect, item):
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#1e1e1e"))
+        painter.setBrush(QColor(item.get("color")) if item.get("color") else QColor("#1e1e1e"))
         painter.drawRect(rect)
         font = QFont("Segoe UI", 9, QFont.Bold)
         text_rect = rect.adjusted(6, 0, -6, 0)
@@ -5507,7 +5623,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
 
     def _paint_sub_media_desc(self, painter, rect, item):
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#1e1e1e"))
+        painter.setBrush(QColor(item.get("color")) if item.get("color") else QColor("#1e1e1e"))
         painter.drawRect(rect)
         font = QFont("Segoe UI", 8)
         text_rect = rect.adjusted(6, 0, -6, 0)
@@ -5883,10 +5999,35 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 self._drag_ghost = None
             if moved and will_detach:
                 self._detach_subitem(idx, event.scenePos())
+            elif not moved:
+                # A plain click (no drag) - select this subitem so it
+                # gets the same top-toolbar editing (Color, and for a
+                # "text" subitem, Font/B/I/U) a standalone component
+                # gets when simply clicked/selected outside a card.
+                # Double-clicking still opens the in-place text editor
+                # exactly as before (see mouseDoubleClickEvent) - this
+                # is a separate, non-editing "selected" state.
+                self._select_subitem(idx)
             self.update()
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def _select_subitem(self, idx):
+        """Mark subitem `idx` as selected (single click, not editing) -
+        see _selected_sub_index. Routed through the scene so only one
+        subitem across the whole app is ever selected this way at a
+        time (mirrors normal component selection), and so the top
+        toolbar refreshes to show its Color/Font controls."""
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "select_board_subitem"):
+            scene.select_board_subitem(self, idx)
+        else:
+            self._selected_sub_index = idx
+        self.update()
+        mw = getattr(scene, "main_window", None) if scene is not None else None
+        if mw is not None:
+            mw.on_selection_changed()
 
     def _detach_subitem(self, idx, scene_pos):
         """Pop subitem `idx` off this card and turn it back into a
@@ -5896,6 +6037,16 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         context-menu entry (contextMenuEvent below), which is really
         the same operation just triggered without a drag."""
         sub = self.subitems.pop(idx)
+        if self._selected_sub_index is not None:
+            # Indices below the removed one are unaffected; anything at
+            # or above it shifts down by one (or, if it was the removed
+            # subitem itself - not possible here since a subitem can't
+            # be both dragged and selected at once, but kept for safety
+            # against stale indices - just clear it).
+            if self._selected_sub_index > idx:
+                self._selected_sub_index -= 1
+            elif self._selected_sub_index == idx:
+                self._selected_sub_index = None
         self._prune_video_proxies()
         self._prune_gif_movies()
         self._prune_rich_doc_cache()
@@ -6054,6 +6205,14 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 sub_font.setUnderline(bool(item.get("underline")))
                 self._subitem_font = sub_font
                 text = item.get("text", "")
+                # A "text" subitem that came from a TextNoteItem (as
+                # opposed to a borderless plain-text note, which has no
+                # background of its own) carries its background fill in
+                # "color" - same field TextNoteItem.paint() uses for its
+                # own card background. This was never actually painted
+                # here, so changing a Text Note's background color had no
+                # visible effect until the note was dragged back out of
+                # the Board Card into its own standalone component.
                 # A link gets the same blue tint (and underline, so it
                 # reads as a link even without hovering) as it would as a
                 # standalone Text component; otherwise fall back to the
@@ -6076,6 +6235,12 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 editing_title = idx == self._sub_edit_index and self._sub_edit_field == "title"
                 editing_text = idx == self._sub_edit_index and self._sub_edit_field == "text"
                 painter.save()
+                if item.get("note_type") != "plaintext":
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QColor(item.get("color") or TextNoteItem.DEFAULT_COLOR))
+                    bg_path = QPainterPath()
+                    bg_path.addRoundedRect(r, 6, 6)
+                    painter.drawPath(bg_path)
                 painter.setClipRect(r)
                 if title_h and not editing_title:
                     title_color = QColor(item.get("title_color")) if item.get("title_color") else text_color
@@ -6117,6 +6282,15 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                     QColor("#ff6b6b") if self._drag_sub_will_detach else QColor("#4c8bf5"),
                     2, Qt.DashLine,
                 ))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(hl)
+            elif idx == self._selected_sub_index:
+                # Single-click "selected" state (as opposed to
+                # _sub_edit_index, which is actively-being-edited) - a
+                # solid border, matching the blue outline a standalone
+                # component gets when it's simply selected on the canvas.
+                hl = QRectF(pad, row_top, avail_w, y - row_top - 8)
+                painter.setPen(QPen(QColor("#4c8bf5"), 2))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRect(hl)
 
@@ -6221,9 +6395,18 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                     base_family=(item.get("description_font") or {}).get("font_family") or "Segoe UI",
                     base_size=(item.get("description_font") or {}).get("font_size") or 9.0,
                 ) if show_desc else None
-                t_html = (f'<div class="media-title">{title_rich if title_rich else MediaCardMixin._escape_html(item.get("title",""))}</div>'
+                # The subitem's own Background color (set via the Color
+                # button/dialog when it's single-click selected - see
+                # MainWindow.pick_color) is inlined onto both bars here,
+                # same as the standalone component's own export (see
+                # MediaCardMixin._title_desc_html) - otherwise it'd only
+                # ever show up on the live canvas and the exported HTML
+                # would silently fall back to .media-title/.media-desc's
+                # #1e1e1e default.
+                bg_css = color_to_css(item.get("color")) if item.get("color") else "#1e1e1e"
+                t_html = (f'<div class="media-title" style="background:{bg_css}">{title_rich if title_rich else MediaCardMixin._escape_html(item.get("title",""))}</div>'
                           if show_title else "")
-                d_html = (f'<div class="media-desc">{desc_rich if desc_rich else MediaCardMixin._escape_html(item.get("description",""))}</div>'
+                d_html = (f'<div class="media-desc" style="background:{bg_css}">{desc_rich if desc_rich else MediaCardMixin._escape_html(item.get("description",""))}</div>'
                           if show_desc else "")
                 if kind == "image":
                     media = f'<img src="data:image/png;base64,{item.get("data","")}"/>'
@@ -6982,8 +7165,16 @@ def component_to_subitem(item):
             # this to export the same highlight that shows in the app.
             "title_html": item.title_item.document().toHtml(),
             "description_html": item.description_item.document().toHtml(),
+            "color": item.color,
             "top_strip_enabled": item.top_strip_enabled,
             "top_strip_color": item.top_strip_color,
+            # The standalone item's own size/opacity - purely so
+            # subitem_to_component can restore them if it's later
+            # dragged back out; the card itself always lays this
+            # subitem out at its own column width regardless of these.
+            "w": item._w,
+            "h": item._h,
+            "opacity": item.opacity(),
         }
     if isinstance(item, GifItem):
         return {
@@ -6999,8 +7190,12 @@ def component_to_subitem(item):
             "description_color": item.description_item.defaultTextColor().name(),
             "title_html": item.title_item.document().toHtml(),
             "description_html": item.description_item.document().toHtml(),
+            "color": item.color,
             "top_strip_enabled": item.top_strip_enabled,
             "top_strip_color": item.top_strip_color,
+            "w": item._w,
+            "h": item._h,
+            "opacity": item.opacity(),
         }
     if isinstance(item, VideoItem):
         return {
@@ -7021,8 +7216,12 @@ def component_to_subitem(item):
             "description_color": item.description_item.defaultTextColor().name(),
             "title_html": item.title_item.document().toHtml(),
             "description_html": item.description_item.document().toHtml(),
+            "color": item.color,
             "top_strip_enabled": item.top_strip_enabled,
             "top_strip_color": item.top_strip_color,
+            "w": item._w,
+            "h": item._h,
+            "opacity": item.opacity(),
         }
     if isinstance(item, (TextNoteItem, PlainTextItem)):
         f = item.text_item.font()
@@ -7046,6 +7245,11 @@ def component_to_subitem(item):
             # highlight runs) - see BoardCardItem.to_html(), which needs
             # this to export the same highlight that shows in the app.
             "text_html": item.text_item.document().toHtml(),
+            # Own size/opacity, restored on drag-out only (see "w"/"h"/
+            # "opacity" comment on the ImageItem branch above).
+            "w": item._w,
+            "h": item._h,
+            "opacity": item.opacity(),
         }
         if isinstance(item, TextNoteItem):
             # A Text Note's own title (and whether it's shown) used to be
@@ -7092,6 +7296,7 @@ def component_to_subitem(item):
             "drawing_strokes": copy.deepcopy(item.strokes),
             "drawing_w": item._w,
             "drawing_h": item._h,
+            "opacity": item.opacity(),
         }
     return None
 
@@ -7109,37 +7314,70 @@ def subitem_to_component(subitem, x, y):
         # editable DrawingItem instead of a flat picture.
         w = subitem.get("drawing_w") or 100
         h = subitem.get("drawing_h") or 100
-        return DrawingItem(x, y, w, h, strokes=copy.deepcopy(subitem.get("drawing_strokes", [])))
+        it = DrawingItem(x, y, w, h, strokes=copy.deepcopy(subitem.get("drawing_strokes", [])))
+        if subitem.get("opacity") is not None:
+            it.setOpacity(subitem.get("opacity"))
+        return it
     if kind == "image":
-        return ImageItem(x, y, b64=subitem.get("data"),
-                          title=subitem.get("title", ""), description=subitem.get("description", ""),
-                          show_title=subitem.get("show_title", True),
-                          show_description=subitem.get("show_description", True),
-                          title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
-                          title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"),
-                          top_strip_enabled=subitem.get("top_strip_enabled", False),
-                          top_strip_color=subitem.get("top_strip_color"))
-    if kind == "gif":
-        return GifItem(x, y, b64=subitem.get("data"),
+        it = ImageItem(x, y, w=subitem.get("w") or 240, h=subitem.get("h") or 180,
+                        b64=subitem.get("data"),
                         title=subitem.get("title", ""), description=subitem.get("description", ""),
                         show_title=subitem.get("show_title", True),
                         show_description=subitem.get("show_description", True),
                         title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
                         title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"),
+                        # Rich per-character title/description formatting
+                        # (bold/italic/underline/color/highlight runs) -
+                        # without these, dragging the subitem back out
+                        # silently flattened it to plain text (see
+                        # component_to_subitem, which does capture these,
+                        # and deserialize_component, which already passes
+                        # them through on a normal file load).
+                        title_html=subitem.get("title_html"), desc_html=subitem.get("description_html"),
                         top_strip_enabled=subitem.get("top_strip_enabled", False),
                         top_strip_color=subitem.get("top_strip_color"))
+        if subitem.get("color"):
+            it.set_color(subitem.get("color"))
+        if subitem.get("opacity") is not None:
+            it.setOpacity(subitem.get("opacity"))
+        return it
+    if kind == "gif":
+        it = GifItem(x, y, w=subitem.get("w") or 240, h=subitem.get("h") or 180,
+                      b64=subitem.get("data"),
+                      title=subitem.get("title", ""), description=subitem.get("description", ""),
+                      show_title=subitem.get("show_title", True),
+                      show_description=subitem.get("show_description", True),
+                      title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
+                      title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"),
+                      title_html=subitem.get("title_html"), desc_html=subitem.get("description_html"),
+                      top_strip_enabled=subitem.get("top_strip_enabled", False),
+                      top_strip_color=subitem.get("top_strip_color"))
+        if subitem.get("color"):
+            it.set_color(subitem.get("color"))
+        if subitem.get("opacity") is not None:
+            it.setOpacity(subitem.get("opacity"))
+        return it
     if kind == "video":
-        return VideoItem(x, y, b64=subitem.get("data"),
-                          title=subitem.get("title", ""), description=subitem.get("description", ""),
-                          show_title=subitem.get("show_title", True),
-                          show_description=subitem.get("show_description", True),
-                          title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
-                          title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"),
-                          top_strip_enabled=subitem.get("top_strip_enabled", False),
-                          top_strip_color=subitem.get("top_strip_color"))
+        it = VideoItem(x, y, w=subitem.get("w") or 320, h=subitem.get("h") or 220,
+                        b64=subitem.get("data"),
+                        title=subitem.get("title", ""), description=subitem.get("description", ""),
+                        show_title=subitem.get("show_title", True),
+                        show_description=subitem.get("show_description", True),
+                        title_font=subitem.get("title_font"), desc_font=subitem.get("description_font"),
+                        title_color=subitem.get("title_color"), desc_color=subitem.get("description_color"),
+                        title_html=subitem.get("title_html"), desc_html=subitem.get("description_html"),
+                        top_strip_enabled=subitem.get("top_strip_enabled", False),
+                        top_strip_color=subitem.get("top_strip_color"))
+        if subitem.get("color"):
+            it.set_color(subitem.get("color"))
+        if subitem.get("opacity") is not None:
+            it.setOpacity(subitem.get("opacity"))
+        return it
     if kind == "text":
         cls = PlainTextItem if subitem.get("note_type") == "plaintext" else TextNoteItem
+        default_w, default_h = (220, 50) if cls is PlainTextItem else (220, 140)
         kwargs = dict(
+            w=subitem.get("w") or default_w, h=subitem.get("h") or default_h,
             text=subitem.get("text", ""),
             color=subitem.get("color"),
             font_family=subitem.get("font_family"),
@@ -7158,7 +7396,10 @@ def subitem_to_component(subitem, x, y):
             kwargs["title_html"] = subitem.get("title_html")
             kwargs["top_strip_enabled"] = subitem.get("top_strip_enabled", False)
             kwargs["top_strip_color"] = subitem.get("top_strip_color")
-        return cls(x, y, **kwargs)
+        it = cls(x, y, **kwargs)
+        if subitem.get("opacity") is not None:
+            it.setOpacity(subitem.get("opacity"))
+        return it
     if kind == "checklist":
         # No standalone checklist component exists yet, so fall back to a
         # plain text note listing the checklist items.
@@ -7434,6 +7675,14 @@ class MindMapScene(QGraphicsScene):
         # construction in MainWindow.__init__; may be None briefly during
         # construction/tests, so drawBackground guards for that.
         self.main_window = None
+        # Which Board Card subitem (if any) is currently single-click
+        # "selected" (as opposed to being actively edited via double-
+        # click) - see BoardCardItem._selected_sub_index/_select_subitem.
+        # Only one, across every card on the board, at a time - tracked
+        # here (rather than just on the card) so a click landing
+        # anywhere else can find and clear whichever card currently
+        # holds it without needing to know which card that is.
+        self._subitem_selected_card = None
         self.setSceneRect(-5000, -5000, 10000, 10000)
         self.setBackgroundBrush(QColor("#101012"))
         self.draw_mode = False
@@ -7469,6 +7718,43 @@ class MindMapScene(QGraphicsScene):
         component - see bring_to_front()'s docstring for why that's the
         signal used to decide which z-order band it belongs in."""
         return isinstance(it, ArrowItem) and (it.anchor1 is not None or it.anchor2 is not None)
+
+    def select_board_subitem(self, card, idx):
+        """Mark subitem `idx` of `card` as single-click "selected" - see
+        BoardCardItem._selected_sub_index. Deselects whatever subitem
+        (on this card or any other) was selected this way before, so
+        only one is ever selected across the whole board at a time,
+        mirroring normal component selection."""
+        self.clear_board_subitem_selection()
+        card._selected_sub_index = idx
+        card.update()
+        self._subitem_selected_card = card
+
+    def clear_board_subitem_selection(self):
+        """Deselect whichever subitem is currently single-click
+        "selected" (if any) - called whenever a click lands anywhere
+        that isn't that same subitem (see MindMapView.mousePressEvent),
+        and whenever that subitem stops existing (deleted, detached,
+        or its card removed)."""
+        card = self._subitem_selected_card
+        if card is not None:
+            try:
+                card._selected_sub_index = None
+                card.update()
+            except RuntimeError:
+                pass  # underlying Qt object already deleted
+            self._subitem_selected_card = None
+            # Unlike a subitem being (re-)selected (see select_board_subitem/
+            # BoardCardItem._select_subitem), a plain click-away deselect
+            # like this one never goes through Qt's own selectionChanged
+            # (subitem "selection" was never real Qt selection to begin
+            # with - see BoardCardItem.mousePressEvent), so nothing else
+            # would ever tell the top toolbar to stop showing this
+            # subitem's now-stale Color/Top Strip/Font controls without
+            # this explicit refresh.
+            mw = getattr(self, "main_window", None)
+            if mw is not None:
+                mw.on_selection_changed()
 
     def bring_to_front(self, item):
         """Raise `item` above every other component in its own "band" so
@@ -8165,6 +8451,15 @@ class MindMapView(QGraphicsView):
             self.centerOn(cx, cy)
 
     def mousePressEvent(self, event):
+        # A press anywhere deselects whichever Board Card subitem was
+        # single-click "selected" (see MindMapScene.select_board_subitem)
+        # - if this same press turns out to land on a subitem again (the
+        # same one, a different one, or one in a different card),
+        # BoardCardItem.mouseReleaseEvent below re-selects it right
+        # after; if it lands anywhere else entirely, it simply stays
+        # cleared, exactly like clicking away from a normally-selected
+        # component.
+        self.scene().clear_board_subitem_selection()
         if event.button() == Qt.MiddleButton:
             self._panning = True
             self._pan_start = event.position().toPoint()
@@ -9092,6 +9387,15 @@ class MainWindow(QMainWindow):
         # in-place "text" subitem editor (_SubitemTextEdit) - see
         # BoardCardItem.font_targets and on_selection_changed.
         self._active_text_board_card = None
+        # (card, subitem-dict) currently single-click "selected" inside
+        # a Board Card - see on_selection_changed/pick_color/
+        # delete_selection. None whenever nothing is.
+        self._selected_board_subitem = None
+        # Mirrors _top_strip_selection above, but for a single-click
+        # "selected" Board Card subitem (a plain dict, not a live
+        # TopStripMixin instance, so it can't just be folded into that
+        # list) - see on_selection_changed/on_top_strip_toggled.
+        self._top_strip_selected_subitem = None
         # The most recent text item that was genuinely in edit mode -
         # kept around (independent of _active_label_arrow's narrower
         # "is this arrow's label the font-panel target" bookkeeping) so
@@ -9748,17 +10052,39 @@ class MainWindow(QMainWindow):
         # subitem is essentially never actually "selected". Clearing is
         # instead driven directly by whether that specific edit is
         # still live.
+        # A Board Card subitem that's single-click "selected" (not being
+        # edited) - see BoardCardItem._selected_sub_index/_select_subitem
+        # and MindMapScene.select_board_subitem. Computed once here and
+        # reused below (font_sel inclusion, color swatch, pick_color,
+        # delete_selection) so a subitem gets the same top-toolbar
+        # editing a standalone component gets when simply selected.
+        selected_sub_card = self.scene._subitem_selected_card
+        selected_sub = None
+        if selected_sub_card is not None:
+            try:
+                si = selected_sub_card._selected_sub_index
+                if si is not None and si < len(selected_sub_card.subitems):
+                    selected_sub = selected_sub_card.subitems[si]
+            except RuntimeError:
+                selected_sub_card = None
+        selected_sub_is_text = selected_sub is not None and selected_sub.get("kind") == "text"
+        self._selected_board_subitem = (
+            (selected_sub_card, selected_sub) if selected_sub is not None else None
+        )
         if editing_item is not None and isinstance(editing_item.parentItem(), BoardCardItem) and (
             editing_item is editing_item.parentItem().title_item
             or editing_item.parentItem()._sub_edit_item is editing_item
         ):
             self._active_text_board_card = editing_item.parentItem()
+        elif editing_item is None and selected_sub_is_text:
+            self._active_text_board_card = selected_sub_card
         elif self._active_text_board_card is not None:
             card = self._active_text_board_card
             try:
                 still_active = (
                     card.title_item.textInteractionFlags() == Qt.TextEditorInteraction
                     or card._sub_edit_item is not None
+                    or (card is selected_sub_card and selected_sub_is_text)
                 )
             except RuntimeError:
                 still_active = False
@@ -9811,10 +10137,27 @@ class MainWindow(QMainWindow):
             self.arrow_style_combo.blockSignals(False)
 
         self._text_note_selection = text_note_sel or None
-        self.title_checkbox_action.setVisible(bool(text_note_sel))
+        # A single-click-selected Board Card "text" subitem that came
+        # from a TextNoteItem (not a plain-text note - those have no
+        # title bar at all) gets the exact same Title checkbox treatment
+        # as its standalone counterpart, just stored as a plain dict -
+        # mirrors the analogous _top_strip_selected_subitem handling
+        # further below, which this file already does for Top Strip.
+        selected_sub_is_text_note = (
+            selected_sub is not None and selected_sub.get("kind") == "text"
+            and selected_sub.get("note_type") != "plaintext"
+        )
+        self._title_selected_subitem = (
+            (selected_sub_card, selected_sub) if selected_sub_is_text_note else None
+        )
+        self.title_checkbox_action.setVisible(bool(text_note_sel) or selected_sub_is_text_note)
         if text_note_sel:
             self.title_checkbox.blockSignals(True)
             self.title_checkbox.setChecked(text_note_sel[0].show_title)
+            self.title_checkbox.blockSignals(False)
+        elif selected_sub_is_text_note:
+            self.title_checkbox.blockSignals(True)
+            self.title_checkbox.setChecked(bool(selected_sub.get("show_title")))
             self.title_checkbox.blockSignals(False)
 
         drawing_sel = [it for it in all_sel if isinstance(it, DrawingItem)]
@@ -9832,14 +10175,28 @@ class MainWindow(QMainWindow):
             self.arrow_label_checkbox.blockSignals(False)
 
         self._media_selection = media_sel or None
-        self.media_title_checkbox_action.setVisible(bool(media_sel))
-        self.media_desc_checkbox_action.setVisible(bool(media_sel))
+        # Same idea as selected_sub_is_text_note above, but for an
+        # image/gif/video Board Card subitem - these always carry
+        # show_title/show_description regardless of where they came from.
+        selected_sub_is_media = selected_sub is not None and selected_sub.get("kind") in ("image", "gif", "video")
+        self._media_selected_subitem = (
+            (selected_sub_card, selected_sub) if selected_sub_is_media else None
+        )
+        self.media_title_checkbox_action.setVisible(bool(media_sel) or selected_sub_is_media)
+        self.media_desc_checkbox_action.setVisible(bool(media_sel) or selected_sub_is_media)
         if media_sel:
             self.media_title_checkbox.blockSignals(True)
             self.media_title_checkbox.setChecked(media_sel[0].show_title)
             self.media_title_checkbox.blockSignals(False)
             self.media_desc_checkbox.blockSignals(True)
             self.media_desc_checkbox.setChecked(media_sel[0].show_description)
+            self.media_desc_checkbox.blockSignals(False)
+        elif selected_sub_is_media:
+            self.media_title_checkbox.blockSignals(True)
+            self.media_title_checkbox.setChecked(bool(selected_sub.get("show_title", True)))
+            self.media_title_checkbox.blockSignals(False)
+            self.media_desc_checkbox.blockSignals(True)
+            self.media_desc_checkbox.setChecked(bool(selected_sub.get("show_description", True)))
             self.media_desc_checkbox.blockSignals(False)
 
         # Top Strip - Text Note, Image, GIF, Video, Board Card (see
@@ -9848,10 +10205,29 @@ class MainWindow(QMainWindow):
         # one of the type-specific *_sel lists above.
         top_strip_sel = [it for it in all_sel if isinstance(it, TopStripMixin)]
         self._top_strip_selection = top_strip_sel or None
-        self.top_strip_checkbox_action.setVisible(bool(top_strip_sel))
+        # A single-click-selected Board Card subitem has the exact same
+        # Top Strip role as its standalone counterpart, just stored as a
+        # plain dict (kind "image"/"gif"/"video" always has it; kind
+        # "text" only when it came from a TextNoteItem, not a plain-text
+        # note - see component_to_subitem/subitem_to_component) - can't
+        # be folded into top_strip_sel above since it isn't a live
+        # TopStripMixin instance, so it's tracked separately here and in
+        # on_top_strip_toggled.
+        selected_sub_has_strip = selected_sub is not None and (
+            selected_sub.get("kind") in ("image", "gif", "video")
+            or (selected_sub.get("kind") == "text" and selected_sub.get("note_type") != "plaintext")
+        )
+        self._top_strip_selected_subitem = (
+            (selected_sub_card, selected_sub) if selected_sub_has_strip else None
+        )
+        self.top_strip_checkbox_action.setVisible(bool(top_strip_sel) or selected_sub_has_strip)
         if top_strip_sel:
             self.top_strip_checkbox.blockSignals(True)
             self.top_strip_checkbox.setChecked(top_strip_sel[0].top_strip_enabled)
+            self.top_strip_checkbox.blockSignals(False)
+        elif selected_sub_has_strip:
+            self.top_strip_checkbox.blockSignals(True)
+            self.top_strip_checkbox.setChecked(bool(selected_sub.get("top_strip_enabled")))
             self.top_strip_checkbox.blockSignals(False)
 
         self._board_link_selection = board_link_sel or None
@@ -9866,7 +10242,7 @@ class MainWindow(QMainWindow):
         # otherwise it'd leave a stray divider mark on the toolbar even
         # with nothing selected.
         self.checkbox_group_sep.setVisible(
-            bool(text_note_sel or arrow_sel or media_sel or top_strip_sel or board_link_sel)
+            bool(text_note_sel or arrow_sel or media_sel or top_strip_sel or board_link_sel or selected_sub_has_strip)
         )
 
         if editing_item is not None:
@@ -9886,6 +10262,19 @@ class MainWindow(QMainWindow):
                 # Table (its closest analog to "this item's color").
                 if isinstance(first, TableItem):
                     col = QColor(first.header_bg)
+                elif isinstance(first, BoardCardItem) and first is selected_sub_card and selected_sub_is_text:
+                    if selected_sub.get("note_type") == "plaintext":
+                        # Its only color role - see _subitem_text_color.
+                        col = BoardCardItem._subitem_text_color(selected_sub)
+                    else:
+                        # A Text Note subitem - preview its Background
+                        # fill, the color role Color now restyles for it
+                        # (matching its standalone TextNoteItem
+                        # counterpart) - not its text color, which is
+                        # only restyled while actively editing it (see
+                        # pick_color's editing_item branch).
+                        col = (QColor(selected_sub.get("color"))
+                               if selected_sub.get("color") else QColor(TextNoteItem.DEFAULT_COLOR))
                 else:
                     default = getattr(first, "DEFAULT_COLOR", None) or "#ffffff"
                     col = QColor(first.color) if first.color else QColor(default)
@@ -9944,6 +10333,14 @@ class MainWindow(QMainWindow):
         elif other_sel:
             first = other_sel[0]
             col = QColor(first.color) if getattr(first, "color", None) else QColor(getattr(first, "DEFAULT_COLOR", None) or "#ffffff")
+            self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+        elif selected_sub is not None and selected_sub.get("kind") in ("image", "gif", "video"):
+            # A single-click-selected image/gif/video subitem previews
+            # its own Background color here, same as its standalone
+            # counterpart (see the other_sel branch above) - Top Strip
+            # is its other color role but only shows in the picker
+            # itself (see pick_color()), same as standalone components.
+            col = QColor(selected_sub.get("color")) if selected_sub.get("color") else QColor("#1e1e1e")
             self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
         elif editing_item is None:
             self._set_brush_color(self.scene.brush_color)
@@ -10092,6 +10489,69 @@ class MainWindow(QMainWindow):
                             parent.update()
             self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
             return
+        if self._selected_board_subitem is not None:
+            # A single-click-selected Board Card subitem (not being
+            # edited) - Color restyles it the exact same way it would
+            # restyle its standalone counterpart: text color for a
+            # "text" subitem, the Top Strip accent for image/gif/video
+            # (their only other color role, mirroring the standalone
+            # Image/GIF/Video/TopStripMixin components these came from).
+            card, sub = self._selected_board_subitem
+            kind = sub.get("kind")
+            if kind == "text":
+                if sub.get("note_type") == "plaintext":
+                    # A plain-text subitem has just the one color role -
+                    # its text color (see _subitem_text_color) - same as
+                    # its standalone PlainTextItem counterpart, which
+                    # isn't a TopStripMixin and so has no Background/Top
+                    # Strip roles to offer here.
+                    start = BoardCardItem._subitem_text_color(sub)
+                    color = QColorDialog.getColor(start, self, "Pick text color")
+                    if not color.isValid():
+                        return
+                    sub["color"] = color.name()
+                    card.update()
+                    self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
+                    return
+                # A Text Note subitem: "color" is its Background fill -
+                # its actual text color lives in "text_color" and is
+                # only restyled while actively editing it (see the
+                # editing_item branch above) - plus Top Strip, the same
+                # two color roles its standalone TextNoteItem
+                # counterpart offers via Color, always shown together
+                # regardless of whether the strip is currently on.
+                bg_start = QColor(sub.get("color")) if sub.get("color") else QColor(TextNoteItem.DEFAULT_COLOR)
+                strip_start = QColor(sub.get("top_strip_color") or TopStripMixin.DEFAULT_STRIP_COLOR)
+                bg, strip = open_bg_strip_color_dialog(
+                    self, bg_start, strip_start, bg_label="Background",
+                )
+                if bg is None:
+                    return
+                sub["color"] = bg.name()
+                sub["top_strip_color"] = strip.name()
+                card.update()
+                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #888;")
+                return
+            if kind in ("image", "gif", "video"):
+                # Background and Top Strip are always offered together
+                # here, same as the standalone Image/GIF/Video component
+                # now gets from the _other_selection branch below - the
+                # checkbox (see on_top_strip_toggled) still controls
+                # whether the strip actually shows, this just lets its
+                # color be set/previewed at any time instead of only
+                # after switching it on first.
+                bg_start = QColor(sub.get("color")) if sub.get("color") else QColor("#1e1e1e")
+                strip_start = QColor(sub.get("top_strip_color") or TopStripMixin.DEFAULT_STRIP_COLOR)
+                bg, strip = open_bg_strip_color_dialog(
+                    self, bg_start, strip_start, bg_label="Background",
+                )
+                if bg is None:
+                    return
+                sub["color"] = bg.name()
+                sub["top_strip_color"] = strip.name()
+                card.update()
+                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #888;")
+                return
         if self._editing_selection:
             first = self._editing_selection[0]
             if isinstance(first, DrawingItem) and first.strokes:
@@ -10115,7 +10575,13 @@ class MainWindow(QMainWindow):
             # component's own color - the background fill for a Text
             # Note, or (its only color) the text color for a plain Text.
             first = self._text_selection[0]
-            if isinstance(first, TopStripMixin) and first.top_strip_enabled:
+            if isinstance(first, TopStripMixin):
+                # Background and Top Strip are always offered together
+                # here, regardless of whether the strip is currently
+                # switched on - the checkbox (see on_top_strip_toggled)
+                # still controls whether it actually shows, this just
+                # lets its color be set/previewed at any time instead of
+                # only after enabling it first.
                 bg, strip = open_bg_strip_color_dialog(
                     self, QColor(first.color) if first.color else QColor(first.DEFAULT_COLOR),
                     QColor(first.top_strip_color), bg_label=first.COLOR_TAB_LABEL,
@@ -10147,7 +10613,10 @@ class MainWindow(QMainWindow):
                 # its dedicated settings dialog instead of QColorDialog.
                 first.open_settings_dialog(self)
                 return
-            if isinstance(first, TopStripMixin) and first.top_strip_enabled:
+            if isinstance(first, TopStripMixin):
+                # Same as the _text_selection branch above: both color
+                # roles are always offered together, independent of
+                # whether Top Strip is currently switched on.
                 bg, strip = open_bg_strip_color_dialog(
                     self,
                     QColor(first.color) if getattr(first, "color", None) else QColor(getattr(first, "DEFAULT_COLOR", None) or "#ffffff"),
@@ -10447,11 +10916,18 @@ class MainWindow(QMainWindow):
             it.update()
 
     def on_title_toggled(self, checked):
-        if not getattr(self, "_text_note_selection", None):
+        if getattr(self, "_text_note_selection", None):
+            for it in self._text_note_selection:
+                if it.show_title != checked:
+                    it._toggle_show_title()
             return
-        for it in self._text_note_selection:
-            if it.show_title != checked:
-                it._toggle_show_title()
+        sub_info = getattr(self, "_title_selected_subitem", None)
+        if sub_info:
+            card, sub = sub_info
+            if bool(sub.get("show_title")) != checked:
+                sub["show_title"] = checked
+                card._autogrow_to_fit()
+                card.update()
 
     def on_allow_board_card_toggled(self, checked):
         if not getattr(self, "_drawing_selection", None):
@@ -10467,25 +10943,45 @@ class MainWindow(QMainWindow):
                 it._toggle_show_label()
 
     def on_media_title_toggled(self, checked):
-        if not getattr(self, "_media_selection", None):
+        if getattr(self, "_media_selection", None):
+            for it in self._media_selection:
+                if it.show_title != checked:
+                    it._toggle_show_title()
             return
-        for it in self._media_selection:
-            if it.show_title != checked:
-                it._toggle_show_title()
+        sub_info = getattr(self, "_media_selected_subitem", None)
+        if sub_info:
+            card, sub = sub_info
+            if bool(sub.get("show_title", True)) != checked:
+                sub["show_title"] = checked
+                card._autogrow_to_fit()
+                card.update()
 
     def on_media_desc_toggled(self, checked):
-        if not getattr(self, "_media_selection", None):
+        if getattr(self, "_media_selection", None):
+            for it in self._media_selection:
+                if it.show_description != checked:
+                    it._toggle_show_description()
             return
-        for it in self._media_selection:
-            if it.show_description != checked:
-                it._toggle_show_description()
+        sub_info = getattr(self, "_media_selected_subitem", None)
+        if sub_info:
+            card, sub = sub_info
+            if bool(sub.get("show_description", True)) != checked:
+                sub["show_description"] = checked
+                card._autogrow_to_fit()
+                card.update()
 
     def on_top_strip_toggled(self, checked):
-        if not getattr(self, "_top_strip_selection", None):
+        if getattr(self, "_top_strip_selection", None):
+            for it in self._top_strip_selection:
+                if it.top_strip_enabled != checked:
+                    it._toggle_top_strip()
             return
-        for it in self._top_strip_selection:
-            if it.top_strip_enabled != checked:
-                it._toggle_top_strip()
+        sub_info = getattr(self, "_top_strip_selected_subitem", None)
+        if sub_info:
+            card, sub = sub_info
+            if bool(sub.get("top_strip_enabled")) != checked:
+                sub["top_strip_enabled"] = checked
+                card.update()
 
     def on_board_link_desc_toggled(self, checked):
         if not getattr(self, "_board_link_selection", None):
@@ -10827,6 +11323,30 @@ class MainWindow(QMainWindow):
                 new_item.setSelected(True)
 
     def delete_selection(self):
+        if self._selected_board_subitem is not None:
+            # A single-click-selected Board Card subitem, not a real
+            # scene selection - remove it from its card's own subitems
+            # list instead (scene.selectedItems() wouldn't include it at
+            # all - see the comment above board_text_sel's computation
+            # in on_selection_changed for why).
+            card, sub = self._selected_board_subitem
+            try:
+                idx = card.subitems.index(sub)
+            except ValueError:
+                idx = None
+            if idx is not None:
+                card.subitems.pop(idx)
+                if card._selected_sub_index is not None and card._selected_sub_index > idx:
+                    card._selected_sub_index -= 1
+                card._prune_video_proxies()
+                card._prune_gif_movies()
+                card._prune_rich_doc_cache()
+                card._prune_image_pixmap_cache()
+                card._prune_subitem_scaled_cache()
+                card._autogrow_to_fit()
+            self.scene.clear_board_subitem_selection()
+            self.on_selection_changed()
+            return
         for it in list(self.scene.selectedItems()):
             self.scene.removeItem(it)
 
@@ -10916,7 +11436,9 @@ class MainWindow(QMainWindow):
         self._last_edited_text_item = None
         self._active_label_arrow = None
         self._active_text_board_card = None
-        self._editing_selection = None
+        self._selected_board_subitem = None
+        if self.scene is not None:
+            self.scene._subitem_selected_card = None
         self._text_selection = None
         self._font_selection = None
         self._arrow_selection = None
@@ -10924,6 +11446,7 @@ class MainWindow(QMainWindow):
         self._text_note_selection = None
         self._media_selection = None
         self._top_strip_selection = None
+        self._top_strip_selected_subitem = None
 
     def _restore_undo_snapshot(self, snapshot_json):
         self._undo_restoring = True
