@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QToolButton,
     QFontComboBox, QInputDialog, QCompleter, QCheckBox,
     QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QDoubleSpinBox, QGridLayout, QLineEdit,
-    QSizePolicy, QTabWidget,
+    QSizePolicy, QTabWidget, QRadioButton, QButtonGroup,
 )
 
 try:
@@ -980,6 +980,26 @@ def _font_from_dict(d, base_family="Segoe UI", base_size=10.0, base_bold=False):
 PREF_ALIGN_OPTIONS = [("left", "Left"), ("center", "Center"), ("right", "Right")]
 PREF_ALIGN_TO_QT = {"left": Qt.AlignLeft, "center": Qt.AlignHCenter, "right": Qt.AlignRight}
 
+# Arrow endpoint snapping method - governs how an anchored arrow endpoint
+# behaves once its target component moves (see ArrowItem.refresh_anchors /
+# _effective_snap_method):
+#   "orbit"    - (default, previous-and-only behaviour) the endpoint keeps
+#                re-picking whichever border point on the target currently
+#                faces the arrow's other end, so it slides all the way
+#                around the target as things move - see _border_point.
+#   "absolute" - the endpoint stays glued to the exact point on the target
+#                it was originally dropped on ("punkt zaczepienia") and
+#                only tracks the target's own move/resize, never re-orbits
+#                to face the other end.
+# The app-wide default lives in Preferences; any individual component can
+# override it for itself via its own context menu's "Arrow Snapping"
+# submenu (see BaseComponentItem.arrow_snap_method / _add_arrow_snap_menu).
+ARROW_SNAP_METHODS = ["orbit", "absolute"]
+ARROW_SNAP_METHOD_OPTIONS = [
+    ("orbit", "Snap Around All Sides (Orbit)"),
+    ("absolute", "Snap To Fixed Anchor Point (Absolute)"),
+]
+
 DEFAULT_PREFS = {
     "default_show_title": True,
     "default_show_description": True,
@@ -998,6 +1018,7 @@ DEFAULT_PREFS = {
     # extreme zoom-out anyway.
     "optimize_grid_rendering": True,
     "grid_disable_zoom_percent": 15.0,  # skip the dot grid once zoom <= this %
+    "default_arrow_snap_method": "orbit",  # one of ARROW_SNAP_METHODS
 }
 
 
@@ -1034,6 +1055,8 @@ def load_app_preferences():
             s.value("grid_disable_zoom_percent", DEFAULT_PREFS["grid_disable_zoom_percent"]))
     except (TypeError, ValueError):
         prefs["grid_disable_zoom_percent"] = DEFAULT_PREFS["grid_disable_zoom_percent"]
+    snap_method = s.value("default_arrow_snap_method", DEFAULT_PREFS["default_arrow_snap_method"])
+    prefs["default_arrow_snap_method"] = snap_method if snap_method in ARROW_SNAP_METHODS else "orbit"
     s.endGroup()
     return prefs
 
@@ -1050,6 +1073,7 @@ def save_app_preferences(prefs):
     s.setValue("default_arrow_size", int(prefs.get("default_arrow_size", 4)))
     s.setValue("optimize_grid_rendering", bool(prefs.get("optimize_grid_rendering", True)))
     s.setValue("grid_disable_zoom_percent", float(prefs.get("grid_disable_zoom_percent", 15.0)))
+    s.setValue("default_arrow_snap_method", prefs.get("default_arrow_snap_method", "orbit"))
     s.endGroup()
 
 
@@ -1355,6 +1379,15 @@ class BaseComponentItem(QGraphicsObject):
         # preview line on the target card as the drag moves, instead of
         # only deciding a drop position at release time.
         self._hover_board = None
+        # Per-component override of the app-wide Preferences > Default
+        # Arrow Snapping Method, set via this item's own context menu
+        # (see _add_arrow_snap_menu) - None means "use the app-wide
+        # default". Only meaningful for components that can actually be
+        # an arrow's anchor target (see ANCHOR_TARGET_TYPES /
+        # ArrowItem._effective_snap_method), but harmless to carry on
+        # every component type.
+        self.arrow_snap_method = None
+        self._snap_method_actions = {}
 
     # -- geometry -----------------------------------------------------
     def boundingRect(self):
@@ -1578,9 +1611,36 @@ class BaseComponentItem(QGraphicsObject):
         don't reach here)."""
         pass
 
+    def _add_arrow_snap_menu(self, menu):
+        """Adds an "Arrow Snapping" submenu with a radio-style choice
+        (QActionGroup, mutually exclusive) between the app-wide default
+        and each ARROW_SNAP_METHOD_OPTIONS value, for components that can
+        be an arrow's anchor target - see ArrowItem._effective_snap_method,
+        which consults self.arrow_snap_method (set below) ahead of
+        Preferences > Default Arrow Snapping Method."""
+        snap_menu = menu.addMenu("Arrow Snapping")
+        group = QActionGroup(snap_menu)
+        group.setExclusive(True)
+        self._snap_method_actions = {}
+        current = self.arrow_snap_method
+        default_act = snap_menu.addAction("Use Default (Preferences)")
+        default_act.setCheckable(True)
+        default_act.setChecked(current not in ARROW_SNAP_METHODS)
+        group.addAction(default_act)
+        self._snap_method_actions[default_act] = None
+        for value, label in ARROW_SNAP_METHOD_OPTIONS:
+            act = snap_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(current == value)
+            group.addAction(act)
+            self._snap_method_actions[act] = value
+        menu.addSeparator()
+
     def contextMenuEvent(self, event):
         menu = QMenu()
         self._build_context_menu(menu)
+        if isinstance(self, ANCHOR_TARGET_TYPES):
+            self._add_arrow_snap_menu(menu)
         color_action = menu.addAction("Change Color\u2026")
         menu.addSeparator()
         dup_action = menu.addAction("Duplicate")
@@ -1599,6 +1659,8 @@ class BaseComponentItem(QGraphicsObject):
                 self.scene().addItem(new_item)
         elif chosen == color_action:
             self._open_color_dialog()
+        elif chosen in self._snap_method_actions:
+            self.arrow_snap_method = self._snap_method_actions[chosen]
         elif chosen is not None:
             self._handle_context_action(chosen)
 
@@ -1624,6 +1686,7 @@ class BaseComponentItem(QGraphicsObject):
             "z": self.zValue(),
             "color": self.color,
             "opacity": self.opacity(),
+            "arrow_snap_method": self.arrow_snap_method,
         }
 
     def to_html(self):
@@ -3769,6 +3832,42 @@ class ArrowItem(BaseComponentItem):
             return None
         return target
 
+    def _effective_snap_method(self, target):
+        """Resolve which method - "orbit" or "absolute" - governs an
+        endpoint anchored to `target`: that component's own per-item
+        override (self.arrow_snap_method, set via its context menu's
+        "Arrow Snapping" submenu - see BaseComponentItem._add_arrow_snap_
+        menu) if it has one, otherwise the app-wide Preferences > Default
+        Arrow Snapping Method. Falls back to "orbit" (the original, only
+        prior behaviour) if neither is available."""
+        method = getattr(target, "arrow_snap_method", None)
+        if method in ARROW_SNAP_METHODS:
+            return method
+        scene = self.scene()
+        mw = getattr(scene, "main_window", None) if scene is not None else None
+        prefs = getattr(mw, "prefs", None) if mw is not None else None
+        if prefs:
+            method = prefs.get("default_arrow_snap_method", "orbit")
+            if method in ARROW_SNAP_METHODS:
+                return method
+        return "orbit"
+
+    @staticmethod
+    def _anchor_fixed_scene_point(anchor):
+        """Where an "absolute"-method anchored endpoint sits: the exact
+        same local (rx, ry) point on target it was originally dropped on
+        (the "punkt zaczepienia" / attachment point - set once in
+        _set_anchor and never re-picked afterwards for this method),
+        rescaled to target's *current* width/height so it still tracks a
+        move or resize. Unlike _anchor_scene_point (the "orbit" method),
+        this never re-faces the arrow's other endpoint - the point simply
+        stays glued to the same spot on target."""
+        target = anchor["item"]
+        w = max(1.0, target._w)
+        h = max(1.0, target._h)
+        local = QPointF(anchor["rx"] * w, anchor["ry"] * h)
+        return target.mapToScene(local)
+
     def _set_anchor(self, endpoint, target, scene_pt):
         _local_edge, (rx, ry), side = self._border_point(target, scene_pt)
         anchor = {"item": target, "rx": rx, "ry": ry, "side": side}
@@ -3856,14 +3955,20 @@ class ArrowItem(BaseComponentItem):
             if target is None:
                 self.anchor1 = None
             elif mover is target:
-                p1_scene = self._anchor_scene_point(self.anchor1, p2_scene)
+                if self._effective_snap_method(target) == "absolute":
+                    p1_scene = self._anchor_fixed_scene_point(self.anchor1)
+                else:
+                    p1_scene = self._anchor_scene_point(self.anchor1, p2_scene)
                 changed = True
         if self.anchor2 is not None and self._drag_endpoint != 2:
             target = self._live_anchor_target(self.anchor2)
             if target is None:
                 self.anchor2 = None
             elif mover is target:
-                p2_scene = self._anchor_scene_point(self.anchor2, p1_scene)
+                if self._effective_snap_method(target) == "absolute":
+                    p2_scene = self._anchor_fixed_scene_point(self.anchor2)
+                else:
+                    p2_scene = self._anchor_scene_point(self.anchor2, p1_scene)
                 changed = True
         if changed:
             self._sync_geometry(p1_scene, p2_scene)
@@ -7524,6 +7629,8 @@ def deserialize_component(d):
         item.top_strip_enabled = bool(d.get("top_strip_enabled", False))
         if d.get("top_strip_color"):
             item.top_strip_color = d.get("top_strip_color")
+    snap_method = d.get("arrow_snap_method")
+    item.arrow_snap_method = snap_method if snap_method in ARROW_SNAP_METHODS else None
     return item
 
 
@@ -9231,6 +9338,29 @@ class PreferencesDialog(QDialog):
 
         layout.addLayout(form)
 
+        arrow_snap_label = QLabel("Default Arrow Snapping Method")
+        arrow_snap_label.setStyleSheet("font-weight:600; margin-top:8px;")
+        layout.addWidget(arrow_snap_label)
+        arrow_snap_hint = QLabel(
+            "Applies to any component without its own override (set via "
+            "that component's right-click menu \u2192 Arrow Snapping)."
+        )
+        arrow_snap_hint.setWordWrap(True)
+        arrow_snap_hint.setStyleSheet("color:#888; font-size:11px;")
+        layout.addWidget(arrow_snap_hint)
+
+        self.arrow_snap_group = QButtonGroup(self)
+        current_snap_method = prefs.get("default_arrow_snap_method", "orbit")
+        for i, (value, label) in enumerate(ARROW_SNAP_METHOD_OPTIONS):
+            rb = QRadioButton(label)
+            rb.setChecked(current_snap_method == value)
+            self.arrow_snap_group.addButton(rb, i)
+            layout.addWidget(rb)
+        if self.arrow_snap_group.checkedButton() is None:
+            first = self.arrow_snap_group.button(0)
+            if first is not None:
+                first.setChecked(True)
+
         perf_label = QLabel("Performance")
         perf_label.setStyleSheet("font-weight:600; margin-top:8px;")
         layout.addWidget(perf_label)
@@ -9305,6 +9435,9 @@ class PreferencesDialog(QDialog):
         self.main_window.prefs["default_arrow_size"] = self.arrow_size_spin.value()
         self.main_window.prefs["optimize_grid_rendering"] = self.optimize_grid_checkbox.isChecked()
         self.main_window.prefs["grid_disable_zoom_percent"] = self.grid_zoom_threshold_spin.value()
+        checked_id = self.arrow_snap_group.checkedId()
+        if 0 <= checked_id < len(ARROW_SNAP_METHOD_OPTIONS):
+            self.main_window.prefs["default_arrow_snap_method"] = ARROW_SNAP_METHOD_OPTIONS[checked_id][0]
         save_app_preferences(self.main_window.prefs)
         self.main_window.scene.update()
         self.accept()
