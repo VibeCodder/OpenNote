@@ -515,6 +515,43 @@ def _make_toolbar_icon(kind, size=20, color="#e8e8e8"):
     return QIcon(pm)
 
 
+def _make_pause_svg_icon(size=16, color="#eee"):
+    """Self-generated SVG pause icon (two vertical bars), used for the
+    video player's play/pause button while playback is running (see
+    VideoPlayerNode._on_playback_state_changed). Rendered through
+    QSvgRenderer the same way thumb_to_pixmap renders .svg thumbnails,
+    with the same fallback to QPixmap's own SVG-capable loader so this
+    still works even without the QtSvg Python module available."""
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
+        f'viewBox="0 0 24 24">'
+        f'<rect x="5" y="3" width="5" height="18" rx="1.2" fill="{color}"/>'
+        f'<rect x="14" y="3" width="5" height="18" rx="1.2" fill="{color}"/>'
+        f'</svg>'
+    )
+    raw = svg.encode("utf-8")
+    pm = None
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+        renderer = QSvgRenderer(QByteArray(raw))
+        if renderer.isValid():
+            pm = QPixmap(size, size)
+            pm.fill(Qt.transparent)
+            painter = QPainter(pm)
+            renderer.render(painter, QRectF(0, 0, size, size))
+            painter.end()
+    except Exception:
+        pm = None
+    if pm is None or pm.isNull():
+        # Fallback: Qt's own image-format plugin can rasterize SVG too,
+        # when it's installed alongside QtSvg.
+        pm = QPixmap()
+        if not (pm.loadFromData(raw) and not pm.isNull()):
+            pm = QPixmap(size, size)
+            pm.fill(Qt.transparent)
+    return QIcon(pm)
+
+
 # --------------------------------------------------------------------------
 # Editable text item (used for note text and board card titles)
 # --------------------------------------------------------------------------
@@ -3062,7 +3099,13 @@ class VideoPlayerNode(QGraphicsObject):
         self.mute_btn.setText("\U0001F507" if muted else "\U0001F50A")
 
     def _on_playback_state_changed(self, state):
-        self.play_btn.setText("\u23F8" if state == QMediaPlayer.PlayingState else "\u25B6")
+        if state == QMediaPlayer.PlayingState:
+            self.play_btn.setText("")
+            self.play_btn.setIcon(_make_pause_svg_icon())
+            self.play_btn.setIconSize(QSize(12, 12))
+        else:
+            self.play_btn.setIcon(QIcon())
+            self.play_btn.setText("\u25B6")
 
     @staticmethod
     def _fmt_ms(ms):
