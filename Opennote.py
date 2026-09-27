@@ -9486,6 +9486,252 @@ class PreferencesDialog(QDialog):
         self.accept()
 
 
+# --------------------------------------------------------------------------
+# Find & Replace
+# --------------------------------------------------------------------------
+#
+# A search "target" is one block of rich text somewhere on the current
+# board. Most of them (a Text Note's title/body, a Table cell, an Arrow's
+# label, ...) are backed by a permanently-live EditableTextItem, so they
+# can be searched/replaced by manipulating that item's QTextDocument
+# directly - see _EditableRef.
+#
+# A Board Card's "text"/media subitems are different: their content is
+# plain dict fields (subitem["text"], subitem["text_html"], ...) that only
+# get a real, live QTextDocument while the card's temporary in-place edit
+# overlay (_SubitemTextEdit, via BoardCardItem._begin_edit_subitem[_field])
+# is open. _SubitemRef spins that overlay up on open() and tears it back
+# down on close(), so the exact same QTextCursor-based search/replace code
+# in MainWindow works uniformly across both kinds of target.
+
+def _is_whole_word_match(text, start, length):
+    """True if text[start:start+length] isn't glued to more word
+    characters on either side - used by Find & Replace's "Whole word"
+    option."""
+    before_ok = start == 0 or not (text[start - 1].isalnum() or text[start - 1] == "_")
+    after = start + length
+    after_ok = after >= len(text) or not (text[after].isalnum() or text[after] == "_")
+    return before_ok and after_ok
+
+
+class _EditableRef:
+    """A search target backed by an always-live EditableTextItem (a Text
+    Note's title/body, a Table cell, an Arrow label, a media title/
+    description, a Board Card's own title, a Board Link's description)."""
+
+    def __init__(self, component, text_item):
+        self.component = component
+        self.text_item = text_item
+
+    def plain_text(self):
+        return self.text_item.toPlainText()
+
+    def open(self):
+        if self.text_item.textInteractionFlags() != Qt.TextEditorInteraction:
+            self.text_item.setTextInteractionFlags(Qt.TextEditorInteraction)
+        return self.text_item
+
+    def close(self):
+        cursor = self.text_item.textCursor()
+        cursor.clearSelection()
+        self.text_item.setTextCursor(cursor)
+        self.text_item.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.text_item.clearFocus()
+
+    def __eq__(self, other):
+        return isinstance(other, _EditableRef) and other.text_item is self.text_item
+
+    def __hash__(self):
+        return hash(id(self.text_item))
+
+
+class _SubitemRef:
+    """A search target backed by a Board Card subitem's data-dict field -
+    "text" (a "text" subitem's body, via _begin_edit_subitem) or "title"/
+    "description" (a "text" subitem's optional title, or an image/gif/
+    video subitem's title/description, via _begin_edit_subitem_field)."""
+
+    def __init__(self, card, idx, field):
+        self.component = card
+        self.idx = idx
+        self.field = field
+
+    def plain_text(self):
+        if self.idx >= len(self.component.subitems):
+            return ""
+        return self.component.subitems[self.idx].get(self.field, "") or ""
+
+    def _rect_ready(self):
+        """Whether the on-screen rect this field's edit overlay needs to
+        be positioned at has actually been computed yet. Both
+        _subitem_rects and _subitem_td_click_rects are filled in by
+        BoardCardItem.paint(), so a card that hasn't been painted even
+        once yet (freshly created off-screen, e.g.) won't have them -
+        _begin_edit_subitem[_field] silently no-ops in that case, so this
+        lets callers detect and skip that rather than treat a no-op as a
+        successful open()."""
+        card = self.component
+        if self.field == "text":
+            return any(i == self.idx for i, _ in card._subitem_rects)
+        rects = card._subitem_td_click_rects.get(self.idx)
+        if not rects:
+            return False
+        rect = rects[0] if self.field == "title" else rects[1]
+        return rect is not None
+
+    def open(self):
+        card = self.component
+        already = (card._sub_edit_item is not None
+                   and card._sub_edit_index == self.idx
+                   and card._sub_edit_field == self.field)
+        if not already:
+            if not self._rect_ready():
+                return None
+            if self.field == "text":
+                card._begin_edit_subitem(self.idx)
+            else:
+                card._begin_edit_subitem_field(self.idx, self.field)
+        return card._sub_edit_item
+
+    def close(self):
+        card = self.component
+        if (card._sub_edit_item is not None and card._sub_edit_index == self.idx
+                and card._sub_edit_field == self.field):
+            card._end_edit_subitem()
+
+    def __eq__(self, other):
+        return (isinstance(other, _SubitemRef) and other.component is self.component
+                and other.idx == self.idx and other.field == self.field)
+
+    def __hash__(self):
+        return hash((id(self.component), self.idx, self.field))
+
+
+class FindReplaceDialog(QDialog):
+    """Edit > Find & Replace... (Ctrl+F) - a small Notepad++-style
+    floating, non-modal panel. MainWindow owns the actual search/replace
+    logic (see MainWindow._gather_find_targets and friends); this class is
+    just the UI and calls back out to MainWindow via plain callables."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Find & Replace")
+        self.setModal(False)
+        self.setMinimumWidth(360)
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft)
+        self.find_edit = QLineEdit()
+        self.find_edit.setPlaceholderText("Text to find")
+        form.addRow("Find:", self.find_edit)
+        self.replace_edit = QLineEdit()
+        self.replace_edit.setPlaceholderText("Replacement text")
+        form.addRow("Replace with:", self.replace_edit)
+        layout.addLayout(form)
+
+        options_row = QHBoxLayout()
+        self.case_checkbox = QCheckBox("Match case")
+        options_row.addWidget(self.case_checkbox)
+        self.whole_word_checkbox = QCheckBox("Whole word")
+        options_row.addWidget(self.whole_word_checkbox)
+        options_row.addStretch(1)
+        layout.addLayout(options_row)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color:#888; font-size:11px;")
+        layout.addWidget(self.status_label)
+
+        buttons_row1 = QHBoxLayout()
+        self.find_prev_btn = QPushButton("Find Previous")
+        self.find_next_btn = QPushButton("Find Next")
+        buttons_row1.addWidget(self.find_prev_btn)
+        buttons_row1.addWidget(self.find_next_btn)
+        layout.addLayout(buttons_row1)
+
+        buttons_row2 = QHBoxLayout()
+        self.replace_btn = QPushButton("Replace")
+        self.replace_all_btn = QPushButton("Replace All")
+        buttons_row2.addWidget(self.replace_btn)
+        buttons_row2.addWidget(self.replace_all_btn)
+        layout.addLayout(buttons_row2)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        self.close_btn = QPushButton("Close")
+        close_row.addWidget(self.close_btn)
+        layout.addLayout(close_row)
+
+        self.find_next_btn.clicked.connect(self._on_find_next)
+        self.find_prev_btn.clicked.connect(self._on_find_prev)
+        self.replace_btn.clicked.connect(self._on_replace)
+        self.replace_all_btn.clicked.connect(self._on_replace_all)
+        self.close_btn.clicked.connect(self.close)
+        self.find_edit.returnPressed.connect(self._on_find_next)
+        self.replace_edit.returnPressed.connect(self._on_replace)
+        self.find_edit.textEdited.connect(self._on_find_text_edited)
+
+        # Filled in by MainWindow.open_find_replace() right after
+        # construction - kept as plain callables (rather than Qt signals)
+        # since this dialog is created lazily, on demand, the first time
+        # Ctrl+F is pressed.
+        self.on_find_next = None
+        self.on_find_prev = None
+        self.on_replace = None
+        self.on_replace_all = None
+        self.on_text_changed = None
+        self.on_closed = None
+
+    def _on_find_next(self):
+        if self.on_find_next:
+            self.on_find_next()
+
+    def _on_find_prev(self):
+        if self.on_find_prev:
+            self.on_find_prev()
+
+    def _on_replace(self):
+        if self.on_replace:
+            self.on_replace()
+
+    def _on_replace_all(self):
+        if self.on_replace_all:
+            self.on_replace_all()
+
+    def _on_find_text_edited(self, _text):
+        if self.on_text_changed:
+            self.on_text_changed()
+
+    def closeEvent(self, event):
+        super().closeEvent(event)
+        if self.on_closed:
+            self.on_closed()
+
+    def find_text(self):
+        return self.find_edit.text()
+
+    def replace_text(self):
+        return self.replace_edit.text()
+
+    def case_sensitive(self):
+        return self.case_checkbox.isChecked()
+
+    def whole_word(self):
+        return self.whole_word_checkbox.isChecked()
+
+    def set_find_text(self, text):
+        self.find_edit.setText(text)
+        self.find_edit.selectAll()
+
+    def set_status(self, text):
+        self.status_label.setText(text)
+
+    def focus_find_field(self):
+        self.find_edit.setFocus()
+        self.find_edit.selectAll()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -9617,6 +9863,13 @@ class MainWindow(QMainWindow):
         self.scene.selectionChanged.connect(self._flush_pending_undo_checkpoint)
         self.scene.focusItemChanged.connect(self._flush_pending_undo_checkpoint)
         self._build_menu()
+        # -- Find & Replace state ------------------------------------------
+        # The dialog itself is created lazily (see open_find_replace) the
+        # first time Ctrl+F is pressed. _find_current tracks the currently
+        # highlighted match, if any, as (target, start, end) - see
+        # _gather_find_targets/_activate_match.
+        self._find_dialog = None
+        self._find_current = None
         self.statusBar().showMessage(
             "Ready \u2014 Middle-mouse drag to pan \u00b7 Ctrl+Wheel to zoom \u00b7 Ctrl+D duplicate \u00b7 Drag a card onto a Board to nest it"
         )
@@ -9684,6 +9937,8 @@ class MainWindow(QMainWindow):
         edit_menu.addAction("Paste", self.paste_clipboard, QKeySequence.Paste)
         edit_menu.addAction("Duplicate", self.duplicate_selection, QKeySequence("Ctrl+D"))
         edit_menu.addAction("Delete", self.delete_selection, QKeySequence.Delete)
+        edit_menu.addSeparator()
+        edit_menu.addAction("Find & Replace...", self.open_find_replace, QKeySequence.Find)
 
         settings_menu = m.addMenu("&Settings")
         settings_menu.addAction("Preferences...", self.open_preferences)
@@ -10114,6 +10369,270 @@ class MainWindow(QMainWindow):
         self._text_format_actions = self._font_format_actions + [self.link_action]
         for a in self._text_format_actions:
             a.setVisible(False)
+
+    # -- Find & Replace -----------------------------------------------
+    # Scope is the current board only (i.e. self.scene.items()) - matching
+    # how a board is itself just a document, the same way Notepad++/most
+    # editors search "this file". See the _EditableRef/_SubitemRef classes
+    # above for how the two different kinds of underlying storage are
+    # unified into one search target.
+    def open_find_replace(self):
+        if self._find_dialog is None:
+            dlg = FindReplaceDialog(self)
+            dlg.on_find_next = self._find_next
+            dlg.on_find_prev = self._find_previous
+            dlg.on_replace = self._replace_current
+            dlg.on_replace_all = self._replace_all
+            dlg.on_text_changed = self._reset_find_position
+            dlg.on_closed = self._on_find_dialog_closed
+            self._find_dialog = dlg
+        sel_text = self._selected_text_in_active_editor()
+        if sel_text:
+            self._find_dialog.set_find_text(sel_text)
+        self._find_dialog.set_status("")
+        self._find_dialog.show()
+        self._find_dialog.raise_()
+        self._find_dialog.activateWindow()
+        self._find_dialog.focus_find_field()
+
+    def _selected_text_in_active_editor(self):
+        fi = self.scene.focusItem()
+        if isinstance(fi, QGraphicsTextItem):
+            cursor = fi.textCursor()
+            if cursor.hasSelection():
+                text = cursor.selectedText().replace("\u2029", " ").strip()
+                if text and "\n" not in text:
+                    return text
+        return ""
+
+    def _reset_find_position(self):
+        # Called when the Find field's text changes - the old match
+        # position may no longer make sense against a new search term, so
+        # start the next Find Next/Previous fresh from the top/bottom of
+        # the board instead of continuing from wherever the old term's
+        # last match happened to be.
+        if self._find_current is not None:
+            self._deactivate_target(self._find_current[0])
+            self._find_current = None
+
+    def _gather_find_targets(self):
+        """All searchable text on the current board, in a stable order."""
+        targets = []
+        for it in self.scene.items():
+            if isinstance(it, TextNoteItem):
+                targets.append(_EditableRef(it, it.title_item))
+                targets.append(_EditableRef(it, it.text_item))
+            elif isinstance(it, PlainTextItem):
+                targets.append(_EditableRef(it, it.text_item))
+            elif isinstance(it, (ImageItem, GifItem, VideoItem)):
+                targets.append(_EditableRef(it, it.title_item))
+                targets.append(_EditableRef(it, it.description_item))
+            elif isinstance(it, ArrowItem):
+                targets.append(_EditableRef(it, it.label_item))
+            elif isinstance(it, BoardLinkItem):
+                targets.append(_EditableRef(it, it.description_item))
+            elif isinstance(it, TableItem):
+                for cell in it._header_items:
+                    targets.append(_EditableRef(it, cell))
+                for row in it._cell_items:
+                    for cell in row:
+                        targets.append(_EditableRef(it, cell))
+            elif isinstance(it, BoardCardItem):
+                targets.append(_EditableRef(it, it.title_item))
+                for idx, sub in enumerate(it.subitems):
+                    kind = sub.get("kind")
+                    if kind == "text":
+                        targets.append(_SubitemRef(it, idx, "text"))
+                        targets.append(_SubitemRef(it, idx, "title"))
+                    elif kind in ("image", "gif", "video"):
+                        targets.append(_SubitemRef(it, idx, "title"))
+                        targets.append(_SubitemRef(it, idx, "description"))
+        return targets
+
+    @staticmethod
+    def _plain_find(haystack, needle, start, case_sensitive, whole_word):
+        """Plain left-to-right substring search honoring the Match
+        case/Whole word options, used to locate which target/offset a
+        match lives at before opening its (possibly expensive, for a
+        subitem) live editor. Returns the match's start index, or None."""
+        if not needle:
+            return None
+        hay = haystack if case_sensitive else haystack.lower()
+        ndl = needle if case_sensitive else needle.lower()
+        pos = max(0, start)
+        while True:
+            i = hay.find(ndl, pos)
+            if i == -1:
+                return None
+            if whole_word and not _is_whole_word_match(hay, i, len(ndl)):
+                pos = i + 1
+                continue
+            return i
+
+    @staticmethod
+    def _plain_rfind(haystack, needle, end, case_sensitive, whole_word):
+        """Same as _plain_find but searching right-to-left, ending before
+        (exclusive) position `end`. Returns the match's start index, or
+        None."""
+        if not needle:
+            return None
+        hay = haystack if case_sensitive else haystack.lower()
+        ndl = needle if case_sensitive else needle.lower()
+        pos = len(hay) if end is None else max(0, end)
+        while True:
+            i = hay.rfind(ndl, 0, pos)
+            if i == -1:
+                return None
+            if whole_word and not _is_whole_word_match(hay, i, len(ndl)):
+                pos = i
+                continue
+            return i
+
+    def _find_next(self, forward=True):
+        dlg = self._find_dialog
+        if dlg is None:
+            return
+        find_text = dlg.find_text()
+        if not find_text:
+            dlg.set_status("")
+            return
+        cs, ww = dlg.case_sensitive(), dlg.whole_word()
+        targets = self._gather_find_targets()
+        if not targets:
+            dlg.set_status("Nothing to search on this board")
+            return
+
+        cur = self._find_current
+        if cur is not None:
+            try:
+                start_idx = targets.index(cur[0])
+            except ValueError:
+                cur = None
+        if cur is None:
+            start_idx = 0 if forward else len(targets) - 1
+
+        n = len(targets)
+        for step in range(n + 1):
+            idx = (start_idx + step) % n if forward else (start_idx - step) % n
+            target = targets[idx]
+            text = target.plain_text()
+            if not text:
+                continue
+            if forward:
+                offset = (cur[2] if (cur is not None and step == 0) else 0)
+                match = self._plain_find(text, find_text, offset, cs, ww)
+            else:
+                end = (cur[1] if (cur is not None and step == 0) else None)
+                match = self._plain_rfind(text, find_text, end, cs, ww)
+            if match is not None and self._activate_match(target, match, match + len(find_text)):
+                return
+        dlg.set_status("Phrase not found")
+        if self._find_current is not None:
+            self._deactivate_target(self._find_current[0])
+            self._find_current = None
+
+    def _find_previous(self):
+        self._find_next(forward=False)
+
+    def _activate_match(self, target, start, end):
+        """Selects target's [start,end) match and scrolls it into view.
+        Returns False (leaving self._find_current untouched) if the
+        target's live editor couldn't be opened - see
+        _SubitemRef._rect_ready - so callers can just move on to the next
+        match instead of crashing on a target that isn't ready yet."""
+        text_item = target.open()
+        if text_item is None:
+            return False
+        prev = self._find_current
+        if prev is not None and prev[0] != target:
+            self._deactivate_target(prev[0])
+        cursor = QTextCursor(text_item.document())
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        text_item.setTextCursor(cursor)
+        text_item.setFocus(Qt.OtherFocusReason)
+        self._find_current = (target, start, end)
+        self.view.ensureVisible(target.component, 60, 60)
+        if self._find_dialog:
+            self._find_dialog.set_status("")
+        return True
+
+    def _deactivate_target(self, target):
+        target.close()
+
+    def _on_find_dialog_closed(self):
+        if self._find_current is not None:
+            self._deactivate_target(self._find_current[0])
+            self._find_current = None
+
+    def _replace_current(self):
+        dlg = self._find_dialog
+        if dlg is None:
+            return
+        find_text = dlg.find_text()
+        if not find_text:
+            return
+        if self._find_current is None:
+            self._find_next()
+            return
+        target, start, end = self._find_current
+        text_item = target.open()
+        cursor = text_item.textCursor()
+        sel = cursor.selectedText()
+        cs = dlg.case_sensitive()
+        matches = sel == find_text if cs else sel.lower() == find_text.lower()
+        if not cursor.hasSelection() or not matches:
+            # The text changed since this match was found (or the dialog's
+            # options changed) - don't blindly overwrite the wrong thing,
+            # just look for a fresh match instead.
+            self._find_current = None
+            self._find_next()
+            return
+        replace_text = dlg.replace_text()
+        cursor.insertText(replace_text)
+        self._find_current = (target, start, start + len(replace_text))
+        self._find_next()
+
+    def _replace_all(self):
+        dlg = self._find_dialog
+        if dlg is None:
+            return
+        find_text = dlg.find_text()
+        if not find_text:
+            return
+        replace_text = dlg.replace_text()
+        cs, ww = dlg.case_sensitive(), dlg.whole_word()
+        if self._find_current is not None:
+            self._deactivate_target(self._find_current[0])
+            self._find_current = None
+
+        flags = QTextDocument.FindFlags()
+        if cs:
+            flags |= QTextDocument.FindCaseSensitively
+        if ww:
+            flags |= QTextDocument.FindWholeWords
+
+        total = 0
+        for target in self._gather_find_targets():
+            if self._plain_find(target.plain_text(), find_text, 0, cs, ww) is None:
+                continue
+            text_item = target.open()
+            if text_item is None:
+                continue
+            document = text_item.document()
+            pos = 0
+            while True:
+                found = document.find(find_text, pos, flags)
+                if found.isNull():
+                    break
+                found.insertText(replace_text)
+                pos = found.position()
+                total += 1
+            target.close()
+
+        dlg.set_status(f"Replaced {total} occurrence(s)" if total else "Phrase not found")
+        if total:
+            self._commit_undo_checkpoint()
 
     # -- brush controls -----------------------------------------------
     # These same controls (Color button, Size slider, Opacity slider) do
