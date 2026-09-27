@@ -3,11 +3,11 @@
 A Milanote inspired app for creating mindmaps.  
 It has been written in Python using Claude AI.  
 
-```
+
 The app requires Pyside6 library to work
 To make app working in Windows please create shortcut to `py` file and adding `python`  
 before filepath; additionally if you want to get rid of cmd window type `pythonw` instead of `python`
-```
+
 
 ## Features infinite canvas allowing user to make notes by placing various different objects like images, videos, gifs, arrows, tables adding text or drawing on canvas.
 
