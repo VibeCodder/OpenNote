@@ -29,7 +29,8 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 - embedded to the HTML file
 - stored on local folder next to HTML files
 
-The app also allows to unpack embedded data and export them to 
+The app also allows to unpack embedded data and export them to 📁 Assets:
+<br>
 📁 Assets/  
 ├── 📁 Images/  
 ├── 📁 Videos/  
