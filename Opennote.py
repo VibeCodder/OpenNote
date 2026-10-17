@@ -25,16 +25,20 @@ import math
 import json
 import base64
 import atexit
+import shutil
+import hashlib
 import tempfile
 import uuid
 import time
 import gc
 import weakref
 import types as _types
+from urllib.parse import quote as _url_quote
+from html import escape as _html_escape
 
 from PySide6.QtCore import (
     Qt, QRectF, QPointF, QPoint, QSize, QSizeF, QByteArray, QBuffer, QIODevice, QUrl, Signal, QTimer,
-    QSettings,
+    QSettings, QEvent, QObject,
 )
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QPainter, QPainterPath, QPainterPathStroker, QPixmap, QImage, QFont,
@@ -50,7 +54,8 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QToolButton,
     QFontComboBox, QInputDialog, QCompleter, QCheckBox,
     QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QDoubleSpinBox, QGridLayout, QLineEdit,
-    QSizePolicy, QTabWidget, QRadioButton, QButtonGroup,
+    QSizePolicy, QTabWidget, QRadioButton, QButtonGroup, QProgressBar, QProgressDialog,
+    QScrollArea, QFrame,
 )
 
 try:
@@ -80,6 +85,15 @@ except Exception:
 # --------------------------------------------------------------------------
 
 HANDLE_SIZE = 12
+
+
+def accent_color():
+    """The app's accent (\"guide\") colour from Preferences. Looked up at call
+    time (THEME_ACCENT is defined further down and changes when the user
+    picks a new accent), so every selection outline / handle follows it."""
+    return QColor(THEME_ACCENT)
+
+
 ARROW_Z_OFFSET = -1_000_000  # arrows default to a layer below every normal
                               # component (see MindMapScene.bring_to_front) -
                               # so a line tucks behind the boxes it connects
@@ -166,6 +180,344 @@ def pixmap_to_base64(pixmap, fmt="PNG"):
     pixmap.save(buf, fmt)
     buf.close()
     return base64.b64encode(ba.data()).decode("ascii")
+
+
+# --------------------------------------------------------------------------
+# Multimedia storage modes
+#
+#   "embedded" (default): every image/GIF/video is base64-embedded straight
+#       into the board's HTML (data: URI) - one self-contained file.
+#   "local":  media lives as separate files and the HTML references them by
+#       a RELATIVE path (always resolved next to the .html file), e.g.
+#       Assets/Images/image_ab12cd34ef56.png - see ASSETS_DIR_NAME.
+#
+# In memory the bytes are always loaded (so rendering code is identical in
+# both modes); an item merely remembers `media_src` (relative path or None).
+# In a board's JSON a media dict has "data" (base64) and/or "src" (relative
+# path): saving in local mode strips "data" wherever "src" is set, saving in
+# embedded mode strips "src" - see strip_media_data().
+# --------------------------------------------------------------------------
+
+MEDIA_KINDS = ("image", "gif", "video")
+MEDIA_MODE_EMBEDDED = "embedded"
+MEDIA_MODE_LOCAL = "local"
+ASSETS_DIR_NAME = "Assets"
+ASSET_SUBDIRS = {"image": "Images", "gif": "GIFs", "video": "Videos", "thumbnail": "Thumbnails"}
+MEDIA_FILE_FILTERS = {
+    "image": "Images (*.png *.jpg *.jpeg *.bmp *.webp)",
+    "gif": "GIF (*.gif)",
+    "video": "Video (*.mp4 *.mov *.avi *.webm *.mkv)",
+}
+
+
+def detect_image_ext(raw):
+    head = raw[:12]
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if head[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if head[:2] == b"BM":
+        return ".bmp"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"
+
+
+def detect_video_ext(raw):
+    head = raw[:16]
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return ".webm"
+    if head[4:8] == b"ftyp":
+        return ".mov" if head[8:12] == b"qt  " else ".mp4"
+    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+        return ".avi"
+    return ".mp4"
+
+
+def relative_media_path(path, base_dir):
+    """Forward-slash relative path of `path` inside `base_dir` (a file in
+    the HTML's own folder or any sub-folder of it), or None if it lies
+    outside of it - HTML files only ever look for media next to them."""
+    try:
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(base_dir))
+    except ValueError:  # e.g. different drive on Windows
+        return None
+    parts = rel.replace("\\", "/").split("/")
+    if rel == "." or parts[0] == ".." or os.path.isabs(rel):
+        return None
+    return "/".join(parts)
+
+
+def media_src_to_url(src):
+    return _url_quote((src or "").replace("\\", "/"), safe="/")
+
+
+def resolve_media_path(src, base_dir):
+    return os.path.normpath(os.path.join(base_dir, *src.replace("\\", "/").split("/")))
+
+
+def _write_bytes_atomic(path, raw):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    os.replace(tmp, path)
+
+
+def _write_text_atomic(path, text):
+    _write_bytes_atomic(path, text.encode("utf-8"))
+
+
+def sniff_image_mime_b64(b64, default="image/png"):
+    """MIME type of base64 image data, from its magic bytes (the app now
+    keeps a picked file's original bytes, so it is not always PNG)."""
+    try:
+        head = base64.b64decode((b64 or "")[:24] + "=" * (-len((b64 or "")[:24]) % 4))
+    except Exception:
+        return default
+    return {".png": "image/png", ".jpg": "image/jpeg", ".bmp": "image/bmp",
+            ".webp": "image/webp"}.get(detect_image_ext(head), default) if head else default
+
+
+def _safe_stem(name):
+    """File name stem (no folders, no extension, no characters that are
+    illegal on common file systems) of an original file name, or ""."""
+    stem = os.path.splitext(os.path.basename((name or "").replace("\\", "/")))[0]
+    stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", stem).strip(" .")
+    return stem[:100]
+
+
+def _norm_ext(ext):
+    ext = (ext or "").lower()
+    return {".jpeg": ".jpg", ".jpe": ".jpg"}.get(ext, ext)
+
+
+def _pick_ext(kind, detected_ext, name):
+    """Keep the ORIGINAL extension of `name` (e.g. .jpeg, .mkv) when it is
+    consistent with what the bytes really are; otherwise use the detected one."""
+    orig = os.path.splitext(name or "")[1]
+    if not orig:
+        return detected_ext
+    if kind == "video" and orig.lower() in VIDEO_EXTS:
+        return orig
+    if _norm_ext(orig) == _norm_ext(detected_ext):
+        return orig
+    return detected_ext
+
+
+def write_asset_file(base_dir, kind, raw, ext, name=None):
+    """Store `raw` under <base_dir>/Assets/<Images|GIFs|Videos|Thumbnails>/
+    and return its relative, forward-slash path. With an original file
+    `name` the file keeps that name; if a DIFFERENT file with that name is
+    already there a short content hash is appended to keep both, and
+    identical content is always stored only once. Without a name a
+    content-hash name is used."""
+    sub = ASSET_SUBDIRS[kind]
+    digest = hashlib.sha1(raw).hexdigest()
+    stem = _safe_stem(name)
+    folder = os.path.join(base_dir, ASSETS_DIR_NAME, sub)
+    os.makedirs(folder, exist_ok=True)
+    if stem:
+        candidates = [f"{stem}{ext}", f"{stem}_{digest[:8]}{ext}"]
+    else:
+        candidates = [f"{kind}_{digest[:12]}{ext}"]
+
+    def same(full):
+        if not (os.path.isfile(full) and os.path.getsize(full) == len(raw)):
+            return False
+        with open(full, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest() == digest
+
+    for fname in candidates:
+        full = os.path.join(folder, fname)
+        if same(full):
+            return f"{ASSETS_DIR_NAME}/{sub}/{fname}"
+        if not os.path.exists(full):
+            _write_bytes_atomic(full, raw)
+            return f"{ASSETS_DIR_NAME}/{sub}/{fname}"
+    fname = f"{stem or kind}_{digest}{ext}"
+    _write_bytes_atomic(os.path.join(folder, fname), raw)
+    return f"{ASSETS_DIR_NAME}/{sub}/{fname}"
+
+
+def externalize_media_bytes(kind, raw, base_dir, origin=None, ext=None, name=None):
+    """Return the relative path under which `raw` should be referenced from
+    an HTML in `base_dir`. A media file the user picked from a folder next
+    to the HTML (`origin`) is referenced where it is; anything else is
+    written into the Assets folder under its original `name`."""
+    if origin:
+        rel = relative_media_path(origin, base_dir)
+        if rel and os.path.isfile(origin):
+            return rel
+    if ext is None:
+        if kind == "gif":
+            ext = ".gif"
+        elif kind == "video":
+            ext = detect_video_ext(raw)
+        else:
+            ext = detect_image_ext(raw)
+    return write_asset_file(base_dir, kind, raw, _pick_ext(kind, ext, name), name)
+
+
+def iter_media_dicts(data):
+    """Yield (kind, dict) for every top-level image/gif/video component and
+    every image/gif/video subitem of a board card in serialized board data."""
+    for it in data.get("items", []) or []:
+        t = it.get("type")
+        if t in MEDIA_KINDS:
+            yield t, it
+        elif t == "board":
+            for sub in it.get("subitems") or []:
+                if sub.get("kind") in MEDIA_KINDS:
+                    yield sub["kind"], sub
+
+
+def iter_thumb_dicts(data):
+    """Board Link components that carry a thumbnail (embedded or by path)."""
+    for it in data.get("items", []) or []:
+        if it.get("type") == "board_link" and (it.get("thumb_data") or it.get("thumb_src")):
+            yield it
+
+
+def _thumb_ext(mime):
+    for ext, m in THUMB_EXTS.items():
+        if m == mime and ext != ".jpeg":
+            return ext
+    return ".png"
+
+
+def count_media_to_hydrate(data):
+    n = sum(1 for _k, d in iter_media_dicts(data) if d.get("src") and not d.get("data"))
+    return n + sum(1 for d in iter_thumb_dicts(data) if d.get("thumb_src") and not d.get("thumb_data"))
+
+
+def media_needs_conversion(data, to_local, thumbs=True):
+    for _k, d in iter_media_dicts(data):
+        if to_local and not d.get("src") and d.get("data"):
+            return True
+        if not to_local and d.get("src"):
+            return True
+    for d in iter_thumb_dicts(data):
+        if to_local:
+            if thumbs and not d.get("thumb_src") and d.get("thumb_data"):
+                return True
+            if not thumbs and d.get("thumb_src"):
+                return True
+        elif d.get("thumb_src"):
+            return True
+    return False
+
+
+def hydrate_media_data(data, base_dir, progress=None, media=True, thumbs=True):
+    """Read every file referenced by "src"/"thumb_src" (and lacking data)
+    into the dict's base64 data. Returns the srcs that couldn't be read."""
+    targets = []  # (dict, src_key, data_key)
+    if media:
+        targets += [(d, "src", "data") for _k, d in iter_media_dicts(data)
+                    if d.get("src") and not d.get("data")]
+    if thumbs:
+        targets += [(d, "thumb_src", "thumb_data") for d in iter_thumb_dicts(data)
+                    if d.get("thumb_src") and not d.get("thumb_data")]
+    missing = []
+    total = len(targets)
+    for i, (d, sk, dk) in enumerate(targets, 1):
+        try:
+            with open(resolve_media_path(d[sk], base_dir), "rb") as f:
+                d[dk] = base64.b64encode(f.read()).decode("ascii")
+            nk = "thumb_name" if sk == "thumb_src" else "name"
+            if not d.get(nk):  # remember the file's name so it survives re-extraction
+                d[nk] = os.path.basename(d[sk])
+        except OSError:
+            missing.append(d[sk])
+        if progress is not None:
+            progress(i, total)
+    return missing
+
+
+def externalize_media_data(data, base_dir, progress=None, thumbs=True):
+    """Write every embedded media dict's bytes (and, if `thumbs`, Board Link
+    thumbnails) to Assets and give it a src (data is kept until
+    strip_media_data)."""
+    targets = [(k, d) for k, d in iter_media_dicts(data) if not d.get("src") and d.get("data")]
+    thumb_targets = [d for d in iter_thumb_dicts(data)
+                     if thumbs and not d.get("thumb_src") and d.get("thumb_data")]
+    total = len(targets) + len(thumb_targets)
+    done = 0
+    for kind, d in targets:
+        raw = base64.b64decode(d["data"])
+        d["src"] = externalize_media_bytes(kind, raw, base_dir, d.get("_origin"), name=d.get("name"))
+        done += 1
+        if progress is not None:
+            progress(done, total)
+    for d in thumb_targets:
+        raw = base64.b64decode(d["thumb_data"])
+        d["thumb_src"] = externalize_media_bytes(
+            "thumbnail", raw, base_dir, None, ext=_thumb_ext(d.get("thumb_mime")), name=d.get("thumb_name"))
+        done += 1
+        if progress is not None:
+            progress(done, total)
+
+
+def strip_media_data(data, local, thumbs=True):
+    """Copy of serialized board `data` ready to be written to HTML. local:
+    media with a "src" loses its bulky "data" (same for thumbnails when
+    `thumbs`); embedded: every "src" is dropped (data stays). Transient
+    "_origin" keys are always removed. The live board (whose subitem dicts
+    `data` may alias) is never modified."""
+    def fix(d):
+        d = dict(d)
+        d.pop("_origin", None)
+        if local and d.get("src"):
+            d["data"] = ""
+        else:
+            d.pop("src", None)
+        return d
+
+    new = dict(data)
+    items = []
+    for it in data.get("items", []) or []:
+        t = it.get("type")
+        if t in MEDIA_KINDS:
+            it = fix(it)
+        elif t == "board":
+            it = dict(it)
+            it["subitems"] = [fix(s) if s.get("kind") in MEDIA_KINDS else s
+                              for s in (it.get("subitems") or [])]
+        elif t == "board_link" and it.get("thumb_src"):
+            it = dict(it)
+            if local and thumbs:
+                it["thumb_data"] = ""
+            else:
+                it.pop("thumb_src", None)
+        items.append(it)
+    new["items"] = items
+    return new
+
+
+def detect_media_storage(html):
+    """How a saved board HTML stores its multimedia: returns (mode, thumbs)
+    where mode is MEDIA_MODE_LOCAL / MEDIA_MODE_EMBEDDED / None (no media at
+    all) and thumbs says whether Board Link thumbnails are extracted too
+    (None = unknown/no thumbnails). Cheap string checks on the JSON blob -
+    no JSON parsing, so it is fast even for huge embedded boards."""
+    m = re.search(r'<script type="application/json" id="mindmap-data">(.*?)</script>', html, re.DOTALL)
+    blob = m.group(1) if m else html
+    thumb_src = '"thumb_src": "' in blob
+    if '"src": "' in blob or thumb_src:
+        if thumb_src:
+            thumbs = True
+        else:
+            thumbs = False if '"thumb_mime"' in blob else None
+        return MEDIA_MODE_LOCAL, thumbs
+    if re.search(r'"(?:data|thumb_data)": "[A-Za-z0-9+/]', blob):
+        return MEDIA_MODE_EMBEDDED, None
+    return None, None
+
+
+def _sub_media_html_src(item, mime):
+    """<img>/<video> src for a board-card media subitem dict."""
+    if item.get("src"):
+        return _html_escape(media_src_to_url(item["src"]), quote=True)
+    return f"data:{mime};base64,{item.get('data', '')}"
 
 
 def base64_to_pixmap(b64):
@@ -1056,6 +1408,18 @@ DEFAULT_PREFS = {
     "optimize_grid_rendering": True,
     "grid_disable_zoom_percent": 15.0,  # skip the dot grid once zoom <= this %
     "default_arrow_snap_method": "orbit",  # one of ARROW_SNAP_METHODS
+    "media_mode": "embedded",  # "embedded" | "local" - see MEDIA_MODE_*
+    "media_include_thumbnails": True,  # local mode: also extract Board Link thumbnails
+    "hide_top_toolbar_when_empty": True,  # hide the (empty) top bar when it has no controls
+    "theme_accent": "#6366f1",        # accent / "guide" colour
+    "theme_bg": "#1b1b1b",            # app background colour
+    "theme_inactive_tab": "#181818",  # background of inactive tabs
+    "theme_hover": "#2a2a2e",         # hover highlight of toolbar buttons and menu-bar items
+    "menu_radius": 10,                # corner radius (px) of context / drop-down menus, 0 = square
+    # -- where file dialogs open (see dialog_start_dir) --
+    "dialogs_default_folder_mode": "project",  # "project" | "custom"
+    "dialogs_custom_folder": "",               # used when the mode above is "custom"
+    "dialogs_media_subfolders": True,          # media pickers -> Assets/Images, Assets/Videos, Assets/GIFs
 }
 
 
@@ -1094,6 +1458,24 @@ def load_app_preferences():
         prefs["grid_disable_zoom_percent"] = DEFAULT_PREFS["grid_disable_zoom_percent"]
     snap_method = s.value("default_arrow_snap_method", DEFAULT_PREFS["default_arrow_snap_method"])
     prefs["default_arrow_snap_method"] = snap_method if snap_method in ARROW_SNAP_METHODS else "orbit"
+    mm = s.value("media_mode", DEFAULT_PREFS["media_mode"])
+    prefs["media_mode"] = mm if mm in (MEDIA_MODE_EMBEDDED, MEDIA_MODE_LOCAL) else MEDIA_MODE_EMBEDDED
+    prefs["media_include_thumbnails"] = _qsettings_bool(
+        s, "media_include_thumbnails", DEFAULT_PREFS["media_include_thumbnails"])
+    prefs["hide_top_toolbar_when_empty"] = _qsettings_bool(
+        s, "hide_top_toolbar_when_empty", DEFAULT_PREFS["hide_top_toolbar_when_empty"])
+    for key in ("theme_accent", "theme_bg", "theme_inactive_tab", "theme_hover"):
+        val = str(s.value(key, DEFAULT_PREFS[key]) or "")
+        prefs[key] = val if QColor(val).isValid() else DEFAULT_PREFS[key]
+    try:
+        prefs["menu_radius"] = max(0, min(20, int(s.value("menu_radius", DEFAULT_PREFS["menu_radius"]))))
+    except (TypeError, ValueError):
+        prefs["menu_radius"] = DEFAULT_PREFS["menu_radius"]
+    mode = str(s.value("dialogs_default_folder_mode", DEFAULT_PREFS["dialogs_default_folder_mode"]) or "")
+    prefs["dialogs_default_folder_mode"] = mode if mode in ("project", "custom") else "project"
+    prefs["dialogs_custom_folder"] = str(s.value("dialogs_custom_folder", "") or "")
+    prefs["dialogs_media_subfolders"] = _qsettings_bool(
+        s, "dialogs_media_subfolders", DEFAULT_PREFS["dialogs_media_subfolders"])
     s.endGroup()
     return prefs
 
@@ -1111,7 +1493,77 @@ def save_app_preferences(prefs):
     s.setValue("optimize_grid_rendering", bool(prefs.get("optimize_grid_rendering", True)))
     s.setValue("grid_disable_zoom_percent", float(prefs.get("grid_disable_zoom_percent", 15.0)))
     s.setValue("default_arrow_snap_method", prefs.get("default_arrow_snap_method", "orbit"))
+    s.setValue("media_mode", prefs.get("media_mode", MEDIA_MODE_EMBEDDED))
+    s.setValue("media_include_thumbnails", bool(prefs.get("media_include_thumbnails", True)))
+    s.setValue("hide_top_toolbar_when_empty", bool(prefs.get("hide_top_toolbar_when_empty", True)))
+    for key in ("theme_accent", "theme_bg", "theme_inactive_tab", "theme_hover"):
+        s.setValue(key, prefs.get(key, DEFAULT_PREFS[key]))
+    s.setValue("menu_radius", int(prefs.get("menu_radius", DEFAULT_PREFS["menu_radius"])))
+    s.setValue("dialogs_default_folder_mode", prefs.get("dialogs_default_folder_mode", "project"))
+    s.setValue("dialogs_custom_folder", prefs.get("dialogs_custom_folder", "") or "")
+    s.setValue("dialogs_media_subfolders", bool(prefs.get("dialogs_media_subfolders", True)))
     s.endGroup()
+
+
+def _find_subdir(parent, name):
+    """Existing sub-directory of `parent` called `name` (matched
+    case-insensitively, so \"assets\" works too), or None."""
+    direct = os.path.join(parent, name)
+    if os.path.isdir(direct):
+        return direct
+    try:
+        for entry in os.listdir(parent):
+            full = os.path.join(parent, entry)
+            if entry.lower() == name.lower() and os.path.isdir(full):
+                return full
+    except OSError:
+        pass
+    return None
+
+
+def _find_main_window():
+    for w in QApplication.topLevelWidgets():
+        if isinstance(w, MainWindow):
+            return w
+    return None
+
+
+def dialog_start_dir(kind=None, main_window=None):
+    """Folder a file dialog should open in.
+
+    Base folder: the project folder (where the board .html files live), or -
+    when Preferences > General > File dialogs says so - a custom folder.
+    With a media `kind` (\"image\" / \"gif\" / \"video\" / \"thumbnail\") and the
+    \"media subfolders\" option on, the picker opens in <base>/Assets/<Images |
+    GIFs | Videos | Thumbnails> when that exists, else <base>/Assets, else the
+    base folder itself. Returns \"\" (= let Qt decide) when there is no usable
+    folder yet, e.g. a brand-new unsaved project."""
+    mw = main_window or _find_main_window()
+    prefs = mw.prefs if mw is not None else load_app_preferences()
+    base = None
+    if prefs.get("dialogs_default_folder_mode") == "custom":
+        custom = prefs.get("dialogs_custom_folder") or ""
+        if custom and os.path.isdir(custom):
+            base = custom
+    if base is None and mw is not None:
+        proj = getattr(mw, "project_dir", None) or (
+            os.path.dirname(mw.current_file) if getattr(mw, "current_file", None) else None)
+        if proj and os.path.isdir(proj):
+            base = proj
+    if base is None:
+        return ""
+    if kind and prefs.get("dialogs_media_subfolders", True):
+        assets = _find_subdir(base, ASSETS_DIR_NAME)
+        if assets:
+            sub = ASSET_SUBDIRS.get(kind)
+            return (_find_subdir(assets, sub) if sub else None) or assets
+    return base
+
+
+def dialog_start_path(filename, main_window=None):
+    """`filename` placed inside the default dialog folder (for Save dialogs)."""
+    folder = dialog_start_dir(None, main_window)
+    return os.path.join(folder, filename) if folder else filename
 
 
 def _qsettings_bool(settings, key, default):
@@ -1469,12 +1921,12 @@ class BaseComponentItem(QGraphicsObject):
         self.update()
 
     def _frame_pen(self, default="#000000"):
-        """Border pen used by image/gif/video items: blue while selected,
+        """Border pen used by image/gif/video items: accent colour while selected,
         otherwise a fixed thin border - self.color now drives the title/
         description background instead (see
         MediaCardMixin._paint_title_desc_chrome)."""
         if self.isSelected():
-            return QPen(QColor("#4c8bf5"), 2)
+            return QPen(accent_color(), 2)
         return QPen(QColor(default), 1)
 
     def handle_rect(self):
@@ -1482,7 +1934,7 @@ class BaseComponentItem(QGraphicsObject):
 
     def paint_handle(self, painter):
         if self.isSelected():
-            painter.setBrush(QColor("#4c8bf5"))
+            painter.setBrush(accent_color())
             painter.setPen(QPen(QColor("#ffffff"), 1))
             painter.drawRect(self.handle_rect())
 
@@ -2189,7 +2641,7 @@ class PlainTextItem(BaseComponentItem):
         # can still be located, dragged and resized like any component.
         if self.isSelected():
             painter.setRenderHint(QPainter.Antialiasing)
-            painter.setPen(QPen(QColor("#4c8bf5"), 1, Qt.DashLine))
+            painter.setPen(QPen(accent_color(), 1, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.rect())
         self.paint_handle(painter)
@@ -2239,7 +2691,86 @@ class PlainTextItem(BaseComponentItem):
 # Image
 # --------------------------------------------------------------------------
 
-class MediaCardMixin:
+class MediaSourceMixin:
+    """Where an Image/GIF/Video component's file lives when the app runs in
+    "local path" media mode (see MEDIA_MODE_*). `media_src` is the path,
+    relative to the board's .html, that the saved HTML references (None =
+    not written out yet / embedded); `media_origin` is the absolute path
+    the content was last loaded from (never saved) - if that file sits next
+    to the HTML it is referenced in place instead of copied into Assets."""
+
+    MEDIA_KIND = None
+
+    def _init_media_src(self, src=None):
+        self.media_src = src or None
+        self.media_origin = None
+        self.media_name = None  # original file name - kept so extraction can reuse it
+
+    def _media_main_window(self):
+        sc = self.scene()
+        return getattr(sc, "main_window", None) if sc is not None else None
+
+    def _media_html_src(self, mime, b64_fn):
+        if self.media_src:
+            return _html_escape(media_src_to_url(self.media_src), quote=True)
+        return f"data:{mime};base64,{b64_fn()}"
+
+    def _media_src_serialize(self, d):
+        if self.media_src:
+            d["src"] = self.media_src
+        if self.media_name:
+            d["name"] = self.media_name
+        return d
+
+    def _media_raw_bytes(self):
+        if self.MEDIA_KIND == "image":
+            b = self._get_b64()
+            return base64.b64decode(b) if b else b""
+        if self.MEDIA_KIND == "gif":
+            return self.gif_bytes or b""
+        return self.video_bytes or b""
+
+    def _media_replace_bytes(self, raw):
+        if self.MEDIA_KIND == "image":
+            pm = QPixmap()
+            if not pm.loadFromData(raw) or pm.isNull():
+                return False
+            self.set_pixmap(pm, raw)
+        elif self.MEDIA_KIND == "gif":
+            self.set_gif_bytes(raw)
+        else:
+            self.set_video_bytes(raw)
+        return True
+
+    def externalize_media(self, base_dir):
+        """Local mode, on save: give this component a relative path,
+        writing its file to Assets if it isn't already a file on disk."""
+        if self.media_src:
+            return
+        raw = self._media_raw_bytes()
+        if not raw:
+            return
+        self.media_src = externalize_media_bytes(
+            self.MEDIA_KIND, raw, base_dir, self.media_origin, name=self.media_name)
+
+    def _change_media_path(self):
+        mw = self._media_main_window()
+        if mw is None:
+            return
+        res = mw.choose_new_media_path(self.MEDIA_KIND, self.media_src)
+        if not res:
+            return
+        raw, rel, name = res
+        if not self._media_replace_bytes(raw):
+            QMessageBox.warning(None, "Change Path", "The selected file could not be read as media.")
+            return
+        self.media_src = rel
+        self.media_origin = None
+        self.media_name = name
+        self.update()
+
+
+class MediaCardMixin(MediaSourceMixin):
     """Shared title (top) + description (bottom) chrome for the standalone
     Image/GIF/Video components, so each media component looks like a small
     captioned card - a bold title bar above the media and a plain
@@ -2492,6 +3023,16 @@ class MediaCardMixin:
     def _build_media_context_menu(self, menu):
         """Call from the subclass's _build_context_menu override to add
         the "Show Title"/"Show Description" checkable entries."""
+        # Local-path mode only: show where the file lives and let the user
+        # re-point it (see MainWindow.choose_new_media_path).
+        self._media_path_action = None
+        mw = self._media_main_window()
+        if mw is not None and mw.media_mode_is_local():
+            info = self.media_src or "(not written yet - goes to Assets on save)"
+            info_action = menu.addAction(f"Path: {info}")
+            info_action.setEnabled(False)
+            self._media_path_action = menu.addAction("Change Path\u2026")
+            menu.addSeparator()
         title_action = menu.addAction("Show Title")
         title_action.setCheckable(True)
         title_action.setChecked(self.show_title)
@@ -2506,6 +3047,9 @@ class MediaCardMixin:
     def _handle_media_context_action(self, action):
         """Call from the subclass's _handle_context_action override;
         returns True if the action was one of ours and was handled."""
+        if action is not None and action is getattr(self, "_media_path_action", None):
+            self._change_media_path()
+            return True
         if action is getattr(self, "_media_title_action", None):
             self._toggle_show_title()
             return True
@@ -2519,6 +3063,7 @@ class MediaCardMixin:
 
 class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     TYPE_NAME = "image"
+    MEDIA_KIND = "image"
     DEFAULT_COLOR = "#1e1e1e"  # title/description bar background fill (see
                                 # MediaCardMixin._paint_title_desc_chrome) -
                                 # matches TextNoteItem's default.
@@ -2528,8 +3073,9 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
                  title="", description="", show_title=True, show_description=True,
                  title_font=None, desc_font=None, title_color=None, desc_color=None,
                  title_html=None, desc_html=None,
-                 top_strip_enabled=False, top_strip_color=None):
+                 top_strip_enabled=False, top_strip_color=None, src=None):
         super().__init__(x, y, w, h, item_id)
+        self._init_media_src(src)
         # Media cards tend to be large on screen, so during panning they
         # fall inside the newly-exposed strip on almost every mouse-move
         # step, re-running the whole paint() (background rect, image draw,
@@ -2578,12 +3124,14 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
                                title_color=title_color, desc_color=desc_color,
                                title_html=title_html, desc_html=desc_html)
 
-    def set_pixmap(self, pixmap):
+    def set_pixmap(self, pixmap, raw=None):
         self.pixmap_orig = pixmap
         self._scaled_cache_pixmap = None
         self._scaled_cache_size = None
         self._scaled_cache_mode = None
-        self._b64_cache = None
+        # `raw` = the picked file's original bytes: kept as-is so extracting
+        # the image later reproduces the original file, not a PNG re-encode.
+        self._b64_cache = base64.b64encode(raw).decode("ascii") if raw else None
         self.update()
 
     def _get_b64(self):
@@ -2630,7 +3178,7 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
             QMessageBox.information(None, "Save Image", "There is no image to save.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            None, "Save Image", "image.png",
+            None, "Save Image", dialog_start_path("image.png"),
             "PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp);;WEBP (*.webp)",
         )
         if not path:
@@ -2690,12 +3238,21 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
             path = urls[0].toLocalFile()
             pm = QPixmap(path)
             if not pm.isNull():
-                self.set_pixmap(pm)
+                try:
+                    with open(path, "rb") as f:
+                        raw = f.read()
+                except OSError:
+                    raw = None
+                self.set_pixmap(pm, raw)
+                self.media_src = None
+                self.media_origin = path
+                self.media_name = os.path.basename(path)
         event.acceptProposedAction()
 
     def serialize(self):
         d = super().serialize()
         d["data"] = self._get_b64()
+        self._media_src_serialize(d)
         return self._top_strip_serialize(self._title_desc_serialize(d))
 
     def to_html(self):
@@ -2704,7 +3261,7 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         return (
             f'<div class="comp image-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;">{self._top_strip_html()}{title_html}'
-            f'<img src="data:image/png;base64,{b64}" />{desc_html}</div>'
+            f'<img src="{self._media_html_src(sniff_image_mime_b64(b64), lambda: b64)}" />{desc_html}</div>'
         )
 
 
@@ -2714,6 +3271,7 @@ class ImageItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
 
 class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     TYPE_NAME = "gif"
+    MEDIA_KIND = "gif"
     DEFAULT_COLOR = "#1e1e1e"
     COLOR_TAB_LABEL = "Background"
 
@@ -2721,8 +3279,9 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
                  title="", description="", show_title=True, show_description=True,
                  title_font=None, desc_font=None, title_color=None, desc_color=None,
                  title_html=None, desc_html=None,
-                 top_strip_enabled=False, top_strip_color=None):
+                 top_strip_enabled=False, top_strip_color=None, src=None):
         super().__init__(x, y, w, h, item_id)
+        self._init_media_src(src)
         # See ImageItem.__init__ for why this cache mode matters for
         # panning smoothness - same reasoning applies here, and the GIF's
         # own animation update() calls still invalidate/refresh the cache
@@ -2829,7 +3388,7 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         if not self.gif_bytes:
             QMessageBox.information(None, "Save GIF", "There is no GIF to save.")
             return
-        path, _ = QFileDialog.getSaveFileName(None, "Save GIF", "image.gif", "GIF (*.gif)")
+        path, _ = QFileDialog.getSaveFileName(None, "Save GIF", dialog_start_path("image.gif"), "GIF (*.gif)")
         if not path:
             return
         if not path.lower().endswith(".gif"):
@@ -2884,6 +3443,9 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
                 with open(path, "rb") as f:
                     data = f.read()
                 self.set_gif_bytes(data)
+                self.media_src = None
+                self.media_origin = path
+                self.media_name = os.path.basename(path)
             except Exception:
                 pass
         event.acceptProposedAction()
@@ -2891,6 +3453,7 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     def serialize(self):
         d = super().serialize()
         d["data"] = base64.b64encode(self.gif_bytes).decode("ascii") if self.gif_bytes else ""
+        self._media_src_serialize(d)
         return self._top_strip_serialize(self._title_desc_serialize(d))
 
     def to_html(self):
@@ -2899,7 +3462,7 @@ class GifItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         return (
             f'<div class="comp gif-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;">{self._top_strip_html()}{title_html}'
-            f'<img src="data:image/gif;base64,{b64}" />{desc_html}</div>'
+            f'<img src="{self._media_html_src("image/gif", lambda: b64)}" />{desc_html}</div>'
         )
 
 
@@ -2992,7 +3555,7 @@ class VideoPlayerNode(QGraphicsObject):
 
         controls.setStyleSheet(
             "QSlider::groove:horizontal { height:4px; background:#444; border-radius:2px; }"
-            "QSlider::handle:horizontal { width:10px; margin:-4px 0; background:#4c8bf5; border-radius:5px; }"
+            "QSlider::handle:horizontal { width:10px; margin:-4px 0; background:" + THEME_ACCENT + "; border-radius:5px; }"
             "QPushButton { background:#333; color:#eee; border:none; border-radius:3px; }"
             "QPushButton:hover { background:#454545; }"
         )
@@ -3138,6 +3701,7 @@ class VideoPlayerNode(QGraphicsObject):
 
 class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     TYPE_NAME = "video"
+    MEDIA_KIND = "video"
     DEFAULT_COLOR = "#1e1e1e"
     COLOR_TAB_LABEL = "Background"
     DRAG_STRIP_H = 16
@@ -3146,8 +3710,9 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
                  title="", description="", show_title=True, show_description=True,
                  title_font=None, desc_font=None, title_color=None, desc_color=None,
                  title_html=None, desc_html=None,
-                 top_strip_enabled=False, top_strip_color=None):
+                 top_strip_enabled=False, top_strip_color=None, src=None):
         super().__init__(x, y, w, h, item_id)
+        self._init_media_src(src)
         # See ImageItem.__init__ for why this cache mode matters for
         # panning smoothness. This only caches the card's own chrome
         # (background, drag strip, border, title/description); the actual
@@ -3212,7 +3777,7 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
             QMessageBox.information(None, "Save Video", "There is no video to save.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            None, "Save Video", "video.mp4",
+            None, "Save Video", dialog_start_path("video.mp4"),
             "Video (*.mp4 *.mov *.avi *.webm *.mkv)",
         )
         if not path:
@@ -3264,6 +3829,9 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
                 with open(path, "rb") as f:
                     data = f.read()
                 self.set_video_bytes(data)
+                self.media_src = None
+                self.media_origin = path
+                self.media_name = os.path.basename(path)
             except Exception:
                 pass
         event.acceptProposedAction()
@@ -3271,6 +3839,7 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
     def serialize(self):
         d = super().serialize()
         d["data"] = base64.b64encode(self.video_bytes).decode("ascii") if self.video_bytes else ""
+        self._media_src_serialize(d)
         return self._top_strip_serialize(self._title_desc_serialize(d))
 
     def to_html(self):
@@ -3279,7 +3848,7 @@ class VideoItem(TopStripMixin, MediaCardMixin, BaseComponentItem):
         return (
             f'<div class="comp video-note" data-id="{self.id}" style="left:{self.pos().x()}px;top:{self.pos().y()}px;'
             f'width:{self._w}px;height:{self._h}px;">{self._top_strip_html()}{title_html}'
-            f'<video controls src="data:video/mp4;base64,{b64}"></video>{desc_html}</div>'
+            f'<video controls src="{self._media_html_src("video/mp4", lambda: b64)}"></video>{desc_html}</div>'
         )
 
 
@@ -3358,7 +3927,7 @@ class DrawingItem(BaseComponentItem):
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.Antialiasing)
         if self.isSelected():
-            outline = QColor(self.color) if self.color else QColor(76, 139, 245)
+            outline = QColor(self.color) if self.color else accent_color()
             outline.setAlpha(130)
             painter.setPen(QPen(outline, 1, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
@@ -4230,8 +4799,8 @@ class ArrowItem(BaseComponentItem):
                     painter.setBrush(Qt.NoBrush)
                     painter.drawEllipse(pt, self.ENDPOINT_R + 3, self.ENDPOINT_R + 3)
                 else:
-                    painter.setPen(QPen(QColor("#4c8bf5"), 1.5))
-                    painter.setBrush(QColor("#4c8bf5"))
+                    painter.setPen(QPen(accent_color(), 1.5))
+                    painter.setBrush(accent_color())
                     painter.drawEllipse(pt, self.ENDPOINT_R, self.ENDPOINT_R)
 
         label_rect = self._label_rect()
@@ -4476,7 +5045,7 @@ class TableSettingsDialog(QDialog):
         # for roles like grid_line_color, instead of showing it opaque.
         self._swatches[name].setStyleSheet(
             f"background-color:rgba({col.red()},{col.green()},{col.blue()},{col.alphaF():.2f}); "
-            f"border:1px solid #888;"
+            f"border:1px solid #4a4a4a; border-radius:8px;"
         )
 
     def _pick(self, name):
@@ -4946,8 +5515,8 @@ class TableItem(BaseComponentItem):
                 y_line = round(rect.y() + yb)
                 painter.drawLine(QPointF(round(rect.x()), y_line), QPointF(round(rect.x() + rect.width()), y_line))
 
-        # Outer frame - blue while selected, like every other component
-        painter.setPen(QPen(QColor("#4c8bf5"), 2) if self.isSelected() else QPen(QColor(0, 0, 0, 120), 1))
+        # Outer frame - accent colour while selected, like every other component
+        painter.setPen(QPen(accent_color(), 2) if self.isSelected() else QPen(QColor(0, 0, 0, 120), 1))
         painter.drawRect(rect)
         self.paint_handle(painter)
 
@@ -5118,7 +5687,7 @@ class SubitemDragGhost(QGraphicsObject):
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.Antialiasing)
-        accent = QColor("#ff6b6b") if self.will_detach else QColor("#4c8bf5")
+        accent = QColor("#ff6b6b") if self.will_detach else accent_color()
         rect = QRectF(0, 0, self._w, self._h)
         path = QPainterPath()
         path.addRoundedRect(rect, 8, 8)
@@ -6215,7 +6784,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         path = QPainterPath()
         path.addRoundedRect(rect, 10, 10)
         painter.setBrush(QColor(self.color or self.DEFAULT_COLOR))
-        pen = QPen(QColor("#4c8bf5") if self.isSelected() else QColor("#111111"),
+        pen = QPen(accent_color() if self.isSelected() else QColor("#111111"),
                    2 if self.isSelected() else 1)
         painter.setPen(pen)
         painter.drawPath(path)
@@ -6427,7 +6996,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
             if idx == self._drag_sub_index:
                 hl = QRectF(pad, row_top, avail_w, y - row_top - 8)
                 painter.setPen(QPen(
-                    QColor("#ff6b6b") if self._drag_sub_will_detach else QColor("#4c8bf5"),
+                    QColor("#ff6b6b") if self._drag_sub_will_detach else accent_color(),
                     2, Qt.DashLine,
                 ))
                 painter.setBrush(Qt.NoBrush)
@@ -6438,7 +7007,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 # solid border, matching the blue outline a standalone
                 # component gets when it's simply selected on the canvas.
                 hl = QRectF(pad, row_top, avail_w, y - row_top - 8)
-                painter.setPen(QPen(QColor("#4c8bf5"), 2))
+                painter.setPen(QPen(accent_color(), 2))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRect(hl)
 
@@ -6461,7 +7030,7 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 # true bottom edge - reads as "insert at the very end"
                 # instead of the line sitting stranded above the cursor.
                 line_y = self._h - pad
-            painter.setPen(QPen(QColor("#4c8bf5"), 3))
+            painter.setPen(QPen(accent_color(), 3))
             painter.drawLine(QPointF(pad, line_y), QPointF(self._w - pad, line_y))
 
         self.paint_handle(painter)
@@ -6484,11 +7053,11 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 continue
             b64 = base64.b64encode(data).decode("ascii")
             if ext in GIF_EXTS:
-                self.add_subitem({"kind": "gif", "data": b64})
+                self.add_subitem({"kind": "gif", "data": b64, "_origin": path, "name": os.path.basename(path)})
             elif ext in VIDEO_EXTS:
-                self.add_subitem({"kind": "video", "data": b64})
+                self.add_subitem({"kind": "video", "data": b64, "_origin": path, "name": os.path.basename(path)})
             elif ext in IMAGE_EXTS:
-                self.add_subitem({"kind": "image", "data": b64})
+                self.add_subitem({"kind": "image", "data": b64, "_origin": path, "name": os.path.basename(path)})
         event.acceptProposedAction()
 
     def contextMenuEvent(self, event):
@@ -6502,7 +7071,50 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 if chosen == convert_action:
                     self._detach_subitem(idx, event.scenePos())
                 return
+            mw = getattr(self.scene(), "main_window", None) if self.scene() is not None else None
+            if sub.get("kind") in MEDIA_KINDS and mw is not None and mw.media_mode_is_local():
+                menu = QMenu()
+                info = sub.get("src") or "(not written yet - goes to Assets on save)"
+                menu.addAction(f"Path: {info}").setEnabled(False)
+                change_action = menu.addAction("Change Path\u2026")
+                chosen = menu.exec(event.screenPos())
+                if chosen == change_action:
+                    self._change_subitem_media_path(idx)
+                return
         super().contextMenuEvent(event)
+
+    def _change_subitem_media_path(self, idx):
+        """Local-path mode: re-point a media subitem at another file (see
+        MainWindow.choose_new_media_path). The subitem dict is replaced by
+        a fresh one so every per-subitem cache (keyed by id()) rebuilds."""
+        mw = getattr(self.scene(), "main_window", None) if self.scene() is not None else None
+        if mw is None or not (0 <= idx < len(self.subitems)):
+            return
+        old = self.subitems[idx]
+        kind = old.get("kind")
+        res = mw.choose_new_media_path(kind, old.get("src"))
+        if not res:
+            return
+        raw, rel, name = res
+        if kind == "image" and base64_to_pixmap(base64.b64encode(raw).decode("ascii")).isNull():
+            QMessageBox.warning(None, "Change Path", "The selected file could not be read as an image.")
+            return
+        new = dict(old)
+        new["data"] = base64.b64encode(raw).decode("ascii")
+        new["src"] = rel
+        new["name"] = name
+        new.pop("_origin", None)
+        self.subitems[idx] = new
+        sel = getattr(mw, "_selected_board_subitem", None)
+        if sel is not None and sel[0] is self and sel[1] is old:
+            mw._selected_board_subitem = (self, new)
+        self._prune_video_proxies()
+        self._prune_gif_movies()
+        self._prune_image_pixmap_cache()
+        self._prune_subitem_scaled_cache()
+        self._prune_rich_doc_cache()
+        self._autogrow_to_fit()
+        self.update()
 
     def _build_context_menu(self, menu):
         self._build_top_strip_context_menu(menu)
@@ -6557,13 +7169,13 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                 d_html = (f'<div class="media-desc" style="background:{bg_css}">{desc_rich if desc_rich else MediaCardMixin._escape_html(item.get("description",""))}</div>'
                           if show_desc else "")
                 if kind == "image":
-                    media = f'<img src="data:image/png;base64,{item.get("data","")}"/>'
+                    media = f'<img src="{_sub_media_html_src(item, sniff_image_mime_b64(item.get("data", "")))}"/>'
                     css_class = "sub-image"
                 elif kind == "gif":
-                    media = f'<img src="data:image/gif;base64,{item.get("data","")}"/>'
+                    media = f'<img src="{_sub_media_html_src(item, "image/gif")}"/>'
                     css_class = "sub-image"
                 else:
-                    media = f'<video controls src="data:video/mp4;base64,{item.get("data","")}"></video>'
+                    media = f'<video controls src="{_sub_media_html_src(item, "video/mp4")}"></video>'
                     css_class = "sub-video"
                 strip_html = _subitem_top_strip_html(item)
                 pad_style = f"padding-top:{TopStripMixin.TOP_STRIP_H + 4}px;" if strip_html else ""
@@ -6664,6 +7276,7 @@ class BoardLinkCreateDialog(QDialog):
         self.setWindowTitle("New board link")
         self.thumb_mime = None
         self.thumb_data = None
+        self.thumb_path = None
 
         layout = QVBoxLayout(self)
 
@@ -6704,7 +7317,7 @@ class BoardLinkCreateDialog(QDialog):
     def _choose_thumbnail(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose thumbnail image",
-            "", "Images and SVG (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.svg)",
+            dialog_start_dir("thumbnail"), "Images and SVG (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.svg)",
         )
         if not path:
             return
@@ -6716,6 +7329,7 @@ class BoardLinkCreateDialog(QDialog):
             )
             return
         self.thumb_mime, self.thumb_data = mime, data
+        self.thumb_path = path
         pm = thumb_to_pixmap(mime, data, size=64)
         if pm is not None and not pm.isNull():
             self.thumb_preview.setPixmap(pm)
@@ -6726,6 +7340,7 @@ class BoardLinkCreateDialog(QDialog):
     def _clear_thumbnail(self):
         self.thumb_mime = None
         self.thumb_data = None
+        self.thumb_path = None
         self.thumb_preview.setPixmap(QPixmap())
         self.thumb_preview.setText("No\nthumbnail")
         self.clear_btn.setEnabled(False)
@@ -6760,7 +7375,8 @@ class BoardLinkItem(BaseComponentItem):
 
     def __init__(self, x=0, y=0, w=220, h=120, title="Board", target_file="", item_id=None,
                  thumb_mime=None, thumb_data=None, description="", show_description=False,
-                 description_font=None, description_color=None, description_html=None):
+                 description_font=None, description_color=None, description_html=None,
+                 thumb_src=None):
         super().__init__(x, y, w, h, item_id)
         self.title = title or "Board"
         self.target_file = target_file or ""
@@ -6796,6 +7412,9 @@ class BoardLinkItem(BaseComponentItem):
         # MainWindow.add_board_link().
         self.thumb_mime = thumb_mime or None
         self.thumb_data = thumb_data or None
+        self.thumb_src = thumb_src or None   # local-path mode: relative file of the thumbnail
+        self.thumb_origin = None             # absolute path it was picked from (never saved)
+        self.thumb_name = None               # original file name (saved, reused on extraction)
         self._thumb_pixmap = None
         self._thumb_pixmap_dirty = True
         self.min_w, self.min_h = 140, 90
@@ -6889,12 +7508,25 @@ class BoardLinkItem(BaseComponentItem):
         self._recalc_desc_height()
 
     # -- thumbnail/icon ---------------------------------------------------
-    def set_thumbnail(self, mime, data):
+    def externalize_thumb(self, base_dir):
+        """Local mode, on save: write the thumbnail to Assets/Images (or
+        reference the picked file in place, if it sits next to the HTML)."""
+        if self.thumb_src or not self.thumb_data:
+            return
+        raw = base64.b64decode(self.thumb_data)
+        self.thumb_src = externalize_media_bytes(
+            "thumbnail", raw, base_dir, self.thumb_origin, ext=_thumb_ext(self.thumb_mime),
+            name=self.thumb_name)
+
+    def set_thumbnail(self, mime, data, origin=None):
         """Set (mime, data) to a base64 `data:` payload to give this card
         a custom icon/thumbnail, or (None, None) to remove it and fall
         back to the plain shortcut glyph."""
         self.thumb_mime = mime or None
         self.thumb_data = data or None
+        self.thumb_src = None
+        self.thumb_origin = origin if data else None
+        self.thumb_name = os.path.basename(origin) if (origin and data) else None
         self._thumb_pixmap_dirty = True
         self.update()
 
@@ -6950,7 +7582,7 @@ class BoardLinkItem(BaseComponentItem):
         painter.setRenderHint(QPainter.Antialiasing)
         bg = QColor(self.color or self.DEFAULT_COLOR)
         painter.setBrush(bg)
-        painter.setPen(QPen(QColor("#4c8bf5"), 2) if self.isSelected() else QPen(QColor("#111111"), 1))
+        painter.setPen(QPen(accent_color(), 2) if self.isSelected() else QPen(QColor("#111111"), 1))
         painter.drawRoundedRect(rect, 10, 10)
 
         # Leave room at the bottom for the (optional) description band,
@@ -7103,7 +7735,7 @@ class BoardLinkItem(BaseComponentItem):
         mw = self._main_window()
         path, _ = QFileDialog.getOpenFileName(
             mw, "Choose thumbnail image",
-            "", "Images and SVG (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.svg)",
+            dialog_start_dir("thumbnail", mw), "Images and SVG (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.svg)",
         )
         if not path:
             return
@@ -7114,7 +7746,7 @@ class BoardLinkItem(BaseComponentItem):
                 "Please choose an image (PNG/JPG/BMP/WEBP/GIF) or an SVG file.",
             )
             return
-        self.set_thumbnail(mime, data)
+        self.set_thumbnail(mime, data, origin=path)
         if mw is not None and mw.current_file:
             mw._write_html(mw.current_file)
 
@@ -7244,9 +7876,13 @@ class BoardLinkItem(BaseComponentItem):
         d = super().serialize()
         d["title"] = self.title
         d["target_file"] = self.target_file
-        if self.thumb_data:
+        if self.thumb_data or self.thumb_src:
             d["thumb_mime"] = self.thumb_mime
-            d["thumb_data"] = self.thumb_data
+            d["thumb_data"] = self.thumb_data or ""
+            if self.thumb_src:
+                d["thumb_src"] = self.thumb_src
+            if self.thumb_name:
+                d["thumb_name"] = self.thumb_name
         d["description"] = self.description_item.toPlainText()
         d["show_description"] = self.show_description
         d["description_font"] = _font_to_dict(self.description_item.font())
@@ -7261,7 +7897,10 @@ class BoardLinkItem(BaseComponentItem):
         title = self.title.replace("&", "&amp;").replace("<", "&lt;")
         href = (self.target_file or "#").replace('"', "&quot;")
         thumb_html = ""
-        if self.thumb_data:
+        if self.thumb_src:
+            thumb_html = (f'<img class="board-link-thumb" '
+                          f'src="{_html_escape(media_src_to_url(self.thumb_src), quote=True)}"/>')
+        elif self.thumb_data:
             # Embedded exactly like any other image in the app - a plain
             # base64 `data:` URI, self-contained inside the exported HTML.
             thumb_html = f'<img class="board-link-thumb" src="data:{self.thumb_mime};base64,{self.thumb_data}"/>'
@@ -7295,6 +7934,7 @@ def component_to_subitem(item):
     if isinstance(item, ImageItem):
         return {
             "kind": "image", "data": pixmap_to_base64(item.pixmap_orig),
+            "src": item.media_src, "_origin": item.media_origin, "name": item.media_name,
             # Title/description are kept, along with whether each is
             # currently shown, so they come back exactly as they were -
             # both while embedded in a card (see BoardCardItem.paint())
@@ -7328,6 +7968,7 @@ def component_to_subitem(item):
         return {
             "kind": "gif",
             "data": base64.b64encode(item.gif_bytes).decode("ascii") if item.gif_bytes else "",
+            "src": item.media_src, "_origin": item.media_origin, "name": item.media_name,
             "title": item.title_item.toPlainText(),
             "description": item.description_item.toPlainText(),
             "show_title": item.show_title,
@@ -7349,6 +7990,7 @@ def component_to_subitem(item):
         return {
             "kind": "video",
             "data": base64.b64encode(item.video_bytes).decode("ascii") if item.video_bytes else "",
+            "src": item.media_src, "_origin": item.media_origin, "name": item.media_name,
             # Store the standalone item's own aspect ratio so the Board
             # Card can reserve a same-proportions box for it too, even
             # though (unlike image/gif) there is no decoded frame to
@@ -7468,7 +8110,7 @@ def subitem_to_component(subitem, x, y):
         return it
     if kind == "image":
         it = ImageItem(x, y, w=subitem.get("w") or 240, h=subitem.get("h") or 180,
-                        b64=subitem.get("data"),
+                        b64=subitem.get("data"), src=subitem.get("src"),
                         title=subitem.get("title", ""), description=subitem.get("description", ""),
                         show_title=subitem.get("show_title", True),
                         show_description=subitem.get("show_description", True),
@@ -7484,6 +8126,7 @@ def subitem_to_component(subitem, x, y):
                         title_html=subitem.get("title_html"), desc_html=subitem.get("description_html"),
                         top_strip_enabled=subitem.get("top_strip_enabled", False),
                         top_strip_color=subitem.get("top_strip_color"))
+        it.media_name = subitem.get("name")
         if subitem.get("color"):
             it.set_color(subitem.get("color"))
         if subitem.get("opacity") is not None:
@@ -7491,7 +8134,7 @@ def subitem_to_component(subitem, x, y):
         return it
     if kind == "gif":
         it = GifItem(x, y, w=subitem.get("w") or 240, h=subitem.get("h") or 180,
-                      b64=subitem.get("data"),
+                      b64=subitem.get("data"), src=subitem.get("src"),
                       title=subitem.get("title", ""), description=subitem.get("description", ""),
                       show_title=subitem.get("show_title", True),
                       show_description=subitem.get("show_description", True),
@@ -7500,6 +8143,7 @@ def subitem_to_component(subitem, x, y):
                       title_html=subitem.get("title_html"), desc_html=subitem.get("description_html"),
                       top_strip_enabled=subitem.get("top_strip_enabled", False),
                       top_strip_color=subitem.get("top_strip_color"))
+        it.media_name = subitem.get("name")
         if subitem.get("color"):
             it.set_color(subitem.get("color"))
         if subitem.get("opacity") is not None:
@@ -7507,7 +8151,7 @@ def subitem_to_component(subitem, x, y):
         return it
     if kind == "video":
         it = VideoItem(x, y, w=subitem.get("w") or 320, h=subitem.get("h") or 220,
-                        b64=subitem.get("data"),
+                        b64=subitem.get("data"), src=subitem.get("src"),
                         title=subitem.get("title", ""), description=subitem.get("description", ""),
                         show_title=subitem.get("show_title", True),
                         show_description=subitem.get("show_description", True),
@@ -7516,6 +8160,7 @@ def subitem_to_component(subitem, x, y):
                         title_html=subitem.get("title_html"), desc_html=subitem.get("description_html"),
                         top_strip_enabled=subitem.get("top_strip_enabled", False),
                         top_strip_color=subitem.get("top_strip_color"))
+        it.media_name = subitem.get("name")
         if subitem.get("color"):
             it.set_color(subitem.get("color"))
         if subitem.get("opacity") is not None:
@@ -7589,7 +8234,7 @@ def deserialize_component(d):
                           show_description=d.get("show_description", True),
                           title_font=d.get("title_font"), desc_font=d.get("description_font"),
                           title_color=d.get("title_color"), desc_color=d.get("description_color"),
-                          title_html=d.get("title_html"), desc_html=d.get("description_html"))
+                          title_html=d.get("title_html"), desc_html=d.get("description_html"), src=d.get("src"))
     elif t == "gif":
         item = GifItem(x, y, w, h, b64=d.get("data"), item_id=item_id,
                         title=d.get("title", ""), description=d.get("description", ""),
@@ -7597,7 +8242,7 @@ def deserialize_component(d):
                         show_description=d.get("show_description", True),
                         title_font=d.get("title_font"), desc_font=d.get("description_font"),
                         title_color=d.get("title_color"), desc_color=d.get("description_color"),
-                        title_html=d.get("title_html"), desc_html=d.get("description_html"))
+                        title_html=d.get("title_html"), desc_html=d.get("description_html"), src=d.get("src"))
     elif t == "video":
         item = VideoItem(x, y, w, h, b64=d.get("data"), item_id=item_id,
                           title=d.get("title", ""), description=d.get("description", ""),
@@ -7605,7 +8250,7 @@ def deserialize_component(d):
                           show_description=d.get("show_description", True),
                           title_font=d.get("title_font"), desc_font=d.get("description_font"),
                           title_color=d.get("title_color"), desc_color=d.get("description_color"),
-                          title_html=d.get("title_html"), desc_html=d.get("description_html"))
+                          title_html=d.get("title_html"), desc_html=d.get("description_html"), src=d.get("src"))
     elif t == "drawing":
         item = DrawingItem(x, y, w, h, strokes=d.get("strokes", []), item_id=item_id,
                             allow_board_card=d.get("allow_board_card", False))
@@ -7637,6 +8282,7 @@ def deserialize_component(d):
         item = BoardLinkItem(
             x, y, w, h, title=d.get("title", "Board"), target_file=d.get("target_file", ""),
             item_id=item_id, thumb_mime=d.get("thumb_mime"), thumb_data=d.get("thumb_data"),
+            thumb_src=d.get("thumb_src"),
             description=d.get("description", ""), show_description=d.get("show_description", False),
             description_font=d.get("description_font"), description_color=d.get("description_color"),
             description_html=d.get("description_html"),
@@ -7656,6 +8302,10 @@ def deserialize_component(d):
         )
     else:
         return None
+    if t in MEDIA_KINDS:
+        item.media_name = d.get("name")
+    elif t == "board_link":
+        item.thumb_name = d.get("thumb_name")
     item.setZValue(d.get("z", 0))
     if "opacity" in d:
         try:
@@ -8379,6 +9029,64 @@ class MindMapScene(QGraphicsScene):
         # single navigation, whether anything was actually edited or not.
         items = sorted(self.all_component_items(), key=lambda it: it.id)
         return {"items": [it.serialize() for it in items]}
+
+    def pending_media_count(self, thumbs=True):
+        """How many media files still need to be written out in local mode."""
+        n = 0
+        for it in self.all_component_items():
+            if isinstance(it, (ImageItem, GifItem, VideoItem)):
+                if not it.media_src:
+                    n += 1
+            elif isinstance(it, BoardCardItem):
+                n += sum(1 for s in it.subitems
+                         if s.get("kind") in MEDIA_KINDS and not s.get("src") and s.get("data"))
+            elif thumbs and isinstance(it, BoardLinkItem):
+                if it.thumb_data and not it.thumb_src:
+                    n += 1
+        return n
+
+    def externalize_media(self, base_dir, progress_callback=None, thumbs=True):
+        """Local mode: write every not-yet-external media file of the live
+        board next to its HTML and remember the relative paths."""
+        targets = []
+        for it in self.all_component_items():
+            if isinstance(it, (ImageItem, GifItem, VideoItem)):
+                if not it.media_src:
+                    targets.append(("item", it))
+            elif isinstance(it, BoardCardItem):
+                for s in it.subitems:
+                    if s.get("kind") in MEDIA_KINDS and not s.get("src") and s.get("data"):
+                        targets.append(("sub", s))
+            elif thumbs and isinstance(it, BoardLinkItem):
+                if it.thumb_data and not it.thumb_src:
+                    targets.append(("thumb", it))
+        total = len(targets)
+        for i, (how, obj) in enumerate(targets, 1):
+            if how == "item":
+                obj.externalize_media(base_dir)
+            elif how == "thumb":
+                obj.externalize_thumb(base_dir)
+            else:
+                obj["src"] = externalize_media_bytes(
+                    obj["kind"], base64.b64decode(obj["data"]), base_dir, obj.get("_origin"),
+                    name=obj.get("name"))
+            if progress_callback is not None:
+                progress_callback(i, total)
+        return total
+
+    def clear_media_sources(self, media=True, thumbs=True):
+        """Forget every media path (bytes stay in memory) - used when the
+        board is packed back into the HTML or saved into another folder."""
+        for it in self.all_component_items():
+            if thumbs and isinstance(it, BoardLinkItem):
+                it.thumb_src = None
+            if not media:
+                continue
+            if isinstance(it, (ImageItem, GifItem, VideoItem)):
+                it.media_src = None
+            elif isinstance(it, BoardCardItem):
+                for s in it.subitems:
+                    s.pop("src", None)
 
     def clear_board(self):
         # Drop selection/focus up front, before anything is actually
@@ -9192,6 +9900,51 @@ def extract_scene_meta(html):
 # Main window
 # --------------------------------------------------------------------------
 
+class MediaProgressDialog(QProgressDialog):
+    """Modal progress bar shown while all boards of a project are converted
+    between the two media storage modes (see MainWindow.convert_project_media).
+    Not cancellable - stopping half-way would leave the project in a mixed
+    state."""
+
+    def __init__(self, parent, title, label="Preparing\u2026"):
+        super().__init__(label, "", 0, 100, parent)
+        self.setCancelButton(None)
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.WindowModal)
+        self.setMinimumDuration(0)
+        self.setAutoClose(False)
+        self.setAutoReset(False)
+        self.setMinimumWidth(480)
+        self._allow_close = False
+        self._last_paint = 0.0
+        self.setValue(0)
+        self.show()
+        QApplication.processEvents()
+
+    def set_progress(self, pct, label=None):
+        now = time.perf_counter()
+        if pct < 100 and (now - self._last_paint) < 0.04:
+            return
+        self._last_paint = now
+        if label is not None:
+            self.setLabelText(label)
+        self.setValue(int(max(0, min(100, pct))))
+        QApplication.processEvents()
+
+    def finish(self):
+        self._allow_close = True
+        self.close()
+
+    def reject(self):
+        pass
+
+    def closeEvent(self, event):
+        if self._allow_close:
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+
 class _FontFamilyCombo(QFontComboBox):
     """QFontComboBox that always hands text-edit focus back to whatever
     item was being edited once its dropdown closes - whether the user
@@ -9227,6 +9980,7 @@ class NumberStepper(QWidget):
         self._value = minimum
         self.setFocusPolicy(Qt.NoFocus)
         self.setObjectName("NumberStepper")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         # Hard-fixed policy: without this, a parent layout with leftover
         # space (like the toolbar here) can stretch this widget wider
         # than its contents, which then get pinned to opposite edges -
@@ -9237,26 +9991,34 @@ class NumberStepper(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        left_pad = QWidget()
+        left_pad.setFixedSize(20, 28)
+        layout.addWidget(left_pad)
+
         self.edit = QLineEdit()
         self.edit.setAlignment(Qt.AlignCenter)
         self.edit.setValidator(QIntValidator(minimum, maximum, self))
-        self.edit.setFixedSize(38, 26)
+        self.edit.setFixedSize(32, 28)
         self.edit.setFocusPolicy(Qt.ClickFocus)
 
         # Up/down arrows stacked in their own thin column to the right of
         # the number field, mimicking a native spinbox instead of the
         # previous side-by-side '- [number] +' pill.
         arrows = QWidget()
-        arrows.setFixedSize(16, 26)
+        arrows.setFixedSize(20, 28)
         arrows_layout = QVBoxLayout(arrows)
         arrows_layout.setContentsMargins(0, 0, 0, 0)
         arrows_layout.setSpacing(0)
 
-        self.up_btn = QPushButton("\u25B2")
-        self.down_btn = QPushButton("\u25BC")
+        self.up_btn = QPushButton()
+        self.down_btn = QPushButton()
+        _icons = _theme_icon_dir().replace("\\", "/")
+        self.up_btn.setIcon(QIcon(f"{_icons}/up.png"))
+        self.down_btn.setIcon(QIcon(f"{_icons}/down.png"))
 
         for btn in (self.up_btn, self.down_btn):
-            btn.setFixedSize(16, 13)
+            btn.setFixedSize(20, 14)
+            btn.setIconSize(QSize(9, 9))
             # Same NoFocus reasoning as the sliders/color button elsewhere
             # in the toolbar: keeps whatever text item is being edited
             # (e.g. an Arrow's label) from losing focus/edit-mode the
@@ -9268,21 +10030,24 @@ class NumberStepper(QWidget):
         layout.addWidget(self.edit)
         layout.addWidget(arrows)
 
-        self.setStyleSheet("""
-            #NumberStepper { background:#2a2a2a; border:1px solid #3d3d3d; border-radius:5px; }
-            QLineEdit { background:transparent; color:#eaeaea; border:none; font-size:13px; padding-left:6px; }
-            QPushButton { background:#333333; color:#a8a8a8; border:none; font-size:7px; }
-            QPushButton:hover { color:#ffffff; background:#3d3d3d; }
-            QPushButton:pressed { background:#4a4a4a; }
-        """)
-        self.up_btn.setStyleSheet(self.up_btn.styleSheet() + "QPushButton { border-top-right-radius:4px; }")
-        self.down_btn.setStyleSheet(self.down_btn.styleSheet() + "QPushButton { border-bottom-right-radius:4px; }")
+        self._qss = """
+            #NumberStepper { background:#2b2b2b; border:1px solid #3b3b3b; border-radius:8px; }
+            #NumberStepper:hover { border-color:#4a4a4a; }
+            QLineEdit { background:transparent; color:#e6e6e9; border:none; font-size:13px; padding:0 0 3px 0; margin:0; min-height:0; }
+            QPushButton { background:transparent; border:none; border-radius:4px; padding:0; min-height:0; }
+            QPushButton:hover { background:#3a3a40; }
+            QPushButton:pressed { background:rgba(99,102,241,0.35); }
+        """
+        self.restyle()
 
         self.up_btn.clicked.connect(lambda: self.setValue(self._value + 1))
         self.down_btn.clicked.connect(lambda: self.setValue(self._value - 1))
         self.edit.editingFinished.connect(self._on_edit_finished)
         self._sync_text()
-        self.setFixedSize(self.edit.width() + arrows.width(), 26)
+        self.setFixedSize(left_pad.width() + self.edit.width() + arrows.width(), 28)
+
+    def restyle(self):
+        self.setStyleSheet(_theme_text(self._qss))
 
     def _sync_text(self):
         self.edit.blockSignals(True)
@@ -9313,6 +10078,54 @@ class NumberStepper(QWidget):
             self.valueChanged.emit(v)
 
 
+def _make_tab_icon(kind, color, size=16):
+    """Small line icon for the Preferences tabs, drawn at 3x so it stays
+    crisp on high-DPI screens."""
+    scale = 3
+    pix = QPixmap(size * scale, size * scale)
+    pix.setDevicePixelRatio(scale)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.scale(size / 24.0, size / 24.0)          # draw on a 24x24 grid
+    pen = QPen(QColor(color), 1.9)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    path = QPainterPath()
+    if kind == "general":          # sliders
+        for y, knob in ((6, 8), (12, 16), (18, 10)):
+            p.drawLine(QPointF(3, y), QPointF(21, y))
+            p.setBrush(QColor(color))
+            p.drawEllipse(QPointF(knob, y), 2.4, 2.4)
+            p.setBrush(Qt.NoBrush)
+    elif kind == "components":     # cube
+        pts = [(12, 3), (20, 7.5), (20, 16.5), (12, 21), (4, 16.5), (4, 7.5)]
+        path.moveTo(*pts[0])
+        for x, y in pts[1:]:
+            path.lineTo(x, y)
+        path.closeSubpath()
+        path.moveTo(4, 7.5); path.lineTo(12, 12); path.lineTo(20, 7.5)
+        path.moveTo(12, 12); path.lineTo(12, 21)
+        p.drawPath(path)
+    elif kind == "storage":        # database
+        p.drawEllipse(QPointF(12, 6), 8, 3)
+        path.moveTo(4, 6); path.lineTo(4, 18)
+        path.arcTo(QRectF(4, 15, 16, 6), 180, 180)
+        path.lineTo(20, 6)
+        path.moveTo(4, 12)
+        path.arcTo(QRectF(4, 9, 16, 6), 180, 180)
+        p.drawPath(path)
+    elif kind == "performance":    # lightning bolt
+        path.moveTo(13.5, 2.5); path.lineTo(5, 13.5); path.lineTo(11.5, 13.5)
+        path.lineTo(10.5, 21.5); path.lineTo(19, 10.5); path.lineTo(12.5, 10.5)
+        path.closeSubpath()
+        p.drawPath(path)
+    p.end()
+    return QIcon(pix)
+
+
 class PreferencesDialog(QDialog):
     """Settings > Preferences. Two independent things live here:
 
@@ -9329,9 +10142,137 @@ class PreferencesDialog(QDialog):
         super().__init__(main_window)
         self.main_window = main_window
         self.setWindowTitle("Preferences")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(420)
 
-        layout = QVBoxLayout(self)
+        # Colour-coded tabs (coloured dot + title) with a fixed OK/Cancel row underneath. Each page
+        # scrolls on its own, so the dialog fits on small screens.
+        outer = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs, 1)
+        self._pref_pages = []
+
+        self.tabs.setIconSize(QSize(16, 16))
+
+        def new_page(title, color, kind):
+            page = QWidget()
+            lay = QVBoxLayout(page)
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setFrameShape(QFrame.NoFrame)
+            sc.setWidget(page)
+            idx = self.tabs.addTab(sc, _make_tab_icon(kind, color), title)
+            self.tabs.tabBar().setTabTextColor(idx, QColor(color))
+            self._pref_pages.append(page)
+            return lay
+
+        page_general = new_page("General", "#a78bfa", "general")
+        general_label = QLabel("General")
+        general_label.setStyleSheet("font-weight:600;")
+        page_general.addWidget(general_label)
+        self.hide_top_bar_checkbox = QCheckBox("Hide the top bar when it has no controls")
+        self.hide_top_bar_checkbox.setToolTip(
+            "Off: the bar under the menu always stays visible (empty when there is "
+            "nothing to edit).\nOn: the whole bar disappears until a selection, text "
+            "editing or Draw mode gives it controls to show."
+        )
+        self.hide_top_bar_checkbox.setChecked(bool(main_window.prefs.get("hide_top_toolbar_when_empty", True)))
+        page_general.addWidget(self.hide_top_bar_checkbox)
+
+        dialogs_label = QLabel("File Dialogs")
+        dialogs_label.setStyleSheet("font-weight:600; margin-top:12px;")
+        page_general.addWidget(dialogs_label)
+        dialogs_hint = QLabel("Folder that open / save / pick-file windows start in.")
+        dialogs_hint.setWordWrap(True)
+        dialogs_hint.setStyleSheet("color:#888; font-size:11px;")
+        page_general.addWidget(dialogs_hint)
+        self.dlg_project_rb = QRadioButton("Project folder (where the board .html files are)")
+        self.dlg_custom_rb = QRadioButton("This folder:")
+        dlg_group = QButtonGroup(self)
+        dlg_group.addButton(self.dlg_project_rb)
+        dlg_group.addButton(self.dlg_custom_rb)
+        page_general.addWidget(self.dlg_project_rb)
+        custom_row = QHBoxLayout()
+        custom_row.addWidget(self.dlg_custom_rb)
+        self.dlg_custom_edit = QLineEdit(main_window.prefs.get("dialogs_custom_folder", "") or "")
+        self.dlg_custom_edit.setPlaceholderText("Choose a folder...")
+        custom_row.addWidget(self.dlg_custom_edit, 1)
+        self.dlg_browse_btn = QPushButton("Browse...")
+        self.dlg_browse_btn.setFocusPolicy(Qt.NoFocus)
+        self.dlg_browse_btn.clicked.connect(self._browse_dialog_folder)
+        custom_row.addWidget(self.dlg_browse_btn)
+        page_general.addLayout(custom_row)
+        custom_mode = main_window.prefs.get("dialogs_default_folder_mode") == "custom"
+        (self.dlg_custom_rb if custom_mode else self.dlg_project_rb).setChecked(True)
+        self.dlg_custom_rb.toggled.connect(self._sync_dialog_folder_widgets)
+        media_dlg_label = QLabel("Add Image / GIF / Video windows")
+        media_dlg_label.setStyleSheet("font-weight:600; margin-top:8px;")
+        page_general.addWidget(media_dlg_label)
+        media_dlg_hint = QLabel(
+            "If the folder above contains an Assets folder: Add Image opens Assets/Images, "
+            "Add Video opens Assets/Videos, Add GIF opens Assets/GIFs (Assets itself when "
+            "the subfolder is missing).")
+        media_dlg_hint.setWordWrap(True)
+        media_dlg_hint.setStyleSheet("color:#888; font-size:11px;")
+        page_general.addWidget(media_dlg_hint)
+        self.dlg_media_assets_rb = QRadioButton("Open in the Assets subfolders (Images / Videos / GIFs)  \u2014 default")
+        self.dlg_media_plain_rb = QRadioButton("Open directly in the folder above")
+        media_dlg_group = QButtonGroup(self)
+        media_dlg_group.addButton(self.dlg_media_assets_rb)
+        media_dlg_group.addButton(self.dlg_media_plain_rb)
+        use_assets = bool(main_window.prefs.get("dialogs_media_subfolders", True))
+        (self.dlg_media_assets_rb if use_assets else self.dlg_media_plain_rb).setChecked(True)
+        page_general.addWidget(self.dlg_media_assets_rb)
+        page_general.addWidget(self.dlg_media_plain_rb)
+        self._sync_dialog_folder_widgets()
+        appearance_label = QLabel("Appearance")
+        appearance_label.setStyleSheet("font-weight:600; margin-top:12px;")
+        page_general.addWidget(appearance_label)
+        self._theme_colors = {}
+        self._theme_swatches = {}
+        self._theme_hex_labels = {}
+        theme_grid = QGridLayout()
+        theme_grid.setColumnStretch(3, 1)
+        for row, (key, text) in enumerate((
+                ("theme_accent", "Accent color:"),
+                ("theme_bg", "Background color:"),
+                ("theme_inactive_tab", "Inactive tab color:"),
+                ("theme_hover", "Hover color:"))):
+            self._theme_colors[key] = QColor(main_window.prefs.get(key, DEFAULT_PREFS[key]))
+            swatch = QPushButton()
+            swatch.setFixedSize(28, 28)
+            swatch.setFocusPolicy(Qt.NoFocus)
+            swatch.setCursor(Qt.PointingHandCursor)
+            swatch.clicked.connect(lambda checked=False, k=key: self._pick_theme_color(k))
+            hex_label = QLabel()
+            reset_btn = QPushButton("Reset")
+            reset_btn.setFocusPolicy(Qt.NoFocus)
+            reset_btn.clicked.connect(lambda checked=False, k=key: self._set_theme_color(k, QColor(DEFAULT_PREFS[k])))
+            self._theme_swatches[key] = swatch
+            self._theme_hex_labels[key] = hex_label
+            theme_grid.addWidget(QLabel(text), row, 0)
+            theme_grid.addWidget(swatch, row, 1)
+            theme_grid.addWidget(hex_label, row, 2)
+            theme_grid.addWidget(reset_btn, row, 3, Qt.AlignLeft)
+            self._refresh_theme_swatch(key)
+        theme_grid.addWidget(QLabel("Menu corner radius:"), 4, 0)
+        self.menu_radius_spin = QSpinBox()
+        self.menu_radius_spin.setRange(0, 20)
+        self.menu_radius_spin.setSuffix(" px")
+        self.menu_radius_spin.setToolTip("Rounding of context menus and drop-down menus. 0 = square corners.")
+        self.menu_radius_spin.setValue(int(main_window.prefs.get("menu_radius", DEFAULT_PREFS["menu_radius"])))
+        theme_grid.addWidget(self.menu_radius_spin, 4, 1, 1, 2)
+        menu_reset = QPushButton("Reset")
+        menu_reset.setFocusPolicy(Qt.NoFocus)
+        menu_reset.clicked.connect(lambda: self.menu_radius_spin.setValue(DEFAULT_PREFS["menu_radius"]))
+        theme_grid.addWidget(menu_reset, 4, 3, Qt.AlignLeft)
+        page_general.addLayout(theme_grid)
+        theme_hint = QLabel("Appearance settings are applied when you press OK.")
+        theme_hint.setStyleSheet("color:#888; font-size:11px;")
+        page_general.addWidget(theme_hint)
+        page_components = new_page("Components", "#4a9eff", "components")
+        page_storage = new_page("Multimedia Storage", "#ffa04a", "storage")
+        page_perf = new_page("Performance", "#4ac96a", "performance")
+        layout = page_components
 
         defaults_label = QLabel("New Component Defaults")
         defaults_label.setStyleSheet("font-weight:600;")
@@ -9404,6 +10345,27 @@ class PreferencesDialog(QDialog):
             if first is not None:
                 first.setChecked(True)
 
+        layout = page_storage
+        mw = main_window
+        (self.def_embedded_rb, self.def_local_rb, self.def_thumbs_cb) = self._add_media_section(
+            layout, "Default Multimedia Storage",
+            "Used for NEW projects (and unsaved boards). Existing projects keep the "
+            "way they were saved - change those below.",
+            prefs.get("media_mode", MEDIA_MODE_EMBEDDED),
+            bool(prefs.get("media_include_thumbnails", True)), warn=False)
+
+        self._committed_proj_mode = mw.project_media_mode
+        self._committed_proj_thumbs = bool(mw.project_media_thumbs)
+        if mw.current_file:
+            proj_hint = (f"Detected from the open project \u201c{os.path.basename(os.path.dirname(mw.current_file))}\u201d. "
+                         "Changing it converts ALL boards of this project.")
+        else:
+            proj_hint = "This board isn't saved yet \u2014 the choice applies when it is first saved."
+        (self.proj_embedded_rb, self.proj_local_rb, self.proj_thumbs_cb) = self._add_media_section(
+            layout, "Current project data storage", proj_hint,
+            self._committed_proj_mode, self._committed_proj_thumbs, warn=True)
+
+        layout = page_perf
         perf_label = QLabel("Performance")
         perf_label.setStyleSheet("font-weight:600; margin-top:8px;")
         layout.addWidget(perf_label)
@@ -9432,6 +10394,7 @@ class PreferencesDialog(QDialog):
 
         layout.addLayout(perf_form)
 
+        layout = page_components
         apply_label = QLabel("Apply Font to All Components")
         apply_label.setStyleSheet("font-weight:600; margin-top:8px;")
         layout.addWidget(apply_label)
@@ -9455,10 +10418,96 @@ class PreferencesDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        outer.addWidget(buttons)
+        for lay in (page_general, page_components, page_storage, page_perf):
+            lay.addStretch(1)
+        avail = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        want_w = max(pg.sizeHint().width() for pg in self._pref_pages)
+        want_h = max(pg.sizeHint().height() for pg in self._pref_pages)
+        want_w = max(want_w + 50, self.tabs.tabBar().sizeHint().width() + 50, 460)
+        self.resize(want_w, min(want_h + 110, int(avail.height() * 0.9)))
+
+    def _sync_dialog_folder_widgets(self, *_):
+        custom = self.dlg_custom_rb.isChecked()
+        self.dlg_custom_edit.setEnabled(custom)
+        self.dlg_browse_btn.setEnabled(custom)
+
+    def _browse_dialog_folder(self):
+        start = self.dlg_custom_edit.text().strip() or dialog_start_dir(None, self.main_window)
+        folder = QFileDialog.getExistingDirectory(self, "Default folder for file dialogs", start)
+        if folder:
+            self.dlg_custom_edit.setText(folder)
 
     def _on_optimize_grid_toggled(self, checked):
         self.grid_zoom_threshold_spin.setEnabled(checked)
+
+    def _add_media_section(self, layout, title, hint, mode, thumbs, warn):
+        """One \u201cmultimedia storage\u201d block (two radios + thumbnail
+        checkbox); used for both the default and the current-project copy."""
+        label = QLabel(title)
+        label.setStyleSheet("font-weight:600; margin-top:8px;")
+        layout.addWidget(label)
+        hint_label = QLabel(hint)
+        hint_label.setWordWrap(True)
+        hint_label.setStyleSheet("color:#888; font-size:11px;")
+        layout.addWidget(hint_label)
+        group = QButtonGroup(self)
+        emb = QRadioButton("Multimedia embedded into HTML")
+        loc = QRadioButton("Multimedia as separate files with local path")
+        group.addButton(emb)
+        group.addButton(loc)
+        (loc if mode == MEDIA_MODE_LOCAL else emb).setChecked(True)
+        layout.addWidget(emb)
+        layout.addWidget(loc)
+        cb = QCheckBox("Also extract Board Link thumbnails together with multimedia")
+        cb.setToolTip(
+            "Local path mode only: Board Link thumbnails/icons are saved as files in "
+            "Assets/Thumbnails too. When off, they stay embedded in the HTML.")
+        cb.setChecked(bool(thumbs))
+        layout.addWidget(cb)
+        if warn:
+            group.buttonClicked.connect(self._on_media_mode_clicked)
+        return emb, loc, cb
+
+    def _on_media_mode_clicked(self, button):
+        """Project section: warn as soon as \u201clocal path\u201d is picked (the
+        conversion itself only runs on OK); declining puts the radio back."""
+        if button is not self.proj_local_rb or self._committed_proj_mode == MEDIA_MODE_LOCAL:
+            return
+        resp = QMessageBox.warning(
+            self, "Switch to local path mode",
+            "If you choose this option, ALL multimedia (images, videos and GIFs) will be "
+            "extracted from ALL HTML documents of this project and saved as separate files "
+            "in an \u201cAssets\u201d folder next to them:\n\n"
+            "    Assets/Images\n    Assets/Videos\n    Assets/GIFs\n\n"
+            + ("Board Link thumbnails are extracted too (they go to Assets/Thumbnails).\n\n"
+               if self.proj_thumbs_cb.isChecked() else "")
+            + 
+            "The HTML files will then reference those files by relative path, so the Assets "
+            "folder must always stay next to the HTML files (also when moving or sharing "
+            "them). The board that is currently open will be saved as part of this.\n\n"
+            "Do you want to continue?",
+            QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel,
+        )
+        if resp != QMessageBox.Ok:
+            self.proj_embedded_rb.setChecked(True)
+
+    def _refresh_theme_swatch(self, key):
+        col = self._theme_colors[key]
+        self._theme_swatches[key].setStyleSheet(
+            f"background-color:{col.name()}; border:1px solid #4a4a4a; border-radius:0px; "
+            "padding:0; min-width:0; min-height:0;"
+        )
+        self._theme_hex_labels[key].setText(col.name())
+
+    def _set_theme_color(self, key, col):
+        self._theme_colors[key] = QColor(col)
+        self._refresh_theme_swatch(key)
+
+    def _pick_theme_color(self, key):
+        chosen = QColorDialog.getColor(self._theme_colors[key], self, "Pick color")
+        if chosen.isValid():
+            self._set_theme_color(key, chosen)
 
     def _on_set_font_clicked(self):
         family = self.apply_font_combo.currentFont().family()
@@ -9476,13 +10525,41 @@ class PreferencesDialog(QDialog):
         self.main_window.prefs["default_title_font_size"] = self.title_size_spin.value()
         self.main_window.prefs["default_description_font_size"] = self.desc_size_spin.value()
         self.main_window.prefs["default_arrow_size"] = self.arrow_size_spin.value()
+        self.main_window.prefs["hide_top_toolbar_when_empty"] = self.hide_top_bar_checkbox.isChecked()
+        for key, col in self._theme_colors.items():
+            self.main_window.prefs[key] = col.name()
+        self.main_window.prefs["menu_radius"] = self.menu_radius_spin.value()
+        custom_folder = self.dlg_custom_edit.text().strip()
+        use_custom = self.dlg_custom_rb.isChecked() and bool(custom_folder)
+        self.main_window.prefs["dialogs_default_folder_mode"] = "custom" if use_custom else "project"
+        self.main_window.prefs["dialogs_custom_folder"] = custom_folder
+        self.main_window.prefs["dialogs_media_subfolders"] = self.dlg_media_assets_rb.isChecked()
         self.main_window.prefs["optimize_grid_rendering"] = self.optimize_grid_checkbox.isChecked()
         self.main_window.prefs["grid_disable_zoom_percent"] = self.grid_zoom_threshold_spin.value()
         checked_id = self.arrow_snap_group.checkedId()
         if 0 <= checked_id < len(ARROW_SNAP_METHOD_OPTIONS):
             self.main_window.prefs["default_arrow_snap_method"] = ARROW_SNAP_METHOD_OPTIONS[checked_id][0]
-        save_app_preferences(self.main_window.prefs)
-        self.main_window.scene.update()
+        mw = self.main_window
+        old_default = (mw.prefs.get("media_mode"), bool(mw.prefs.get("media_include_thumbnails", True)))
+        mw.prefs["media_mode"] = MEDIA_MODE_LOCAL if self.def_local_rb.isChecked() else MEDIA_MODE_EMBEDDED
+        mw.prefs["media_include_thumbnails"] = self.def_thumbs_cb.isChecked()
+        save_app_preferences(mw.prefs)
+        mw.scene.update()
+        mw.refresh_theme()
+        mw._update_top_toolbar_visibility()
+        new_mode = MEDIA_MODE_LOCAL if self.proj_local_rb.isChecked() else MEDIA_MODE_EMBEDDED
+        new_thumbs = self.proj_thumbs_cb.isChecked()
+        proj_untouched = (new_mode == self._committed_proj_mode and new_thumbs == self._committed_proj_thumbs)
+        if proj_untouched and not mw.current_file:
+            # A brand-new, unsaved board simply follows the default.
+            mw.project_media_mode = mw.prefs["media_mode"]
+            mw.project_media_thumbs = bool(mw.prefs["media_include_thumbnails"])
+        elif new_mode != self._committed_proj_mode or (
+                new_mode == MEDIA_MODE_LOCAL and new_thumbs != self._committed_proj_thumbs):
+            self.hide()
+            mw.convert_project_media(new_mode, new_thumbs)
+        else:
+            mw.project_media_thumbs = new_thumbs
         self.accept()
 
 
@@ -9732,6 +10809,29 @@ class FindReplaceDialog(QDialog):
         self.find_edit.selectAll()
 
 
+class _ToolbarIndentSync(QObject):
+    """Keeps the breadcrumb/tab strip's left margin equal to the width of the
+    left tool column, so the "Untitled" tab starts exactly on the vertical
+    line where the toolbar ends (the canvas' left edge)."""
+
+    def __init__(self, toolbar, layout, extra=10, top=4, right=10, bottom=4):
+        super().__init__(toolbar)
+        self._layout = layout
+        self._margins = (extra, top, right, bottom)
+        self._toolbar = toolbar
+        toolbar.installEventFilter(self)
+        self.sync()
+
+    def sync(self):
+        extra, top, right, bottom = self._margins
+        self._layout.setContentsMargins(self._toolbar.width() + extra, top, right, bottom)
+
+    def eventFilter(self, obj, event):
+        if obj is self._toolbar and event.type() in (QEvent.Resize, QEvent.Show, QEvent.LayoutRequest):
+            self.sync()
+        return False
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -9748,6 +10848,14 @@ class MainWindow(QMainWindow):
         # for, which walks every item on disk instead of just defaults
         # used at creation time).
         self.prefs = load_app_preferences()
+        # How the project that is open right now stores its multimedia.
+        # prefs["media_mode"] / ["media_include_thumbnails"] are only the
+        # DEFAULT for new projects - the real, per-project state is detected
+        # from the board files when one is opened (see _detect_project_media_state)
+        # and can be changed in Preferences > Current project data storage.
+        self.project_media_mode = self.prefs.get("media_mode", MEDIA_MODE_EMBEDDED)
+        self.project_media_thumbs = bool(self.prefs.get("media_include_thumbnails", True))
+        self._media_state_dir = None
 
         self.scene = MindMapScene(self)
         self.scene.main_window = self
@@ -9765,13 +10873,21 @@ class MainWindow(QMainWindow):
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.setSpacing(0)
         self.breadcrumb_bar = QWidget()
-        self.breadcrumb_bar.setStyleSheet("background:#1b1b1b; border-bottom:1px solid #000;")
+        self.breadcrumb_bar.setStyleSheet(_theme_text("background:#1b1b1b; border-bottom:1px solid #000;"))
         self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_bar)
         self.breadcrumb_layout.setContentsMargins(10, 4, 10, 4)
         self.breadcrumb_layout.setSpacing(2)
         self.breadcrumb_layout.addStretch(1)
         central_layout.addWidget(self.breadcrumb_bar)
-        central_layout.addWidget(self.view)
+        # Body row: [left tool column | canvas]. The tool column is inserted
+        # by _build_toolbar, so it starts right below the breadcrumb/tab
+        # strip (the "end" of the top bar) instead of beside it.
+        body = QWidget()
+        self._body_layout = QHBoxLayout(body)
+        self._body_layout.setContentsMargins(0, 0, 0, 0)
+        self._body_layout.setSpacing(0)
+        self._body_layout.addWidget(self.view, 1)
+        central_layout.addWidget(body, 1)
         self.setCentralWidget(central)
 
         # Let dropping an .html board file anywhere on the window open it,
@@ -9879,6 +10995,13 @@ class MainWindow(QMainWindow):
         # _set_loading_progress_label / _on_board_load_progress.
         self.loading_label = QLabel()
         self.statusBar().addWidget(self.loading_label)
+        self.load_progress_bar = QProgressBar()
+        self.load_progress_bar.setRange(0, 100)
+        self.load_progress_bar.setFixedSize(170, 12)
+        self.load_progress_bar.setTextVisible(False)
+        self.load_progress_bar.hide()
+        self.statusBar().addWidget(self.load_progress_bar)
+        self._media_progress_last_paint = 0.0
         self.zoom_label = QLabel()
         self.statusBar().addPermanentWidget(self.zoom_label)
         self._loading_progress_shown_pct = -1
@@ -9947,16 +11070,21 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Tools")
         tb.setIconSize(QSize(20, 20))
         tb.setMovable(False)
+        tb.setFloatable(False)
         tb.setOrientation(Qt.Vertical)
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        tb.setStyleSheet("""
+        self._left_tb = tb
+        self._left_tb_qss = """
             QToolBar { background:#1b1b1b; border:none; spacing:2px; padding:8px 4px; }
             QToolButton { color:#e8e8e8; padding:8px 10px; border-radius:6px; font-size:12px; }
-            QToolButton:hover { background:#2a2a2a; }
-            QToolButton:checked { background:#33465e; color:#8ab4ff; }
+            QToolButton:hover { background:%HOVER%; }
+            QToolButton:checked { background:rgba(99,102,241,0.24); color:#a9acff; }
             QToolBar::separator { background:#333333; height:1px; margin:6px 10px; }
-        """)
-        self.addToolBar(Qt.LeftToolBarArea, tb)
+        """
+        tb.setStyleSheet(_theme_text(self._left_tb_qss))
+        tb.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self._body_layout.insertWidget(0, tb)
+        self._toolbar_indent_sync = _ToolbarIndentSync(tb, self.breadcrumb_layout)
 
         def add_action(text, slot, checkable=False, icon_kind=None):
             act = QAction(text, self)
@@ -10015,6 +11143,10 @@ class MainWindow(QMainWindow):
         self.select_action.setChecked(True)
 
         draw_tb = QToolBar("Drawing Options")
+        self.draw_tb = draw_tb
+        draw_tb.setMinimumHeight(54)  # stays the same height when empty
+        draw_tb.setMovable(False)
+        draw_tb.setFloatable(False)
         self.addToolBar(Qt.TopToolBarArea, draw_tb)
 
         self.brush_label_action = draw_tb.addWidget(QLabel(" Brush: "))
@@ -10028,9 +11160,9 @@ class MainWindow(QMainWindow):
         self.brush_label_action.setVisible(False)
         self.brush_combo_action.setVisible(False)
 
-        draw_tb.addWidget(QLabel("  Color: "))
+        self.color_label_action = draw_tb.addWidget(QLabel("  Color: "))
         self.color_btn = QPushButton()
-        self.color_btn.setFixedSize(26, 26)
+        self.color_btn.setFixedSize(28, 28)
         # NoFocus is essential here: this button is also used to recolor
         # the TEXT of a note while it's being edited (see pick_color /
         # _focused_text_item, which target whatever QGraphicsTextItem
@@ -10045,7 +11177,7 @@ class MainWindow(QMainWindow):
         self.color_btn.setFocusPolicy(Qt.NoFocus)
         self._set_brush_color(QColor("#ffffff"))
         self.color_btn.clicked.connect(self.pick_color)
-        draw_tb.addWidget(self.color_btn)
+        self.color_btn_action = draw_tb.addWidget(self.color_btn)
 
         # -- Size group (label + slider + spinbox) -----------------------
         # All three live in one small container with a fixed 8px gap
@@ -10084,7 +11216,7 @@ class MainWindow(QMainWindow):
         self.size_slider.valueChanged.connect(self.size_stepper.setValue)
         self.size_stepper.valueChanged.connect(self.size_slider.setValue)
         size_group_layout.addWidget(self.size_stepper)
-        draw_tb.addWidget(size_group)
+        self.size_group_action = draw_tb.addWidget(size_group)
 
         # -- Opacity group (label + slider + spinbox) --------------------
         opacity_group = QWidget()
@@ -10108,7 +11240,7 @@ class MainWindow(QMainWindow):
         self.opacity_slider.valueChanged.connect(self.opacity_stepper.setValue)
         self.opacity_stepper.valueChanged.connect(self.opacity_slider.setValue)
         opacity_group_layout.addWidget(self.opacity_stepper)
-        draw_tb.addWidget(opacity_group)
+        self.opacity_group_action = draw_tb.addWidget(opacity_group)
 
 
         # -- arrow style control (Arrow only) -----------------------------
@@ -10369,6 +11501,52 @@ class MainWindow(QMainWindow):
         self._text_format_actions = self._font_format_actions + [self.link_action]
         for a in self._text_format_actions:
             a.setVisible(False)
+        self._update_top_toolbar_visibility()
+
+    def refresh_theme(self):
+        """Re-apply the app-wide theme (accent / background / inactive-tab
+        colours from Preferences) to everything that carries its own
+        stylesheet."""
+        apply_dark_theme(QApplication.instance(), self.prefs)
+        self._left_tb.setStyleSheet(_theme_text(self._left_tb_qss))
+        self.breadcrumb_bar.setStyleSheet(_theme_text("background:#1b1b1b; border-bottom:1px solid #000;"))
+        self._update_breadcrumb_bar()
+        for ns in self.findChildren(NumberStepper):
+            ns.restyle()
+        for menu in self.findChildren(QMenu):   # menus created before the radius was turned on
+            _make_menu_rounded(menu)
+        # Selection outlines / handles are painted with the accent colour, so
+        # repaint every canvas item to pick up a freshly chosen accent.
+        for view in self.findChildren(QGraphicsView):
+            sc = view.scene()
+            if sc is not None:
+                for it in sc.items():
+                    it.update()
+            view.viewport().update()
+
+    def _update_top_toolbar_visibility(self, needed=None):
+        """Hide Color/Size/Opacity (and the whole top bar when nothing else
+        is showing) while there is nothing they could change: no selection,
+        no text being edited and Draw mode off."""
+        if not hasattr(self, "opacity_group_action"):
+            return
+        if needed is None:
+            sub_sel = getattr(self.scene, "_subitem_selected_card", None) is not None
+            needed = bool(
+                self.scene.selectedItems()
+                or self._focused_text_item() is not None
+                or sub_sel
+                or self._active_text_board_card is not None
+                or self.draw_action.isChecked()
+            )
+        for a in (self.color_label_action, self.color_btn_action,
+                  self.size_group_action, self.opacity_group_action):
+            a.setVisible(needed)
+        any_visible = any(
+            a.isVisible() for a in self.draw_tb.actions() if not a.isSeparator()
+        )
+        hide_when_empty = bool(self.prefs.get("hide_top_toolbar_when_empty", True))
+        self.draw_tb.setVisible(any_visible or not hide_when_empty)
 
     # -- Find & Replace -----------------------------------------------
     # Scope is the current board only (i.e. self.scene.items()) - matching
@@ -10641,7 +11819,7 @@ class MainWindow(QMainWindow):
     # instead restyle the selected object(s) live, so the user can just
     # select something and drag the sliders / pick a color to change it.
     def _set_brush_color(self, color):
-        self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
+        self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
         self.scene.brush_color = color
 
     def _focused_text_item(self):
@@ -10945,7 +12123,7 @@ class MainWindow(QMainWindow):
             # priority for the color swatch: it previews the TEXT color,
             # not whatever the component's own color happens to be.
             col = editing_item.defaultTextColor()
-            self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+            self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
 
         if font_sel:
             first = font_sel[0]
@@ -10973,7 +12151,7 @@ class MainWindow(QMainWindow):
                 else:
                     default = getattr(first, "DEFAULT_COLOR", None) or "#ffffff"
                     col = QColor(first.color) if first.color else QColor(default)
-                self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+                self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
                 # No live text cursor to read a per-run highlight from
                 # here - default the toggle off (it'll pick up the real
                 # state again once actively editing/selecting text).
@@ -11016,7 +12194,7 @@ class MainWindow(QMainWindow):
             else:
                 col = self.scene.brush_color
                 width = self.scene.brush_width
-            self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+            self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
             self.size_slider.blockSignals(True)
             self.size_slider.setValue(int(max(1, min(40, round(width)))))
             self.size_slider.blockSignals(False)
@@ -11028,7 +12206,7 @@ class MainWindow(QMainWindow):
         elif other_sel:
             first = other_sel[0]
             col = QColor(first.color) if getattr(first, "color", None) else QColor(getattr(first, "DEFAULT_COLOR", None) or "#ffffff")
-            self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+            self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
         elif selected_sub is not None and selected_sub.get("kind") in ("image", "gif", "video"):
             # A single-click-selected image/gif/video subitem previews
             # its own Background color here, same as its standalone
@@ -11036,7 +12214,7 @@ class MainWindow(QMainWindow):
             # is its other color role but only shows in the picker
             # itself (see pick_color()), same as standalone components.
             col = QColor(selected_sub.get("color")) if selected_sub.get("color") else QColor("#1e1e1e")
-            self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+            self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
         elif editing_item is None:
             self._set_brush_color(self.scene.brush_color)
             self.size_slider.blockSignals(True)
@@ -11050,6 +12228,12 @@ class MainWindow(QMainWindow):
 
         if editing_item is not None:
             self._refresh_text_format_buttons()
+
+        self._update_top_toolbar_visibility(
+            bool(all_sel or editing_item is not None or selected_sub is not None
+                 or self._active_text_board_card is not None
+                 or self.draw_action.isChecked())
+        )
 
     def _refresh_text_format_buttons(self):
         """Live-refresh the Font/B/I/U/Color/Link toolbar controls from
@@ -11088,7 +12272,7 @@ class MainWindow(QMainWindow):
         self.size_stepper.setValue(self.size_slider.value())
         fg = fmt.foreground()
         col = fg.color() if fg.style() != Qt.NoBrush else editing_item.defaultTextColor()
-        self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #888;")
+        self.color_btn.setStyleSheet(f"background-color:{col.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
         bg = fmt.background()
         self.highlight_btn.blockSignals(True)
         self.highlight_btn.setChecked(bg.style() != Qt.NoBrush)
@@ -11182,7 +12366,7 @@ class MainWindow(QMainWindow):
                         if idx < len(parent.subitems):
                             parent.subitems[idx]["color"] = color.name()
                             parent.update()
-            self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
+            self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
             return
         if self._selected_board_subitem is not None:
             # A single-click-selected Board Card subitem (not being
@@ -11206,7 +12390,7 @@ class MainWindow(QMainWindow):
                         return
                     sub["color"] = color.name()
                     card.update()
-                    self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
+                    self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
                     return
                 # A Text Note subitem: "color" is its Background fill -
                 # its actual text color lives in "text_color" and is
@@ -11225,7 +12409,7 @@ class MainWindow(QMainWindow):
                 sub["color"] = bg.name()
                 sub["top_strip_color"] = strip.name()
                 card.update()
-                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #888;")
+                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
                 return
             if kind in ("image", "gif", "video"):
                 # Background and Top Strip are always offered together
@@ -11245,7 +12429,7 @@ class MainWindow(QMainWindow):
                 sub["color"] = bg.name()
                 sub["top_strip_color"] = strip.name()
                 card.update()
-                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #888;")
+                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
                 return
         if self._editing_selection:
             first = self._editing_selection[0]
@@ -11263,7 +12447,7 @@ class MainWindow(QMainWindow):
                     it.set_stroke_style(color=color)
                 elif isinstance(it, ArrowItem):
                     it.set_color(color)
-            self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
+            self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
             return
         if self._text_selection:
             # Whole component selected (not editing its text): change the
@@ -11287,7 +12471,7 @@ class MainWindow(QMainWindow):
                     it.set_color(bg)
                     if isinstance(it, TopStripMixin):
                         it.set_top_strip_color(strip)
-                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #888;")
+                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
                 return
             start = QColor(first.color) if first.color else QColor(first.DEFAULT_COLOR)
             color = QColorDialog.getColor(start, self, "Pick component color")
@@ -11295,7 +12479,7 @@ class MainWindow(QMainWindow):
                 return
             for it in self._text_selection:
                 it.set_color(color)
-            self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
+            self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
             return
         if self._other_selection:
             # Whole component selected (Image/GIF/Video/Board Card, ...):
@@ -11323,7 +12507,7 @@ class MainWindow(QMainWindow):
                     it.set_color(bg)
                     if isinstance(it, TopStripMixin):
                         it.set_top_strip_color(strip)
-                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #888;")
+                self.color_btn.setStyleSheet(f"background-color:{bg.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
                 return
             start = QColor(first.color) if getattr(first, "color", None) else QColor(getattr(first, "DEFAULT_COLOR", None) or "#ffffff")
             color = QColorDialog.getColor(start, self, "Pick component color")
@@ -11331,7 +12515,7 @@ class MainWindow(QMainWindow):
                 return
             for it in self._other_selection:
                 it.set_color(color)
-            self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #888;")
+            self.color_btn.setStyleSheet(f"background-color:{color.name()}; border:1px solid #4a4a4a; border-radius:0px; padding:0; min-width:0; min-height:0;")
             return
         color = QColorDialog.getColor(self.scene.brush_color, self, "Pick brush color")
         if color.isValid():
@@ -11693,6 +12877,7 @@ class MainWindow(QMainWindow):
         self.eraser_checkbox_action.setVisible(checked)
         if not checked:
             self.eraser_checkbox.setChecked(False)
+        self._update_top_toolbar_visibility()
         self.statusBar().showMessage(
             "Draw mode ON \u2014 click and drag on the canvas to sketch" if checked else "Ready"
         )
@@ -11829,6 +13014,8 @@ class MainWindow(QMainWindow):
             pos.x() - 110, pos.y() - 60, title=safe_name, target_file=target_file,
             thumb_mime=dlg.thumb_mime, thumb_data=dlg.thumb_data,
         )
+        item.thumb_origin = dlg.thumb_path if dlg.thumb_data else None
+        item.thumb_name = os.path.basename(dlg.thumb_path) if (dlg.thumb_data and dlg.thumb_path) else None
         self.scene.addItem(item)
         self.scene.bring_to_front(item)
         self.statusBar().showMessage(f"Linked board: {target_file}", 4000)
@@ -11852,17 +13039,17 @@ class MainWindow(QMainWindow):
         self._apply_default_font(item)
 
     def add_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select image", dialog_start_dir("image", self), "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
         if path:
             self.create_item_from_file(path, self._viewport_center_scene())
 
     def add_gif(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select GIF", "", "GIF (*.gif)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select GIF", dialog_start_dir("gif", self), "GIF (*.gif)")
         if path:
             self.create_item_from_file(path, self._viewport_center_scene())
 
     def add_video(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select video", "", "Video (*.mp4 *.mov *.avi *.webm *.mkv)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select video", dialog_start_dir("video", self), "Video (*.mp4 *.mov *.avi *.webm *.mkv)")
         if path:
             self.create_item_from_file(path, self._viewport_center_scene())
 
@@ -11916,6 +13103,10 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "Unsupported file", f"Unsupported file type: {ext}")
             return None
+        item.media_origin = path
+        item.media_name = os.path.basename(path)
+        if ext in IMAGE_EXTS:
+            item._b64_cache = base64.b64encode(data).decode("ascii")  # keep the original bytes
         self.scene.addItem(item)
         self.scene.bring_to_front(item)
         self._apply_default_title_alignment(item)
@@ -12240,6 +13431,7 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "New board", "Clear the current board?") == QMessageBox.Yes:
             self.scene.clear_board()
             self.current_file = None
+            self._reset_project_media_state()
             self.breadcrumb = [{"name": "Untitled", "file": None}]
             self._update_breadcrumb_bar()
             self._set_base_title("OpenNote \u2014 Milanote-style Mind Map")
@@ -12262,6 +13454,7 @@ class MainWindow(QMainWindow):
         self.scene.clear_board()
         self.current_file = None
         self.project_dir = None
+        self._reset_project_media_state()
         self.breadcrumb = [{"name": "Untitled", "file": None}]
         self._update_breadcrumb_bar()
         self._ensure_project_and_file()
@@ -12279,6 +13472,9 @@ class MainWindow(QMainWindow):
         dlg = QFileDialog(self, title)
         dlg.setFileMode(QFileDialog.Directory)
         dlg.setOption(QFileDialog.ShowDirsOnly, True)
+        start_dir = dialog_start_dir(None, self)
+        if start_dir:
+            dlg.setDirectory(start_dir)
         if dlg.exec() != QDialog.Accepted:
             return None
         selected = dlg.selectedFiles()
@@ -12345,7 +13541,7 @@ class MainWindow(QMainWindow):
             self.save_board_as()
 
     def save_board_as(self):
-        start_dir = self.project_dir or (os.path.dirname(self.current_file) if self.current_file else "")
+        start_dir = dialog_start_dir(None, self)
         start_path = os.path.join(start_dir, "board.html") if start_dir else "board.html"
         path, _ = QFileDialog.getSaveFileName(self, "Save board as HTML", start_path, "HTML files (*.html)")
         if path:
@@ -12475,10 +13671,235 @@ class MainWindow(QMainWindow):
             f"Renamed main board to \u201c{new_target_file}\u201d ({updated} other file(s) updated)", 5000
         )
 
+    # -- multimedia storage mode (embedded / local path) ------------------
+    def media_mode_is_local(self):
+        return self.project_media_mode == MEDIA_MODE_LOCAL
+
+    def _reset_project_media_state(self):
+        self.project_media_mode = self.prefs.get("media_mode", MEDIA_MODE_EMBEDDED)
+        self.project_media_thumbs = bool(self.prefs.get("media_include_thumbnails", True))
+        self._media_state_dir = None
+
+    def _detect_project_media_state(self, html, path):
+        """Adopt the storage mode the just-opened board was saved with. A
+        board without any media says nothing, so the project's other boards
+        are consulted (once per project folder); failing that the state is
+        kept / falls back to the default preference."""
+        proj = os.path.dirname(os.path.abspath(path))
+        mode, thumbs = detect_media_storage(html)
+        if mode is None:
+            if self._media_state_dir == proj:
+                return
+            try:
+                me = os.path.normcase(os.path.abspath(path))
+                for fname in sorted(os.listdir(proj)):
+                    other = os.path.join(proj, fname)
+                    if not fname.lower().endswith(".html") or os.path.normcase(other) == me:
+                        continue
+                    with open(other, "r", encoding="utf-8") as f:
+                        mode, thumbs = detect_media_storage(f.read())
+                    if mode is not None:
+                        break
+            except OSError:
+                pass
+        same_project = self._media_state_dir == proj
+        default_thumbs = bool(self.prefs.get("media_include_thumbnails", True))
+        if mode is None:
+            mode = self.prefs.get("media_mode", MEDIA_MODE_EMBEDDED)
+        if thumbs is None:
+            thumbs = self.project_media_thumbs if same_project else default_thumbs
+        self.project_media_mode = mode
+        self.project_media_thumbs = bool(thumbs)
+        self._media_state_dir = proj
+
+    def media_thumbs_enabled(self):
+        return bool(self.project_media_thumbs)
+
+    def media_base_dir(self):
+        """Folder of the current board's HTML - local media paths are always
+        relative to it. None until the board has been saved."""
+        return os.path.dirname(os.path.abspath(self.current_file)) if self.current_file else None
+
+    def _on_media_progress(self, verb, name, done, total):
+        now = time.perf_counter()
+        if done < total and (now - self._media_progress_last_paint) < 0.05:
+            return
+        self._media_progress_last_paint = now
+        pct = int(done * 100 / total) if total else 100
+        self._set_loading_progress_label(name, pct, verb=verb)
+
+    def choose_new_media_path(self, kind, current_src=None):
+        """\"Change Path...\" for a media component: let the user pick a file
+        (starting in the folder of the current one, inside the HTML's folder)
+        and return (bytes, relative_src) - or None if cancelled. A file that
+        isn't inside the HTML's folder can't be referenced relatively, so the
+        user is offered a copy in Assets instead."""
+        base = self.media_base_dir()
+        if not base:
+            QMessageBox.information(
+                self, "Change Path",
+                "Save the board first - media paths are relative to the board's HTML file.")
+            return None
+        start = base
+        if current_src:
+            cand = os.path.dirname(resolve_media_path(current_src, base))
+            if os.path.isdir(cand):
+                start = cand
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose media file (next to the HTML)", start, MEDIA_FILE_FILTERS.get(kind, "All files (*)"))
+        if not path:
+            return None
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            QMessageBox.warning(self, "Change Path", f"Could not read file:\n{e}")
+            return None
+        rel = relative_media_path(path, base)
+        if rel is None:
+            resp = QMessageBox.question(
+                self, "File is outside the HTML folder",
+                "The HTML can only reference files inside its own folder (relative paths), "
+                f"and this file is somewhere else.\n\nCopy it into {ASSETS_DIR_NAME}/{ASSET_SUBDIRS[kind]} instead?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if resp != QMessageBox.Yes:
+                return None
+            try:
+                rel = externalize_media_bytes(kind, raw, base, None, name=os.path.basename(path))
+            except OSError as e:
+                QMessageBox.warning(self, "Change Path", f"Could not copy file:\n{e}")
+                return None
+        return raw, rel, os.path.basename(path)
+
+    def _externalize_current_board(self, base_dir):
+        n = self.scene.pending_media_count(self.media_thumbs_enabled())
+        if not n:
+            return
+        name = os.path.basename(self.current_file) if self.current_file else "board"
+        self._media_progress_last_paint = 0.0
+        try:
+            self._set_loading_progress_label(name, 0, verb="Saving media of")
+            self.scene.externalize_media(
+                base_dir, lambda d, t: self._on_media_progress("Saving media of", name, d, t),
+                thumbs=self.media_thumbs_enabled())
+        finally:
+            self._set_loading_progress_label(None, None)
+
+    def convert_project_media(self, new_mode, thumbs=None):
+        """Convert every board of the open project to `new_mode` (and, in
+        local mode, with/without Board Link thumbnails), with a progress bar."""
+        to_local = new_mode == MEDIA_MODE_LOCAL
+        if thumbs is None:
+            thumbs = self.media_thumbs_enabled()
+        self.project_media_mode = new_mode
+        self.project_media_thumbs = bool(thumbs)
+        proj = self.project_dir or (os.path.dirname(self.current_file) if self.current_file else None)
+        if not proj or not os.path.isdir(proj):
+            self.statusBar().showMessage(
+                "Media mode changed - it will apply when the board is first saved.", 5000)
+            return
+        proj = os.path.abspath(proj)
+        self._media_state_dir = proj
+        cur_norm = os.path.normcase(os.path.abspath(self.current_file)) if self.current_file else None
+        boards = sorted(os.path.join(proj, n) for n in os.listdir(proj) if n.lower().endswith(".html"))
+        if cur_norm and not any(os.path.normcase(b) == cur_norm for b in boards):
+            boards.append(os.path.abspath(self.current_file))
+        total = len(boards)
+        if not total:
+            return
+        dlg = MediaProgressDialog(
+            self, "Extracting multimedia" if to_local else "Packing multimedia into HTML")
+        missing, failed, converted = [], [], 0
+        try:
+            for i, path in enumerate(boards):
+                name = os.path.basename(path)
+                is_current = cur_norm is not None and os.path.normcase(path) == cur_norm
+
+                def report(frac, what, i=i, name=name):
+                    dlg.set_progress((i + frac) / total * 100, f"{name}  ({i + 1}/{total})\n{what}")
+
+                report(0.0, "Reading\u2026")
+                try:
+                    if is_current:
+                        if to_local:
+                            if not thumbs:
+                                self.scene.clear_media_sources(media=False, thumbs=True)
+                            self.scene.externalize_media(
+                                proj, lambda d, t: report(0.8 * d / max(t, 1), f"Extracting media {d}/{t}"),
+                                thumbs=thumbs)
+                        else:
+                            self.scene.clear_media_sources()
+                        report(0.85, "Writing HTML\u2026")
+                        self._write_html(self.current_file)
+                        converted += 1
+                    else:
+                        with open(path, "r", encoding="utf-8") as f:
+                            data = extract_scene_data(f.read())
+                        if data is None or not media_needs_conversion(data, to_local, thumbs):
+                            continue
+                        if to_local:
+                            if not thumbs:  # thumbnails stay embedded - pull any referenced ones back in
+                                missing += hydrate_media_data(data, proj, media=False)
+                            externalize_media_data(
+                                data, proj, lambda d, t: report(0.8 * d / max(t, 1), f"Extracting media {d}/{t}"),
+                                thumbs=thumbs)
+                        else:
+                            missing += hydrate_media_data(
+                                data, proj, lambda d, t: report(0.8 * d / max(t, 1), f"Packing media {d}/{t}"))
+                        data = strip_media_data(data, to_local, thumbs)
+                        report(0.85, "Writing HTML\u2026")
+                        _write_text_atomic(path, build_html_document(data))
+                        converted += 1
+                except Exception as e:
+                    failed.append(f"{name}: {e}")
+                report(1.0, "Done")
+            dlg.set_progress(100, "Done")
+        finally:
+            dlg.finish()
+        self.statusBar().showMessage(
+            f"Multimedia {'extracted to Assets' if to_local else 'embedded into HTML'} in {converted} board file(s)", 6000)
+        problems = []
+        if failed:
+            problems.append("These boards could not be converted:\n" + "\n".join(f"  \u2022 {m}" for m in failed[:10]))
+        if missing:
+            problems.append(f"{len(missing)} referenced media file(s) were not found and could not be packed:\n"
+                            + "\n".join(f"  \u2022 {m}" for m in missing[:10]))
+        if problems:
+            QMessageBox.warning(self, "Media conversion", "\n\n".join(problems))
+        if not to_local and not failed:
+            assets = os.path.join(proj, ASSETS_DIR_NAME)
+            if os.path.isdir(assets) and QMessageBox.question(
+                self, "Remove Assets folder?",
+                "All multimedia is embedded in the HTML files again.\n\n"
+                f"Delete the now unused \u201c{ASSETS_DIR_NAME}\u201d folder (Images, Videos, GIFs, Thumbnails)?\n"
+                "(Files you referenced from your own folders are never touched.)",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+                for sub in ASSET_SUBDIRS.values():
+                    shutil.rmtree(os.path.join(assets, sub), ignore_errors=True)
+                try:
+                    os.rmdir(assets)  # only succeeds if nothing else is in it
+                except OSError:
+                    pass
+
     def _write_html(self, path):
+        base_dir = os.path.dirname(os.path.abspath(path))
+        local = self.media_mode_is_local()
+        if local:
+            # Saving into a different folder than the one the relative
+            # paths were made for: forget them (bytes are in memory) so the
+            # media is re-written next to the new HTML.
+            old_base = self.media_base_dir()
+            if old_base is not None and os.path.normcase(old_base) != os.path.normcase(base_dir):
+                self.scene.clear_media_sources()  # media and thumbnails
+            try:
+                self._externalize_current_board(base_dir)
+            except OSError as e:
+                QMessageBox.critical(self, "Save failed", f"Could not write media files:\n{e}")
+                return
         data = self.scene.serialize()
         data["view"] = self.view.current_view_state()
         data["breadcrumb"] = self.breadcrumb
+        data = strip_media_data(data, local, self.media_thumbs_enabled())
         html = build_html_document(data)
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -12540,7 +13961,7 @@ class MainWindow(QMainWindow):
     def open_board(self):
         if not self._confirm_discard_changes(title="Open board"):
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open board", "", "HTML files (*.html)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open board", dialog_start_dir(None, self), "HTML files (*.html)")
         if not path:
             return
         self._load_board_file(path, error_title="Open failed")
@@ -12617,7 +14038,7 @@ class MainWindow(QMainWindow):
         pct = round(self.view.transform().m11() * 100)
         self.zoom_label.setText(f"Zoom: {pct}%")
 
-    def _set_loading_progress_label(self, board_name, pct):
+    def _set_loading_progress_label(self, board_name, pct, verb="Loading"):
         """Update (or, with board_name=None, clear) the permanent
         bottom-left status bar label used while a board is loading. Kept
         separate from _on_board_load_progress so _load_board_file can
@@ -12625,8 +14046,11 @@ class MainWindow(QMainWindow):
         without going through the done/total percentage math."""
         if board_name is None:
             self.loading_label.clear()
+            self.load_progress_bar.hide()
         else:
-            self.loading_label.setText(f"Loading {board_name}\u2026 {pct}%")
+            self.loading_label.setText(f"{verb} {board_name}\u2026 {pct}%")
+            self.load_progress_bar.setValue(int(pct))
+            self.load_progress_bar.show()
         # scene.load() below is one long synchronous call - without
         # pumping the event loop here the label text above would just
         # sit in Qt's paint queue and never actually reach the screen
@@ -12664,6 +14088,7 @@ class MainWindow(QMainWindow):
             if data is None:
                 QMessageBox.warning(self, error_title, "No board data found in this HTML file.")
                 return
+            self._detect_project_media_state(html, path)
             # See _reset_transient_item_refs's docstring: scene.load()
             # below only protects the scene's *own* selection/focus
             # (MindMapScene.clear_board) - it has no way to know about
@@ -12671,6 +14096,18 @@ class MainWindow(QMainWindow):
             # at a component that's about to be destroyed, which is
             # what actually crashed the app on navigating away rather
             # than just misbehaving.
+            # A board saved in local-path mode only holds relative "src"
+            # paths - read those files (next to this HTML) back into the
+            # data first, with a progress bar of their own.
+            missing_media = []
+            if count_media_to_hydrate(data):
+                _name = os.path.basename(path)
+                try:
+                    missing_media = hydrate_media_data(
+                        data, os.path.dirname(os.path.abspath(path)),
+                        lambda d, t, n=_name: self._on_media_progress("Reading media of", n, d, t))
+                finally:
+                    self._set_loading_progress_label(None, None)
             self._reset_transient_item_refs()
             basename_for_progress = os.path.basename(path)
             self._loading_progress_shown_pct = -1
@@ -12711,6 +14148,14 @@ class MainWindow(QMainWindow):
             self._update_saved_snapshot(snapshot)
             self._reset_undo_history(snapshot)
             self._add_recent_file(path)
+            if missing_media:
+                shown = "\n".join(f"  \u2022 {m}" for m in missing_media[:10])
+                more = f"\n  \u2026and {len(missing_media) - 10} more" if len(missing_media) > 10 else ""
+                QMessageBox.warning(
+                    self, "Media files not found",
+                    f"{len(missing_media)} media file(s) referenced by this board were not found "
+                    f"next to the HTML file:\n\n{shown}{more}\n\n"
+                    "In local-path mode, right-click the media \u2192 Change Path\u2026 to point it at the file.")
         except Exception as e:
             QMessageBox.critical(self, error_title, str(e))
 
@@ -12743,10 +14188,10 @@ class MainWindow(QMainWindow):
                 target_path = os.path.join(project_dir, target_file) if (project_dir and target_file) else None
                 enabled = bool(target_path and os.path.exists(target_path))
                 btn.setEnabled(enabled)
-                btn.setStyleSheet(
-                    "QToolButton { color:#8ab4ff; } QToolButton:hover { text-decoration:underline; }"
+                btn.setStyleSheet(_theme_text(
+                    "QToolButton { color:#9da0ff; } QToolButton:hover { text-decoration:underline; }"
                     if enabled else "QToolButton { color:#666; }"
-                )
+                ))
                 if enabled:
                     btn.clicked.connect(lambda checked=False, p=target_path: self.navigate_to_file(p))
             layout.addWidget(btn)
@@ -12757,21 +14202,274 @@ class MainWindow(QMainWindow):
 # Theme
 # --------------------------------------------------------------------------
 
-def apply_dark_theme(app):
+_THEME_DIR = None
+
+
+def _theme_icon_dir():
+    """Tiny PNG glyphs (check mark, dropdown/spin chevrons) the stylesheet
+    points at - Qt style sheets can only draw indicators from image files.
+    Painted once into a temp folder that is removed at exit."""
+    global _THEME_DIR
+    if _THEME_DIR is not None:
+        return _THEME_DIR
+    _THEME_DIR = tempfile.mkdtemp(prefix="opennote_theme_")
+    atexit.register(shutil.rmtree, _THEME_DIR, True)
+
+    def make(name, painter_fn, color):
+        pm = QPixmap(48, 48)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(color), 5.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        painter_fn(p)
+        p.end()
+        pm.save(os.path.join(_THEME_DIR, name + ".png"), "PNG")
+
+    def check(p):
+        path = QPainterPath()
+        path.moveTo(11, 25)
+        path.lineTo(20, 34)
+        path.lineTo(37, 14)
+        p.drawPath(path)
+
+    def chevron(down):
+        def draw(p):
+            path = QPainterPath()
+            y0, y1 = (17, 31) if down else (31, 17)
+            path.moveTo(13, y0)
+            path.lineTo(24, y1)
+            path.lineTo(35, y0)
+            p.drawPath(path)
+        return draw
+
+    make("check", check, "#ffffff")
+    make("down", chevron(True), "#a8a8b3")
+    make("up", chevron(False), "#a8a8b3")
+    return _THEME_DIR
+
+
+THEME_ACCENT = "#6366f1"      # accent ("guide") colour: primary button, focus ring, checked
+THEME_BG = "#1b1b1b"          # app background
+THEME_TAB = "#181818"         # inactive tab background
+THEME_HOVER = "#2a2a2e"       # hover highlight (toolbar buttons, menu-bar items)
+THEME_MENU_RADIUS = 10        # menu corner radius in px
+
+
+def _clamp8(v):
+    return max(0, min(255, int(round(v))))
+
+
+def _mix_hex(hex_a, hex_b, t):
+    a, b = QColor(hex_a), QColor(hex_b)
+    return "#%02x%02x%02x" % (
+        _clamp8(a.red() + (b.red() - a.red()) * t),
+        _clamp8(a.green() + (b.green() - a.green()) * t),
+        _clamp8(a.blue() + (b.blue() - a.blue()) * t),
+    )
+
+
+def _shade_hex(hex_color, delta):
+    c = QColor(hex_color)
+    return "#%02x%02x%02x" % (_clamp8(c.red() + delta), _clamp8(c.green() + delta), _clamp8(c.blue() + delta))
+
+
+def _gray(v):
+    """A neutral surface grey from the original design (#1b1b1b background =
+    27), re-based on the current background colour so every panel, input and
+    border shifts together with it."""
+    return _shade_hex(THEME_BG, v - 0x1b)
+
+
+def _theme_text(qss):
+    """Re-colour a stylesheet fragment written for the default theme
+    (indigo accent, #1b1b1b background) with the current theme colours."""
+    acc = QColor(THEME_ACCENT)
+    qss = qss.replace("rgba(99,102,241,", f"rgba({acc.red()},{acc.green()},{acc.blue()},")
+    for old, new in (("#7679f3", _mix_hex(THEME_ACCENT, "#ffffff", 0.12)),
+                     ("#5558dd", _mix_hex(THEME_ACCENT, "#000000", 0.13)),
+                     ("#a9acff", _mix_hex(THEME_ACCENT, "#ffffff", 0.45)),
+                     ("#9da0ff", _mix_hex(THEME_ACCENT, "#ffffff", 0.38))):
+        qss = qss.replace(old, new)
+
+    def _neutral(m):
+        h = m.group(1)
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        if r == g == b and r <= 0x50:
+            return _gray(r)
+        return m.group(0)
+
+    qss = re.sub(r"#([0-9a-fA-F]{6})\b", _neutral, qss)
+    return (qss.replace("%MENURADIUS%", str(int(THEME_MENU_RADIUS)))
+               .replace("%BG%", THEME_BG).replace("%ACCENT%", THEME_ACCENT)
+               .replace("%HOVER%", THEME_HOVER)
+               .replace("%TABHOVER%", _shade_hex(THEME_TAB, 7))
+               .replace("%TABBORDER%", _shade_hex(THEME_TAB, 20))
+               .replace("%TAB%", THEME_TAB))
+
+_THEME_QSS = """
+QMainWindow { background:%BG%; }
+QDialog { background:#212121; }
+QToolTip { background:#2a2a2a; color:#eeeeee; border:1px solid #3d3d3d; border-radius:6px; padding:5px 8px; }
+
+/* ---- menus --------------------------------------------------------- */
+QMenuBar { background:%BG%; color:#d4d4d8; padding:3px 6px; }
+QMenuBar::item { background:transparent; padding:5px 11px; border-radius:6px; }
+QMenuBar::item:selected { background:%HOVER%; color:#ffffff; }
+QMenu { background:#242424; border:1px solid #363636; border-radius:%MENURADIUS%px; padding:6px; }
+QMenu::item { padding:7px 26px 7px 14px; border-radius:6px; color:#e4e4e7; }
+QMenu::item:selected { background:rgba(99,102,241,0.30); color:#ffffff; }
+QMenu::item:disabled { color:#77777d; }
+QMenu::separator { height:1px; background:#363636; margin:5px 8px; }
+
+/* ---- tabs ----------------------------------------------------------- */
+QTabWidget::pane { border:1px solid #343434; border-radius:10px; border-top-left-radius:0; border-top-right-radius:0; background:#252525; top:-1px; }
+QTabBar { qproperty-drawBase:0; }
+QTabBar::tab { background:%TAB%; padding:8px 16px; border:1px solid %TABBORDER%; border-bottom:none;
+               border-top-left-radius:9px; border-top-right-radius:9px; margin-right:6px; }
+QTabBar::tab:selected { background:#252525; border-color:#343434; font-weight:600; }
+QTabBar::tab:hover:!selected { background:%TABHOVER%; }
+
+/* ---- inputs --------------------------------------------------------- */
+QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox {
+    background:#2b2b2b; border:1px solid #3b3b3b; border-radius:8px; padding:6px 10px;
+    selection-background-color:%ACCENT%; selection-color:#ffffff; min-height:18px; }
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QAbstractSpinBox:focus, QComboBox:focus { border:1px solid %ACCENT%; }
+QLineEdit:disabled, QAbstractSpinBox:disabled, QComboBox:disabled { color:#77777d; background:#262626; }
+QAbstractSpinBox QLineEdit, QComboBox QLineEdit { background:transparent; border:none; padding:0; min-height:0; }
+QComboBox::drop-down { border:none; width:28px; }
+QComboBox::down-arrow { image:url(%DOWN%); width:11px; height:11px; }
+QComboBox QAbstractItemView { background:#242424; border:1px solid #363636; padding:4px; outline:0;
+    selection-background-color:rgba(99,102,241,0.35); selection-color:#ffffff; }
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button { subcontrol-origin:border; width:20px; border:none; background:transparent; }
+QAbstractSpinBox::up-button { subcontrol-position:top right; }
+QAbstractSpinBox::down-button { subcontrol-position:bottom right; }
+QAbstractSpinBox::up-arrow { image:url(%UP%); width:9px; height:9px; }
+QAbstractSpinBox::down-arrow { image:url(%DOWN%); width:9px; height:9px; }
+
+/* ---- buttons -------------------------------------------------------- */
+QPushButton { background:#2b2b2b; border:1px solid #3b3b3b; border-radius:8px; padding:7px 18px; min-height:18px; }
+QPushButton:hover { background:#343434; border-color:#4a4a4a; }
+QPushButton:pressed { background:#262626; }
+QPushButton:disabled { color:#6d6d73; background:#262626; }
+QPushButton:default { background:%ACCENT%; border:1px solid %ACCENT%; color:#ffffff; font-weight:600; }
+QPushButton:default:hover { background:#7679f3; border-color:#7679f3; }
+QPushButton:default:pressed { background:#5558dd; }
+QToolButton { border-radius:6px; padding:4px 7px; }
+QToolButton:hover { background:%HOVER%; }
+QToolButton:checked { background:rgba(99,102,241,0.24); color:#a9acff; }
+
+/* ---- checkboxes / radios -------------------------------------------- */
+QCheckBox, QRadioButton { spacing:9px; }
+QCheckBox::indicator, QRadioButton::indicator { width:16px; height:16px; border:1px solid #5b5b62; background:#2b2b2b; }
+QCheckBox::indicator { border-radius:5px; }
+QRadioButton::indicator { width:14px; height:14px; border-radius:8px; }
+QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color:#8c8c95; }
+QCheckBox::indicator:checked { background:%ACCENT%; border-color:%ACCENT%; image:url(%CHECK%); }
+QRadioButton::indicator:checked { width:6px; height:6px; background:#ffffff; border:5px solid %ACCENT%; border-radius:8px; }
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled { background:#262626; border-color:#3b3b3b; }
+
+/* ---- sliders / progress -------------------------------------------- */
+QSlider::groove:horizontal { height:4px; background:#3b3b3b; border-radius:2px; }
+QSlider::sub-page:horizontal { background:%ACCENT%; border-radius:2px; }
+QSlider::handle:horizontal { width:14px; height:14px; margin:-5px 0; border-radius:7px; background:#ffffff; }
+QProgressBar { background:#2b2b2b; border:none; border-radius:6px; text-align:center; color:#e4e4e7; }
+QProgressBar::chunk { background:%ACCENT%; border-radius:6px; }
+
+/* ---- scrollbars ------------------------------------------------------ */
+QScrollBar:vertical { background:transparent; width:12px; margin:0; }
+QScrollBar:horizontal { background:transparent; height:12px; margin:0; }
+QScrollBar::handle:vertical { background:#3e3e44; border-radius:5px; min-height:32px; margin:2px; }
+QScrollBar::handle:horizontal { background:#3e3e44; border-radius:5px; min-width:32px; margin:2px; }
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background:#585860; }
+QScrollBar::add-line, QScrollBar::sub-line { width:0; height:0; background:none; border:none; }
+QScrollBar::add-page, QScrollBar::sub-page { background:none; }
+QScrollArea { background:transparent; border:none; }
+QScrollArea > QWidget > QWidget { background:transparent; }
+
+/* ---- bars ------------------------------------------------------------ */
+QToolBar { background:%BG%; border:none; border-bottom:1px solid #2a2a2a; spacing:6px; padding:4px 8px; }
+QToolBar::separator { background:#333333; width:1px; margin:5px 6px; }
+QStatusBar { background:%BG%; color:#9a9aa2; border-top:1px solid #2a2a2a; }
+QStatusBar::item { border:none; }
+QLabel { background:transparent; }
+QMessageBox QLabel { color:#e4e4e7; }
+
+/* ---- lists / trees / tables / groups / splitters ------------------- */
+QGroupBox { border:1px solid #343434; border-radius:10px; margin-top:12px; padding-top:10px; }
+QGroupBox::title { subcontrol-origin:margin; left:12px; padding:0 6px; color:#a8a8b3; }
+QListView, QTreeView, QTableView, QTextBrowser { background:#252525; border:1px solid #343434; border-radius:8px; outline:0;
+    selection-background-color:rgba(99,102,241,0.35); selection-color:#ffffff; alternate-background-color:#2a2a2a; }
+QListView::item, QTreeView::item { padding:4px 6px; border-radius:6px; }
+QListView::item:hover, QTreeView::item:hover { background:#2e2e33; }
+QHeaderView::section { background:#2b2b2b; color:#c8c8cf; border:none; border-right:1px solid #343434; padding:6px 8px; }
+QSplitter::handle { background:#2a2a2a; }
+QSplitter::handle:hover { background:%ACCENT%; }
+QDockWidget { color:#e4e4e7; }
+QDockWidget::title { background:#212121; padding:6px 10px; }
+QSizeGrip { background:transparent; }
+"""
+
+
+def _make_menu_rounded(menu):
+    """Transparent, frameless window so the stylesheet's border-radius
+    actually shows instead of square window corners (only done once per
+    menu, and only while the menu radius setting is above 0)."""
+    if THEME_MENU_RADIUS <= 0 or menu.property("_rounded"):
+        return
+    menu.setProperty("_rounded", True)
+    menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+    menu.setAttribute(Qt.WA_TranslucentBackground, True)
+
+
+class _RoundedMenuFilter(QObject):
+    """Applies _make_menu_rounded to every QMenu (menu-bar menus, context
+    menus, sub-menus, the standard text-edit menu...)."""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Polish and isinstance(obj, QMenu):
+            _make_menu_rounded(obj)
+        return False
+
+
+_ROUNDED_MENU_FILTER = None
+
+
+def apply_dark_theme(app, prefs=None):
+    global _ROUNDED_MENU_FILTER
+    if _ROUNDED_MENU_FILTER is None:
+        _ROUNDED_MENU_FILTER = _RoundedMenuFilter(app)
+        app.installEventFilter(_ROUNDED_MENU_FILTER)
+    global THEME_ACCENT, THEME_BG, THEME_TAB, THEME_MENU_RADIUS, THEME_HOVER
+    if prefs is None:
+        prefs = load_app_preferences()
+    THEME_ACCENT = prefs.get("theme_accent", DEFAULT_PREFS["theme_accent"])
+    THEME_BG = prefs.get("theme_bg", DEFAULT_PREFS["theme_bg"])
+    THEME_TAB = prefs.get("theme_inactive_tab", DEFAULT_PREFS["theme_inactive_tab"])
+    THEME_HOVER = prefs.get("theme_hover", DEFAULT_PREFS["theme_hover"])
+    THEME_MENU_RADIUS = int(prefs.get("menu_radius", DEFAULT_PREFS["menu_radius"]))
     app.setStyle("Fusion")
     palette = QPalette()
-    palette.setColor(QPalette.Window, QColor(30, 30, 30))
-    palette.setColor(QPalette.WindowText, Qt.white)
-    palette.setColor(QPalette.Base, QColor(24, 24, 24))
-    palette.setColor(QPalette.AlternateBase, QColor(45, 45, 45))
-    palette.setColor(QPalette.ToolTipBase, Qt.white)
-    palette.setColor(QPalette.ToolTipText, Qt.white)
-    palette.setColor(QPalette.Text, Qt.white)
-    palette.setColor(QPalette.Button, QColor(45, 45, 45))
-    palette.setColor(QPalette.ButtonText, Qt.white)
-    palette.setColor(QPalette.Highlight, QColor(76, 139, 245))
-    palette.setColor(QPalette.HighlightedText, Qt.black)
+    palette.setColor(QPalette.Window, QColor(THEME_BG))
+    palette.setColor(QPalette.WindowText, QColor("#e6e6e9"))
+    palette.setColor(QPalette.Base, QColor(_gray(0x2b)))
+    palette.setColor(QPalette.AlternateBase, QColor(_gray(0x24)))
+    palette.setColor(QPalette.ToolTipBase, QColor(_gray(0x2a)))
+    palette.setColor(QPalette.ToolTipText, QColor("#eeeeee"))
+    palette.setColor(QPalette.Text, QColor("#e6e6e9"))
+    palette.setColor(QPalette.PlaceholderText, QColor("#77777d"))
+    palette.setColor(QPalette.Button, QColor(_gray(0x2b)))
+    palette.setColor(QPalette.ButtonText, QColor("#e6e6e9"))
+    palette.setColor(QPalette.Link, QColor(_mix_hex(THEME_ACCENT, "#ffffff", 0.38)))
+    palette.setColor(QPalette.Highlight, QColor(THEME_ACCENT))
+    palette.setColor(QPalette.HighlightedText, Qt.white)
     app.setPalette(palette)
+    icons = _theme_icon_dir().replace("\\", "/")
+    qss = (_theme_text(_THEME_QSS)
+           .replace("%CHECK%", f"{icons}/check.png")
+           .replace("%DOWN%", f"{icons}/down.png").replace("%UP%", f"{icons}/up.png"))
+    app.setStyleSheet(qss)
 
 
 def main():
@@ -12789,6 +14487,10 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("OpenNote")
+    try:
+        app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
+    except Exception:
+        pass
     apply_dark_theme(app)
     win = MainWindow()
 
