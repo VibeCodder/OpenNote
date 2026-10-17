@@ -19,7 +19,7 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 
 
 ## Notes are saved to `html` files and can be viewed in browser as single files.
-### The app also features `Link Boards` that enable user to switch between various sub-boards.
+#### The app also features `Link Boards` that enable user to switch between various sub-boards.
 
 <img width="1920" height="1020" alt="new presentation-3" src="https://github.com/user-attachments/assets/bc0e6af0-7f68-4344-99fc-b1765dcd7dbd" />
 <br><br>
@@ -30,10 +30,10 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 - stored on local folder next to HTML files
 
 The app also allows to unpack embedded data and export them to 
-📁 Assets/
-├── 📁 Images/
-├── 📁 Videos/
-├── 📁 GIFs/
+📁 Assets/  
+├── 📁 Images/  
+├── 📁 Videos/  
+├── 📁 GIFs/  
 
 <img width="777" height="872" alt="Multimedia Storage" src="https://github.com/user-attachments/assets/b2cf7ca4-1507-4739-af26-f8e96c810f6b" />
 
