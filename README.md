@@ -11,9 +11,10 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 
 ## Features infinite canvas allowing user to make notes by placing various different objects like images, videos, gifs, arrows, tables adding text or drawing on canvas.
 
-<img width="1920" height="1020" alt="new presentation-1" src="https://github.com/user-attachments/assets/f099c597-fad8-4d4f-8009-d43841e424ed" />
+<img width="1920" height="1020" alt="new presentation-1" src="https://github.com/user-attachments/assets/476c3f46-9648-4c17-b875-e5953bb81a8b" />
+
 <br><br>
-<img width="1920" height="1020" alt="new presentation-2" src="https://github.com/user-attachments/assets/97e9f609-bea5-40c0-bffb-b8d0ec45cee5" />
+<img width="1920" height="1020" alt="new presentation-2" src="https://github.com/user-attachments/assets/b4d71093-0399-49dd-a90d-acc025ef039a" />
 
 
 
