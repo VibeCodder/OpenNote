@@ -1521,6 +1521,42 @@ def _find_subdir(parent, name):
     return None
 
 
+APP_ICON_FOLDER = "icons"
+APP_ICON_FILE = "logo.ico"
+
+
+def find_app_icon_path():
+    """Path of icons/logo.ico next to this script (also looked up next to the
+    frozen executable / in the PyInstaller bundle), or None if it is missing.
+    Folder and file names are matched case-insensitively."""
+    bases = [os.path.dirname(os.path.abspath(__file__))]
+    if getattr(sys, "frozen", False):
+        bases.append(os.path.dirname(os.path.abspath(sys.executable)))
+        if getattr(sys, "_MEIPASS", None):
+            bases.append(sys._MEIPASS)
+    for base in bases:
+        folder = _find_subdir(base, APP_ICON_FOLDER)
+        if not folder:
+            continue
+        try:
+            for entry in os.listdir(folder):
+                full = os.path.join(folder, entry)
+                if entry.lower() == APP_ICON_FILE and os.path.isfile(full):
+                    return full
+        except OSError:
+            pass
+    return None
+
+
+def load_app_icon():
+    """QIcon built from icons/logo.ico, or None when it is missing/unreadable."""
+    path = find_app_icon_path()
+    if not path:
+        return None
+    icon = QIcon(path)
+    return None if icon.isNull() else icon
+
+
 def _find_main_window():
     for w in QApplication.topLevelWidgets():
         if isinstance(w, MainWindow):
@@ -14485,14 +14521,30 @@ def main():
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
 
+    # Windows groups taskbar buttons by process: without an explicit AppUserModelID
+    # the taskbar shows python.exe's icon instead of ours.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OpenNote.MindMap")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("OpenNote")
+    # One call gives every window / dialog / message box without an icon of its own
+    # the app logo (title bars, taskbar, Alt+Tab).
+    app_icon = load_app_icon()
+    if app_icon is not None:
+        app.setWindowIcon(app_icon)
     try:
         app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
     except Exception:
         pass
     apply_dark_theme(app)
     win = MainWindow()
+    if app_icon is not None:
+        win.setWindowIcon(app_icon)
 
     # Explicitly place the window on the primary screen instead of relying
     # on the OS default placement, which is what produced the odd
