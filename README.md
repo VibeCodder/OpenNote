@@ -38,7 +38,8 @@ The app also allows to unpack embedded data and export them to Assets 📁:
 ├── 📁 Videos/  
 ├── 📁 GIFs/  
 
-<img width="777" height="872" alt="Multimedia Storage" src="https://github.com/user-attachments/assets/b2cf7ca4-1507-4739-af26-f8e96c810f6b" />
+<img width="777" height="872" alt="image" src="https://github.com/user-attachments/assets/899f1248-9369-4e0a-a522-8b80f1f8601f" />
+
 
 
 
