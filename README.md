@@ -25,7 +25,8 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 
 <img width="1920" height="1020" alt="new presentation-3" src="https://github.com/user-attachments/assets/bc0e6af0-7f68-4344-99fc-b1765dcd7dbd" />
 <br><br>
-<img width="1920" height="1020" alt="new presentation-4" src="https://github.com/user-attachments/assets/7c05956c-6751-4c76-9c5b-9262d705b68e" />
+<img width="1920" height="1020" alt="pythonw_fH8QDwJvzp" src="https://github.com/user-attachments/assets/1b370e5b-7db2-4cbf-8682-4eec9be118bb" />
+
 
 ## The app allows user to choose how multimedia data should be storage:
 - embedded to the HTML file
