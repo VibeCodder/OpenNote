@@ -867,41 +867,63 @@ def _make_toolbar_icon(kind, size=20, color="#e8e8e8"):
     return QIcon(pm)
 
 
-def _make_pause_svg_icon(size=16, color="#eee"):
-    """Self-generated SVG pause icon (two vertical bars), used for the
-    video player's play/pause button while playback is running (see
-    VideoPlayerNode._on_playback_state_changed). Rendered through
-    QSvgRenderer the same way thumb_to_pixmap renders .svg thumbnails,
-    with the same fallback to QPixmap's own SVG-capable loader so this
-    still works even without the QtSvg Python module available."""
+def _svg_to_icon(body, size=16):
+    """QIcon from SVG shapes drawn on a 24x24 canvas. Rendered through
+    QSvgRenderer at 2x density (crisp on scaled displays), with the same
+    fallback to QPixmap's own SVG-capable loader so this still works even
+    without the QtSvg Python module available. Used instead of font glyphs
+    (\u25B6, speaker emoji, ...) which did not render inside the video
+    controls on systems whose UI font lacks them."""
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
-        f'viewBox="0 0 24 24">'
-        f'<rect x="5" y="3" width="5" height="18" rx="1.2" fill="{color}"/>'
-        f'<rect x="14" y="3" width="5" height="18" rx="1.2" fill="{color}"/>'
-        f'</svg>'
+        f'viewBox="0 0 24 24">{body}</svg>'
     )
     raw = svg.encode("utf-8")
+    px = size * 2
     pm = None
     try:
         from PySide6.QtSvg import QSvgRenderer
         renderer = QSvgRenderer(QByteArray(raw))
         if renderer.isValid():
-            pm = QPixmap(size, size)
+            pm = QPixmap(px, px)
             pm.fill(Qt.transparent)
             painter = QPainter(pm)
-            renderer.render(painter, QRectF(0, 0, size, size))
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            renderer.render(painter, QRectF(0, 0, px, px))
             painter.end()
+            pm.setDevicePixelRatio(2.0)
     except Exception:
         pm = None
     if pm is None or pm.isNull():
-        # Fallback: Qt's own image-format plugin can rasterize SVG too,
-        # when it's installed alongside QtSvg.
         pm = QPixmap()
         if not (pm.loadFromData(raw) and not pm.isNull()):
             pm = QPixmap(size, size)
             pm.fill(Qt.transparent)
     return QIcon(pm)
+
+
+def _make_pause_svg_icon(size=16, color="#eee"):
+    """Pause icon (two vertical bars) for the video player's play/pause button."""
+    return _svg_to_icon(
+        f'<rect x="5" y="3" width="5" height="18" rx="1.2" fill="{color}"/>'
+        f'<rect x="14" y="3" width="5" height="18" rx="1.2" fill="{color}"/>', size)
+
+
+def _make_play_svg_icon(size=16, color="#eee"):
+    return _svg_to_icon(
+        f'<path d="M7 4.5 L19.5 12 L7 19.5 Z" fill="{color}" stroke="{color}" '
+        f'stroke-width="2" stroke-linejoin="round"/>', size)
+
+
+def _make_volume_svg_icon(size=16, color="#eee", muted=False):
+    speaker = f'<path d="M3 9h4l5-4v14l-5-4H3z" fill="{color}" stroke="{color}" stroke-width="1.2" stroke-linejoin="round"/>'
+    if muted:
+        extra = (f'<path d="M16 9.5l6 6M22 9.5l-6 6" fill="none" stroke="{color}" '
+                 f'stroke-width="2" stroke-linecap="round"/>')
+    else:
+        extra = (f'<path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" fill="none" '
+                 f'stroke="{color}" stroke-width="2" stroke-linecap="round"/>')
+    return _svg_to_icon(speaker + extra, size)
 
 
 # --------------------------------------------------------------------------
@@ -3567,7 +3589,9 @@ class VideoPlayerNode(QGraphicsObject):
         c_layout.setContentsMargins(4, 0, 4, 0)
         c_layout.setSpacing(4)
 
-        self.play_btn = QPushButton("\u25B6")
+        self.play_btn = QPushButton()
+        self.play_btn.setIcon(_make_play_svg_icon())
+        self.play_btn.setIconSize(QSize(14, 14))
         self.play_btn.setFixedWidth(26)
         self.play_btn.clicked.connect(self.toggle_play)
         c_layout.addWidget(self.play_btn)
@@ -3584,7 +3608,9 @@ class VideoPlayerNode(QGraphicsObject):
         self.time_label.setFixedWidth(80)
         c_layout.addWidget(self.time_label)
 
-        self.mute_btn = QPushButton("\U0001F50A")
+        self.mute_btn = QPushButton()
+        self.mute_btn.setIcon(_make_volume_svg_icon())
+        self.mute_btn.setIconSize(QSize(16, 16))
         self.mute_btn.setFixedWidth(26)
         self.mute_btn.clicked.connect(self.toggle_mute)
         c_layout.addWidget(self.mute_btn)
@@ -3592,8 +3618,8 @@ class VideoPlayerNode(QGraphicsObject):
         controls.setStyleSheet(
             "QSlider::groove:horizontal { height:4px; background:#444; border-radius:2px; }"
             "QSlider::handle:horizontal { width:10px; margin:-4px 0; background:" + THEME_ACCENT + "; border-radius:5px; }"
-            "QPushButton { background:#333; color:#eee; border:none; border-radius:3px; }"
-            "QPushButton:hover { background:#454545; }"
+            "QPushButton { background:transparent; color:#eee; border:none; border-radius:3px; }"
+            "QPushButton:hover { background:rgba(255,255,255,0.08); }"
         )
         if not HAS_MULTIMEDIA:
             self.play_btn.setEnabled(False)
@@ -3695,16 +3721,15 @@ class VideoPlayerNode(QGraphicsObject):
             return
         muted = not self.audio.isMuted()
         self.audio.setMuted(muted)
-        self.mute_btn.setText("\U0001F507" if muted else "\U0001F50A")
+        self.mute_btn.setIcon(_make_volume_svg_icon(muted=muted))
 
     def _on_playback_state_changed(self, state):
         if state == QMediaPlayer.PlayingState:
-            self.play_btn.setText("")
             self.play_btn.setIcon(_make_pause_svg_icon())
             self.play_btn.setIconSize(QSize(12, 12))
         else:
-            self.play_btn.setIcon(QIcon())
-            self.play_btn.setText("\u25B6")
+            self.play_btn.setIcon(_make_play_svg_icon())
+            self.play_btn.setIconSize(QSize(14, 14))
 
     @staticmethod
     def _fmt_ms(ms):
