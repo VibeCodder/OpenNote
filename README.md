@@ -21,7 +21,7 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 
 
 
-## Notes are saved to `html` files and can be viewed in browser as single files.
+## Notes are saved to `html` files and can be viewed in browser.
 #### The app also features `Link Boards` that enable user to switch between various sub-boards.
 
 <img width="1920" height="1020" alt="new presentation-3" src="https://github.com/user-attachments/assets/bc0e6af0-7f68-4344-99fc-b1765dcd7dbd" />
