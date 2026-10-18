@@ -253,14 +253,41 @@ def media_src_to_url(src):
 
 
 def resolve_media_path(src, base_dir):
-    return os.path.normpath(os.path.join(base_dir, *src.replace("\\", "/").split("/")))
+    """Absolute path of a media `src` (relative to `base_dir`). Raises
+    OSError if the path would leave `base_dir` (\"../..\", absolute paths,
+    other drives) - a board file must never be able to make the app read
+    arbitrary files from elsewhere on the disk."""
+    base = os.path.abspath(base_dir)
+    full = os.path.normpath(os.path.join(base, *src.replace("\\", "/").split("/")))
+    try:
+        inside = (os.path.commonpath([os.path.normcase(base), os.path.normcase(full)])
+                  == os.path.normcase(base)) and os.path.normcase(full) != os.path.normcase(base)
+    except ValueError:  # e.g. different drive on Windows
+        inside = False
+    if not inside:
+        raise OSError(f"media path points outside the project folder: {src}")
+    return full
+
+
+def media_file_exists(src, base_dir):
+    try:
+        return os.path.isfile(resolve_media_path(src, base_dir))
+    except OSError:
+        return False
 
 
 def _write_bytes_atomic(path, raw):
     tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(raw)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        os.replace(tmp, path)
+    except BaseException:
+        try:  # never leave a stray .tmp file behind
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _write_text_atomic(path, text):
@@ -1439,7 +1466,7 @@ DEFAULT_PREFS = {
     "theme_hover": "#2a2a2e",         # hover highlight of toolbar buttons and menu-bar items
     "menu_radius": 10,                # corner radius (px) of context / drop-down menus, 0 = square
     # -- where file dialogs open (see dialog_start_dir) --
-    "dialogs_default_folder_mode": "project",  # "project" | "custom"
+    "dialogs_default_folder_mode": "program",  # "program" | "project" | "custom"
     "dialogs_custom_folder": "",               # used when the mode above is "custom"
     "dialogs_media_subfolders": True,          # media pickers -> Assets/Images, Assets/Videos, Assets/GIFs
 }
@@ -1494,7 +1521,16 @@ def load_app_preferences():
     except (TypeError, ValueError):
         prefs["menu_radius"] = DEFAULT_PREFS["menu_radius"]
     mode = str(s.value("dialogs_default_folder_mode", DEFAULT_PREFS["dialogs_default_folder_mode"]) or "")
-    prefs["dialogs_default_folder_mode"] = mode if mode in ("project", "custom") else "project"
+    if not _qsettings_bool(s, "dialogs_mode_migrated_v2", False):
+        # "project" used to be the factory default; Open board now starts in
+        # the program folder by default. One-time switch (a custom folder
+        # chosen by the user is left alone).
+        if mode == "project":
+            mode = "program"
+        s.setValue("dialogs_default_folder_mode", mode)
+        s.setValue("dialogs_mode_migrated_v2", True)
+    prefs["dialogs_default_folder_mode"] = (
+        mode if mode in ("program", "project", "custom") else DEFAULT_PREFS["dialogs_default_folder_mode"])
     prefs["dialogs_custom_folder"] = str(s.value("dialogs_custom_folder", "") or "")
     prefs["dialogs_media_subfolders"] = _qsettings_bool(
         s, "dialogs_media_subfolders", DEFAULT_PREFS["dialogs_media_subfolders"])
@@ -1586,8 +1622,21 @@ def _find_main_window():
     return None
 
 
+def program_dir():
+    """Folder the program lives in: next to Opennote.py, or next to the
+    frozen executable when packaged (PyInstaller etc.)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def dialog_start_dir(kind=None, main_window=None):
     """Folder a file dialog should open in.
+
+    kind == "board" is the Open-board window: in "program" mode (the
+    default) it starts in the folder of the program itself; every other
+    dialog (save, media pickers, folder pickers) still follows the project
+    folder in that mode.
 
     Base folder: the project folder (where the board .html files live), or -
     when Preferences > General > File dialogs says so - a custom folder.
@@ -1599,10 +1648,17 @@ def dialog_start_dir(kind=None, main_window=None):
     mw = main_window or _find_main_window()
     prefs = mw.prefs if mw is not None else load_app_preferences()
     base = None
-    if prefs.get("dialogs_default_folder_mode") == "custom":
+    mode = prefs.get("dialogs_default_folder_mode")
+    if mode == "custom":
         custom = prefs.get("dialogs_custom_folder") or ""
         if custom and os.path.isdir(custom):
             base = custom
+    if base is None and mode == "program" and kind == "board":
+        pd = program_dir()
+        if os.path.isdir(pd):
+            return pd
+    if kind == "board":
+        kind = None  # not a media picker: never redirect into Assets
     if base is None and mw is not None:
         proj = getattr(mw, "project_dir", None) or (
             os.path.dirname(mw.current_file) if getattr(mw, "current_file", None) else None)
@@ -9135,6 +9191,23 @@ class MindMapScene(QGraphicsScene):
                 progress_callback(i, total)
         return total
 
+    def missing_media_sources(self):
+        """Local mode: paths of media / thumbnails that have a path but whose
+        bytes are not in memory (the file could not be read when the board
+        was loaded). Packing such a board into the HTML would lose them."""
+        out = []
+        for it in self.all_component_items():
+            if isinstance(it, (ImageItem, GifItem, VideoItem)):
+                if it.media_src and not it._media_raw_bytes():
+                    out.append(it.media_src)
+            elif isinstance(it, BoardCardItem):
+                out += [s["src"] for s in it.subitems
+                        if s.get("kind") in MEDIA_KINDS and s.get("src") and not s.get("data")]
+            elif isinstance(it, BoardLinkItem):
+                if it.thumb_src and not it.thumb_data:
+                    out.append(it.thumb_src)
+        return out
+
     def clear_media_sources(self, media=True, thumbs=True):
         """Forget every media path (bytes stay in memory) - used when the
         board is packed back into the HTML or saved into another folder."""
@@ -9494,6 +9567,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <style>
   html,body {{ margin:0; padding:0; background:#141414; overflow:hidden; font-family:'Segoe UI',Arial,sans-serif; height:100%; }}
   #viewport {{ width:100%; height:100vh; overflow:hidden; position:relative; cursor:grab; }}
+  body.panning, body.panning * {{ user-select:none; -webkit-user-select:none; cursor:grabbing; }}
+  body.ctrl-held:not(.panning) #viewport {{ cursor:auto; }}
+  #canvas img, #canvas a {{ -webkit-user-drag:none; }}
   body.has-breadcrumb #viewport {{ height:calc(100vh - 37px); margin-top:37px; }}
   #canvas {{ position:absolute; top:0; left:0; transform-origin:0 0; }}
   .comp {{ position:absolute; box-sizing:border-box; }}
@@ -9546,7 +9622,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     {components}
   </div>
 </div>
-<div id="hint">Read-only view &mdash; scroll to zoom, drag to pan. Open with the OpenNote app to edit.</div>
+<div id="hint">Read-only view &mdash; scroll to zoom, drag to pan, hold Ctrl to click normally. Open with the OpenNote app to edit.</div>
 <script type="application/json" id="mindmap-meta">{meta_json}</script>
 <script type="application/json" id="mindmap-data">{json_data}</script>
 <script>
@@ -9626,18 +9702,64 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     apply();
   }}, {{ passive:false }});
 
+  // Panning. It used to start on mousedown and stop ONLY on mouseup - but
+  // if the press lands on an image, a link card or selected text, the
+  // browser starts a native drag-and-drop instead, and no mouseup is ever
+  // delivered: panning then stayed "stuck on" after releasing the button.
+  // So: (1) native drags are cancelled up front, (2) every way a drag can
+  // end stops the pan, and (3) a mousemove with no button held is a
+  // guaranteed last-resort stop, whatever went wrong before it.
+  function stopPanning() {{
+    isPanning = false;
+    document.body.classList.remove('panning');
+  }}
+  // Holding Ctrl turns panning off: presses go straight to whatever is
+  // under the cursor (links, video controls, text selection ...) exactly
+  // like on a normal web page. The body class only drives the cursor.
+  // (Not Shift: Shift+click extends the current text selection. Not Alt:
+  // browsers download the target of an Alt+click on a link.)
+  function syncCtrl(e) {{
+    document.body.classList.toggle('ctrl-held', !!e.ctrlKey);
+  }}
+  window.addEventListener('keydown', syncCtrl);
+  window.addEventListener('keyup', syncCtrl);
+  window.addEventListener('blur', function() {{ document.body.classList.remove('ctrl-held'); }});
+  // A Ctrl+click on a link would open it in a new BACKGROUND tab, so the
+  // click would seem to do nothing. Make it behave like a plain click, so
+  // board links and hyperlinks open as usual.
+  viewport.addEventListener('click', function(e) {{
+    if (!e.ctrlKey || !e.target || !e.target.closest) return;
+    var a = e.target.closest('a[href]');
+    if (!a) return;
+    e.preventDefault();
+    if (a.target && a.target !== '_self') window.open(a.href, a.target, 'noopener,noreferrer');
+    else window.location.href = a.href;
+  }}, true);
   viewport.addEventListener('mousedown', function(e) {{
+    if (e.ctrlKey) return;                          // Ctrl held: normal clicking, no panning
+    if (e.button !== 0 && e.button !== 1) return;  // left / middle only (a right-click opens a menu and would never release)
+    if (e.button === 1) e.preventDefault();         // no browser auto-scroll on middle click
     isPanning = true; startX = e.clientX - originX; startY = e.clientY - originY;
-    viewport.style.cursor = 'grabbing';
+    document.body.classList.add('panning');          // grabbing cursor, no text selection while dragging
   }});
   window.addEventListener('mousemove', function(e) {{
+    syncCtrl(e);
     if (!isPanning) return;
+    if (!(e.buttons & 5)) {{ stopPanning(); return; }}  // 1 = left, 4 = middle: nothing held any more
     originX = e.clientX - startX; originY = e.clientY - startY;
     apply();
   }});
-  window.addEventListener('mouseup', function() {{
-    isPanning = false; viewport.style.cursor = 'grab';
+  window.addEventListener('mouseup', function(e) {{
+    if (e.buttons & 5) return;  // another button is still held
+    stopPanning();
   }});
+  viewport.addEventListener('dragstart', function(e) {{
+    if (isPanning || !e.ctrlKey) e.preventDefault();  // only a Ctrl-press keeps the browser's own drag
+  }});
+  window.addEventListener('dragend', stopPanning);
+  window.addEventListener('drop', stopPanning);
+  window.addEventListener('blur', stopPanning);
+  viewport.addEventListener('contextmenu', stopPanning);
   window.addEventListener('resize', fitInitialView);
 
   fitInitialView();
@@ -10248,11 +10370,16 @@ class PreferencesDialog(QDialog):
         dialogs_hint.setWordWrap(True)
         dialogs_hint.setStyleSheet("color:#888; font-size:11px;")
         page_general.addWidget(dialogs_hint)
+        self.dlg_program_rb = QRadioButton(
+            "Program folder for Open board (other windows: project folder)  \u2014 default")
+        self.dlg_program_rb.setToolTip(f"Open board starts in: {program_dir()}")
         self.dlg_project_rb = QRadioButton("Project folder (where the board .html files are)")
         self.dlg_custom_rb = QRadioButton("This folder:")
         dlg_group = QButtonGroup(self)
+        dlg_group.addButton(self.dlg_program_rb)
         dlg_group.addButton(self.dlg_project_rb)
         dlg_group.addButton(self.dlg_custom_rb)
+        page_general.addWidget(self.dlg_program_rb)
         page_general.addWidget(self.dlg_project_rb)
         custom_row = QHBoxLayout()
         custom_row.addWidget(self.dlg_custom_rb)
@@ -10264,8 +10391,9 @@ class PreferencesDialog(QDialog):
         self.dlg_browse_btn.clicked.connect(self._browse_dialog_folder)
         custom_row.addWidget(self.dlg_browse_btn)
         page_general.addLayout(custom_row)
-        custom_mode = main_window.prefs.get("dialogs_default_folder_mode") == "custom"
-        (self.dlg_custom_rb if custom_mode else self.dlg_project_rb).setChecked(True)
+        folder_mode = main_window.prefs.get("dialogs_default_folder_mode")
+        {"custom": self.dlg_custom_rb, "project": self.dlg_project_rb}.get(
+            folder_mode, self.dlg_program_rb).setChecked(True)
         self.dlg_custom_rb.toggled.connect(self._sync_dialog_folder_widgets)
         media_dlg_label = QLabel("Add Image / GIF / Video windows")
         media_dlg_label.setStyleSheet("font-weight:600; margin-top:8px;")
@@ -10419,9 +10547,10 @@ class PreferencesDialog(QDialog):
 
         self._committed_proj_mode = mw.project_media_mode
         self._committed_proj_thumbs = bool(mw.project_media_thumbs)
+        self._proj_user_committed = False
         if mw.current_file:
             proj_hint = (f"Detected from the open project \u201c{os.path.basename(os.path.dirname(mw.current_file))}\u201d. "
-                         "Changing it converts ALL boards of this project.")
+                         "Changing it converts ALL boards of this project right away (after you confirm).")
         else:
             proj_hint = "This board isn't saved yet \u2014 the choice applies when it is first saved."
         (self.proj_embedded_rb, self.proj_local_rb, self.proj_thumbs_cb) = self._add_media_section(
@@ -10536,30 +10665,122 @@ class PreferencesDialog(QDialog):
         layout.addWidget(cb)
         if warn:
             group.buttonClicked.connect(self._on_media_mode_clicked)
+            cb.clicked.connect(self._on_media_thumbs_clicked)
         return emb, loc, cb
 
+    def _project_board_count(self):
+        mw = self.main_window
+        proj = mw.project_dir or (os.path.dirname(mw.current_file) if mw.current_file else None)
+        if not proj or not os.path.isdir(proj):
+            return 0
+        try:
+            return sum(1 for n in os.listdir(proj) if n.lower().endswith(".html"))
+        except OSError:
+            return 0
+
+    def _confirm_project_media_change(self, new_mode, new_thumbs):
+        """Explain what the chosen storage option will do and ask for a go.
+        Shown for EVERY change of the project's storage (either direction);
+        nothing happens until Proceed is clicked."""
+        mw = self.main_window
+        n = self._project_board_count()
+        boards = f"ALL {n} HTML board(s)" if n else "ALL HTML boards"
+        to_local = new_mode == MEDIA_MODE_LOCAL
+        thumbs_only = new_mode == self._committed_proj_mode  # local -> local, thumbnail option changed
+        saved = bool(n) or bool(mw.current_file)
+        if not saved:
+            title = "Multimedia as separate files (local path)" if to_local else "Multimedia embedded into HTML"
+            body = ("This board isn't saved yet, so nothing is converted now.\n\n"
+                    "The chosen storage mode will be used when the board is first saved.")
+        elif thumbs_only and new_thumbs:
+            title = "Also extract Board Link thumbnails"
+            body = ("\u2022 The thumbnails / icons of Board Link components will be extracted from "
+                    f"{boards} of this project into \u201c{ASSETS_DIR_NAME}/Thumbnails\u201d.\n"
+                    "\u2022 The HTML files will reference them by relative path (keep the Assets "
+                    "folder next to the HTML files).\n"
+                    "\u2022 The board that is currently open is saved as part of this, including "
+                    "unsaved changes.\n"
+                    "\u2022 A temporary backup of the HTML files is made first and deleted "
+                    "automatically when everything succeeds.")
+        elif thumbs_only:
+            title = "Keep Board Link thumbnails inside the HTML"
+            body = ("\u2022 The thumbnails / icons of Board Link components will be read back from "
+                    f"{ASSETS_DIR_NAME}/Thumbnails and embedded into {boards} of this project.\n"
+                    "\u2022 Images, GIFs and videos stay as separate files.\n"
+                    "\u2022 The board that is currently open is saved as part of this, including "
+                    "unsaved changes.\n"
+                    "\u2022 A temporary backup of the HTML files is made first and deleted "
+                    "automatically when everything succeeds.")
+        elif to_local:
+            title = "Switch to: multimedia as separate files (local path)"
+            body = ("\u2022 ALL multimedia (images, videos and GIFs) will be extracted from "
+                    f"{boards} of this project and saved as separate files in an "
+                    f"\u201c{ASSETS_DIR_NAME}\u201d folder next to them "
+                    "(Assets/Images, Assets/Videos, Assets/GIFs"
+                    + (", Assets/Thumbnails for Board Link thumbnails" if new_thumbs else "") + ").\n"
+                    "\u2022 The HTML files will reference those files by relative path, so the Assets "
+                    "folder must always stay next to the HTML files (also when moving or sharing them).\n"
+                    "\u2022 The board that is currently open is saved as part of this, including "
+                    "unsaved changes.\n"
+                    "\u2022 A temporary backup of the HTML files is made first and deleted "
+                    "automatically when everything succeeds.")
+        else:
+            title = "Switch to: multimedia embedded into HTML"
+            body = ("\u2022 ALL multimedia will be read from the files it points to and packed into "
+                    f"{boards} of this project, so every HTML becomes one self-contained file "
+                    "that can be moved or shared on its own.\n"
+                    "\u2022 The HTML files get larger (media grows by about a third) and boards with "
+                    "big videos can open more slowly.\n"
+                    "\u2022 If a referenced file is missing you are asked before anything is changed.\n"
+                    "\u2022 The board that is currently open is saved as part of this, including "
+                    "unsaved changes.\n"
+                    "\u2022 A temporary backup of the HTML files is made first and deleted "
+                    "automatically when everything succeeds.\n"
+                    f"\u2022 Afterwards you are asked whether to delete the now unused "
+                    f"\u201c{ASSETS_DIR_NAME}\u201d folder.")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Change data storage")
+        box.setText(title)
+        box.setInformativeText(body + ("\n\nThis starts as soon as you click Proceed." if saved else ""))
+        go = box.addButton("Proceed", QMessageBox.AcceptRole)
+        cancel = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel)
+        box.exec()
+        return box.clickedButton() is go
+
+    def _apply_project_media_change(self, new_mode, new_thumbs):
+        """Confirm, then convert the project right away. True = done."""
+        if not self._confirm_project_media_change(new_mode, new_thumbs):
+            return False
+        if self.main_window.convert_project_media(new_mode, new_thumbs, ui_parent=self) is False:
+            return False
+        self._committed_proj_mode = new_mode
+        self._committed_proj_thumbs = bool(new_thumbs)
+        self._proj_user_committed = True
+        return True
+
     def _on_media_mode_clicked(self, button):
-        """Project section: warn as soon as \u201clocal path\u201d is picked (the
-        conversion itself only runs on OK); declining puts the radio back."""
-        if button is not self.proj_local_rb or self._committed_proj_mode == MEDIA_MODE_LOCAL:
+        """Project section: picking the other storage mode asks for
+        confirmation (Proceed / Cancel) and then converts immediately - no
+        need to press OK of this window. Cancel puts the radio back."""
+        new_mode = MEDIA_MODE_LOCAL if button is self.proj_local_rb else MEDIA_MODE_EMBEDDED
+        if new_mode == self._committed_proj_mode:
             return
-        resp = QMessageBox.warning(
-            self, "Switch to local path mode",
-            "If you choose this option, ALL multimedia (images, videos and GIFs) will be "
-            "extracted from ALL HTML documents of this project and saved as separate files "
-            "in an \u201cAssets\u201d folder next to them:\n\n"
-            "    Assets/Images\n    Assets/Videos\n    Assets/GIFs\n\n"
-            + ("Board Link thumbnails are extracted too (they go to Assets/Thumbnails).\n\n"
-               if self.proj_thumbs_cb.isChecked() else "")
-            + 
-            "The HTML files will then reference those files by relative path, so the Assets "
-            "folder must always stay next to the HTML files (also when moving or sharing "
-            "them). The board that is currently open will be saved as part of this.\n\n"
-            "Do you want to continue?",
-            QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel,
-        )
-        if resp != QMessageBox.Ok:
-            self.proj_embedded_rb.setChecked(True)
+        if self._apply_project_media_change(new_mode, self.proj_thumbs_cb.isChecked()):
+            return
+        (self.proj_local_rb if self._committed_proj_mode == MEDIA_MODE_LOCAL
+         else self.proj_embedded_rb).setChecked(True)
+
+    def _on_media_thumbs_clicked(self, checked):
+        """Thumbnail checkbox of the project section. In local mode it
+        changes what is stored where, so it gets the same Proceed / Cancel
+        step; in embedded mode it only sets the option for a later switch."""
+        if self._committed_proj_mode != MEDIA_MODE_LOCAL or bool(checked) == self._committed_proj_thumbs:
+            return
+        if self._apply_project_media_change(MEDIA_MODE_LOCAL, bool(checked)):
+            return
+        self.proj_thumbs_cb.setChecked(self._committed_proj_thumbs)
 
     def _refresh_theme_swatch(self, key):
         col = self._theme_colors[key]
@@ -10600,7 +10821,13 @@ class PreferencesDialog(QDialog):
         self.main_window.prefs["menu_radius"] = self.menu_radius_spin.value()
         custom_folder = self.dlg_custom_edit.text().strip()
         use_custom = self.dlg_custom_rb.isChecked() and bool(custom_folder)
-        self.main_window.prefs["dialogs_default_folder_mode"] = "custom" if use_custom else "project"
+        if use_custom:
+            folder_mode = "custom"
+        elif self.dlg_project_rb.isChecked():
+            folder_mode = "project"
+        else:
+            folder_mode = "program"
+        self.main_window.prefs["dialogs_default_folder_mode"] = folder_mode
         self.main_window.prefs["dialogs_custom_folder"] = custom_folder
         self.main_window.prefs["dialogs_media_subfolders"] = self.dlg_media_assets_rb.isChecked()
         self.main_window.prefs["optimize_grid_rendering"] = self.optimize_grid_checkbox.isChecked()
@@ -10619,7 +10846,7 @@ class PreferencesDialog(QDialog):
         new_mode = MEDIA_MODE_LOCAL if self.proj_local_rb.isChecked() else MEDIA_MODE_EMBEDDED
         new_thumbs = self.proj_thumbs_cb.isChecked()
         proj_untouched = (new_mode == self._committed_proj_mode and new_thumbs == self._committed_proj_thumbs)
-        if proj_untouched and not mw.current_file:
+        if proj_untouched and not mw.current_file and not self._proj_user_committed:
             # A brand-new, unsaved board simply follows the default.
             mw.project_media_mode = mw.prefs["media_mode"]
             mw.project_media_thumbs = bool(mw.prefs["media_include_thumbnails"])
@@ -13811,8 +14038,11 @@ class MainWindow(QMainWindow):
             return None
         start = base
         if current_src:
-            cand = os.path.dirname(resolve_media_path(current_src, base))
-            if os.path.isdir(cand):
+            try:
+                cand = os.path.dirname(resolve_media_path(current_src, base))
+            except OSError:
+                cand = None
+            if cand and os.path.isdir(cand):
                 start = cand
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose media file (next to the HTML)", start, MEDIA_FILE_FILTERS.get(kind, "All files (*)"))
@@ -13854,30 +14084,123 @@ class MainWindow(QMainWindow):
         finally:
             self._set_loading_progress_label(None, None)
 
-    def convert_project_media(self, new_mode, thumbs=None):
+    BACKUP_DIR_PREFIX = ".opennote_backup_"
+
+    def _make_project_backup(self, proj, boards):
+        """Copy the board .html files into <proj>/.opennote_backup_<time>/
+        before a conversion rewrites them. Returns the folder; raises OSError."""
+        bdir = os.path.join(proj, self.BACKUP_DIR_PREFIX + time.strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(bdir, exist_ok=True)
+        try:
+            for b in boards:
+                if os.path.isfile(b):
+                    shutil.copy2(b, os.path.join(bdir, os.path.basename(b)))
+        except OSError:
+            shutil.rmtree(bdir, ignore_errors=True)
+            raise
+        return bdir
+
+    def _remove_project_backups(self, proj):
+        """Delete every conversion backup folder of the project (called only
+        after a fully successful conversion, so nothing piles up)."""
+        try:
+            names = os.listdir(proj)
+        except OSError:
+            return
+        for n in names:
+            full = os.path.join(proj, n)
+            if n.startswith(self.BACKUP_DIR_PREFIX) and os.path.isdir(full):
+                shutil.rmtree(full, ignore_errors=True)
+
+    def convert_project_media(self, new_mode, thumbs=None, ui_parent=None):
         """Convert every board of the open project to `new_mode` (and, in
-        local mode, with/without Board Link thumbnails), with a progress bar."""
+        local mode, with/without Board Link thumbnails), with a progress bar.
+        `ui_parent`: widget the progress / message windows belong to (the
+        Preferences window when called from there, so they stack above it).
+        Returns False if the user backed out / nothing could be done (the
+        previous mode is restored), True otherwise."""
+        ui = ui_parent or self
         to_local = new_mode == MEDIA_MODE_LOCAL
         if thumbs is None:
             thumbs = self.media_thumbs_enabled()
+        prev_state = (self.project_media_mode, self.project_media_thumbs)
         self.project_media_mode = new_mode
         self.project_media_thumbs = bool(thumbs)
         proj = self.project_dir or (os.path.dirname(self.current_file) if self.current_file else None)
         if not proj or not os.path.isdir(proj):
             self.statusBar().showMessage(
                 "Media mode changed - it will apply when the board is first saved.", 5000)
-            return
+            return True
         proj = os.path.abspath(proj)
-        self._media_state_dir = proj
         cur_norm = os.path.normcase(os.path.abspath(self.current_file)) if self.current_file else None
         boards = sorted(os.path.join(proj, n) for n in os.listdir(proj) if n.lower().endswith(".html"))
         if cur_norm and not any(os.path.normcase(b) == cur_norm for b in boards):
             boards.append(os.path.abspath(self.current_file))
         total = len(boards)
         if not total:
-            return
+            return True
+
+        def _abort(msg=None):
+            self.project_media_mode, self.project_media_thumbs = prev_state
+            if msg:
+                self.statusBar().showMessage(msg, 6000)
+
+        # Pre-flight (packing into HTML only): find media whose file is gone.
+        # Packing would drop their path and leave an empty image behind, so
+        # the user must explicitly accept that - Cancel is the default.
+        preparsed = {}
+        if not to_local:
+            lost = []
+            for path in boards:
+                if cur_norm is not None and os.path.normcase(path) == cur_norm:
+                    lost += [f"{os.path.basename(path)}: {m}" for m in self.scene.missing_media_sources()]
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        html = f.read()
+                except OSError:
+                    continue  # a real read error is reported by the main loop
+                if detect_media_storage(html)[0] != MEDIA_MODE_LOCAL:
+                    continue
+                data = extract_scene_data(html)
+                if data is None:
+                    continue
+                preparsed[path] = data
+                nm = os.path.basename(path)
+                for _k, d in iter_media_dicts(data):
+                    if d.get("src") and not d.get("data") and not media_file_exists(d["src"], proj):
+                        lost.append(f"{nm}: {d['src']}")
+                for d in iter_thumb_dicts(data):
+                    if d.get("thumb_src") and not d.get("thumb_data") and not media_file_exists(d["thumb_src"], proj):
+                        lost.append(f"{nm}: {d['thumb_src']}")
+            if lost:
+                box = QMessageBox(ui)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle("Missing media files")
+                box.setText(
+                    f"{len(lost)} referenced media file(s) cannot be found. If you continue, "
+                    "they will be LOST from the HTML (empty placeholders).")
+                box.setInformativeText(
+                    "\n".join(f"  \u2022 {m}" for m in lost[:10]) + ("\n  \u2026" if len(lost) > 10 else ""))
+                go = box.addButton("Convert anyway", QMessageBox.DestructiveRole)
+                cancel = box.addButton(QMessageBox.Cancel)
+                box.setDefaultButton(cancel)
+                box.exec()
+                if box.clickedButton() is not go:
+                    _abort("Conversion cancelled - nothing was changed.")
+                    return False
+
+        try:
+            backup_dir = self._make_project_backup(proj, boards)
+        except OSError as e:
+            QMessageBox.critical(
+                ui, "Media conversion",
+                f"Could not back up the project's boards, so nothing was changed.\n\n{e}")
+            _abort()
+            return False
+        self._media_state_dir = proj
         dlg = MediaProgressDialog(
-            self, "Extracting multimedia" if to_local else "Packing multimedia into HTML")
+            ui, "Extracting multimedia" if to_local else "Packing multimedia into HTML")
         missing, failed, converted = [], [], 0
         try:
             for i, path in enumerate(boards):
@@ -13902,8 +14225,10 @@ class MainWindow(QMainWindow):
                         self._write_html(self.current_file)
                         converted += 1
                     else:
-                        with open(path, "r", encoding="utf-8") as f:
-                            data = extract_scene_data(f.read())
+                        data = preparsed.pop(path, None)
+                        if data is None:
+                            with open(path, "r", encoding="utf-8") as f:
+                                data = extract_scene_data(f.read())
                         if data is None or not media_needs_conversion(data, to_local, thumbs):
                             continue
                         if to_local:
@@ -13927,18 +14252,26 @@ class MainWindow(QMainWindow):
             dlg.finish()
         self.statusBar().showMessage(
             f"Multimedia {'extracted to Assets' if to_local else 'embedded into HTML'} in {converted} board file(s)", 6000)
+        clean = not failed and not missing
+        if clean:
+            self._remove_project_backups(proj)  # nothing went wrong -> no leftovers
         problems = []
+        if not clean:
+            problems.append(
+                "A backup of the boards from before the conversion was kept in:\n"
+                f"  {backup_dir}\n"
+                "(It is deleted automatically after the next fully successful conversion.)")
         if failed:
             problems.append("These boards could not be converted:\n" + "\n".join(f"  \u2022 {m}" for m in failed[:10]))
         if missing:
             problems.append(f"{len(missing)} referenced media file(s) were not found and could not be packed:\n"
                             + "\n".join(f"  \u2022 {m}" for m in missing[:10]))
         if problems:
-            QMessageBox.warning(self, "Media conversion", "\n\n".join(problems))
-        if not to_local and not failed:
+            QMessageBox.warning(ui, "Media conversion", "\n\n".join(problems))
+        if not to_local and clean:
             assets = os.path.join(proj, ASSETS_DIR_NAME)
             if os.path.isdir(assets) and QMessageBox.question(
-                self, "Remove Assets folder?",
+                ui, "Remove Assets folder?",
                 "All multimedia is embedded in the HTML files again.\n\n"
                 f"Delete the now unused \u201c{ASSETS_DIR_NAME}\u201d folder (Images, Videos, GIFs, Thumbnails)?\n"
                 "(Files you referenced from your own folders are never touched.)",
@@ -13949,6 +14282,7 @@ class MainWindow(QMainWindow):
                     os.rmdir(assets)  # only succeeds if nothing else is in it
                 except OSError:
                     pass
+        return True
 
     def _write_html(self, path):
         base_dir = os.path.dirname(os.path.abspath(path))
@@ -13971,8 +14305,7 @@ class MainWindow(QMainWindow):
         data = strip_media_data(data, local, self.media_thumbs_enabled())
         html = build_html_document(data)
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(html)
+            _write_text_atomic(path, html)
             self.statusBar().showMessage(f"Saved: {path}", 4000)
             self._update_saved_snapshot()
             self._add_recent_file(path)
@@ -14030,7 +14363,7 @@ class MainWindow(QMainWindow):
     def open_board(self):
         if not self._confirm_discard_changes(title="Open board"):
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open board", dialog_start_dir(None, self), "HTML files (*.html)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open board", dialog_start_dir("board", self), "HTML files (*.html)")
         if not path:
             return
         self._load_board_file(path, error_title="Open failed")
