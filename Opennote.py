@@ -10186,6 +10186,7 @@ class PreferencesDialog(QDialog):
         self.tabs = QTabWidget()
         outer.addWidget(self.tabs, 1)
         self._pref_pages = []
+        self._pref_page_colors = []
 
         self.tabs.setIconSize(QSize(16, 16))
 
@@ -10199,6 +10200,7 @@ class PreferencesDialog(QDialog):
             idx = self.tabs.addTab(sc, _make_tab_icon(kind, color), title)
             self.tabs.tabBar().setTabTextColor(idx, QColor(color))
             self._pref_pages.append(page)
+            self._pref_page_colors.append(color)
             return lay
 
         page_general = new_page("General", "#a78bfa", "general")
@@ -10457,6 +10459,12 @@ class PreferencesDialog(QDialog):
         outer.addWidget(buttons)
         for lay in (page_general, page_components, page_storage, page_perf):
             lay.addStretch(1)
+        # Section headings (the bold labels) take the colour of the tab they live in.
+        for page, color in zip(self._pref_pages, self._pref_page_colors):
+            for lbl in page.findChildren(QLabel):
+                ss = lbl.styleSheet()
+                if "font-weight:600" in ss:
+                    lbl.setStyleSheet(ss.rstrip().rstrip(";") + f"; color:{color};")
         avail = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
         want_w = max(pg.sizeHint().width() for pg in self._pref_pages)
         want_h = max(pg.sizeHint().height() for pg in self._pref_pages)
