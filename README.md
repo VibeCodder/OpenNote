@@ -15,7 +15,8 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 
 
 <br><br>
-<img width="1920" height="1020" alt="new presentation-2" src="https://github.com/user-attachments/assets/a676189b-d498-402f-99f9-f985a1edb219" />
+<img width="1920" height="1020" alt="new presentation-2" src="https://github.com/user-attachments/assets/0a2643b7-77d8-4b1b-aab9-376f91066002" />
+
 
 
 
@@ -25,7 +26,8 @@ before filepath; additionally if you want to get rid of cmd window type `pythonw
 
 <img width="1920" height="1020" alt="new presentation-3" src="https://github.com/user-attachments/assets/bc0e6af0-7f68-4344-99fc-b1765dcd7dbd" />
 <br><br>
-<img width="1920" height="1020" alt="pythonw_fH8QDwJvzp" src="https://github.com/user-attachments/assets/1b370e5b-7db2-4cbf-8682-4eec9be118bb" />
+<img width="1920" height="1020" alt="new presentation-4" src="https://github.com/user-attachments/assets/d19b4213-0d8c-442a-8bbd-f4e1c5d28813" />
+
 
 
 ## The app allows user to choose how multimedia data should be storage:
