@@ -42,7 +42,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QPainter, QPainterPath, QPainterPathStroker, QPixmap, QImage, QFont,
-    QFontMetrics,
+    QFontMetrics, QImageReader,
     QMovie, QPalette, QKeySequence, QAction, QGuiApplication,
     QIcon, QActionGroup, QTextCursor, QIntValidator, QTextCharFormat, QTextDocument,
     QAbstractTextDocumentLayout,
@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
     QFontComboBox, QInputDialog, QCompleter, QCheckBox,
     QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QDoubleSpinBox, QGridLayout, QLineEdit,
     QSizePolicy, QTabWidget, QRadioButton, QButtonGroup, QProgressBar, QProgressDialog,
-    QScrollArea, QFrame,
+    QScrollArea, QFrame, QWidgetAction,
 )
 
 try:
@@ -65,7 +65,7 @@ except Exception:
     HAS_OPENGL = False
 
 try:
-    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaMetaData, QVideoSink
     # QGraphicsVideoItem (a real QGraphicsItem the scene paints directly)
     # is used instead of QVideoWidget for the actual video frames: a
     # QVideoWidget embedded through a QGraphicsProxyWidget reliably came
@@ -556,6 +556,264 @@ def base64_to_pixmap(b64):
         except Exception:
             pass
     return pm
+
+
+# --------------------------------------------------------------------------
+# Media "Details" window (context menu of Image / GIF / Video components and
+# of media sub-items inside a Board Card): file name, path, size, resolution.
+# --------------------------------------------------------------------------
+
+def _format_file_size(n):
+    if n is None:
+        return "Unknown"
+    if n < 1024:
+        return f"{n:,} bytes"
+    v = float(n)
+    unit = "KB"
+    for unit in ("KB", "MB", "GB", "TB"):
+        v /= 1024.0
+        if v < 1024.0:
+            break
+    return f"{v:.2f} {unit} ({n:,} bytes)"
+
+
+def _probe_image_size(raw=None, path=None):
+    """Pixel size of an image/GIF read from its header only (no full decode)
+    - from the bytes if given, else from the file at `path`. None if unknown."""
+    try:
+        if raw:
+            ba = QByteArray(raw)
+            buf = QBuffer(ba)
+            buf.open(QIODevice.ReadOnly)
+            sz = QImageReader(buf).size()
+            if sz.isValid():
+                return sz
+            img = QImage()
+            if img.loadFromData(raw) and not img.isNull():
+                return img.size()
+        if path and os.path.isfile(path):
+            sz = QImageReader(path).size()
+            if sz.isValid():
+                return sz
+    except Exception:
+        pass
+    return None
+
+
+def gather_media_details(kind, raw=None, name=None, src=None, origin=None,
+                         base_dir=None, size_hint=None):
+    """Collect everything the Details window shows for one media file.
+    `src` is the path relative to the board's HTML (local-path mode),
+    `origin` the absolute path the content was last loaded from, `raw` the
+    bytes held by the component. The real file on disk wins when it exists."""
+    path = None
+    on_disk = False
+    note = ""
+    if src and base_dir:
+        try:
+            cand = resolve_media_path(src, base_dir)
+            if os.path.isfile(cand):
+                path, on_disk = cand, True
+        except OSError:
+            pass
+    if path is None and origin and os.path.isfile(origin):
+        path, on_disk = os.path.abspath(origin), True
+    if path is None:
+        if src:
+            if base_dir:
+                path = os.path.join(base_dir, *src.replace("\\", "/").split("/"))
+                note = "  (file not found)"
+            else:
+                path = src
+                note = "  (board not saved yet)"
+        elif origin:
+            path = origin
+            note = "  (original file no longer exists)"
+
+    if on_disk:
+        fname = os.path.basename(path)
+    else:
+        fname = (name
+                 or (os.path.basename(src.replace("\\", "/")) if src else None)
+                 or (os.path.basename(origin) if origin else None)
+                 or "(unnamed)")
+
+    size = None
+    if on_disk:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = None
+    if size is None and raw:
+        size = len(raw)
+
+    resolution = None
+    video_source = None
+    if kind == "video":
+        if on_disk:
+            video_source = path
+        elif raw:
+            ext = os.path.splitext(fname)[1] if fname else ""
+            fd, tmp = tempfile.mkstemp(suffix=ext if ext else ".mp4")
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            _TEMP_VIDEO_FILES.append(tmp)
+            video_source = tmp
+    else:
+        if size_hint is not None and size_hint.isValid():
+            resolution = QSize(size_hint)
+        else:
+            resolution = _probe_image_size(raw, path if on_disk else None)
+
+    return {
+        "kind": kind, "name": fname, "path": path, "path_note": note,
+        "embedded": path is None, "size": size, "resolution": resolution,
+        "video_source": video_source,
+    }
+
+
+class MediaDetailsDialog(QDialog):
+    def __init__(self, parent, info):
+        super().__init__(parent)
+        self.setWindowTitle("Details")
+        self.setMinimumWidth(520)
+        self._info = info
+        self._player = None
+        self._sink = None
+        self._resolved = False
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+
+        def ro_edit(text):
+            e = QLineEdit(text)
+            e.setReadOnly(True)
+            e.setCursorPosition(0)
+            e.setToolTip(text)
+            return e
+
+        form.addRow("File name:", ro_edit(info["name"] or ""))
+        if info["path"]:
+            path_text = info["path"] + info["path_note"]
+        else:
+            path_text = "(embedded in the board file - no external file)"
+        form.addRow("Path:", ro_edit(path_text))
+        self.size_label = QLabel(_format_file_size(info["size"]))
+        self.size_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("File size:", self.size_label)
+        self.res_label = QLabel("")
+        self.res_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("Resolution:", self.res_label)
+        lay.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        copy_btn = buttons.addButton("Copy path", QDialogButtonBox.ActionRole)
+        copy_btn.setEnabled(bool(info["path"]))
+        copy_btn.clicked.connect(lambda: QGuiApplication.clipboard().setText(info["path"] or ""))
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        copy_btn.setAutoDefault(False)
+        copy_btn.setDefault(False)
+        close_btn = buttons.button(QDialogButtonBox.Close)
+        close_btn.setDefault(True)
+        close_btn.setFocus()
+        lay.addWidget(buttons)
+
+        self._timeout = QTimer(self)
+        self._timeout.setSingleShot(True)
+        self._timeout.timeout.connect(self._on_probe_timeout)
+        self.finished.connect(self._cleanup_probe)
+
+        if info["kind"] == "video":
+            self._start_video_probe()
+        else:
+            self._set_resolution(info["resolution"])
+
+    # -- resolution ----------------------------------------------------
+    def _set_resolution(self, sz):
+        self._resolved = True
+        if sz is not None and sz.isValid() and sz.width() > 0 and sz.height() > 0:
+            self.res_label.setText(f"{sz.width()} \u00d7 {sz.height()} px")
+        else:
+            self.res_label.setText("Unknown")
+
+    def _start_video_probe(self):
+        source = self._info.get("video_source")
+        if not HAS_MULTIMEDIA or not source:
+            self._set_resolution(None)
+            return
+        self.res_label.setText("Reading\u2026")
+        self._player = QMediaPlayer(self)
+        self._sink = QVideoSink(self)
+        self._player.setVideoSink(self._sink)
+        self._sink.videoFrameChanged.connect(self._on_probe_frame)
+        self._player.metaDataChanged.connect(self._check_probe_meta)
+        self._player.mediaStatusChanged.connect(self._on_probe_status)
+        self._player.errorOccurred.connect(lambda *a: self._on_probe_timeout())
+        self._player.setSource(QUrl.fromLocalFile(source))
+        self._timeout.start(4000)
+
+    def _check_probe_meta(self):
+        if self._resolved or self._player is None:
+            return
+        try:
+            sz = self._player.metaData().value(QMediaMetaData.Key.Resolution)
+        except Exception:
+            sz = None
+        if isinstance(sz, QSize) and sz.isValid() and sz.width() > 0:
+            self._timeout.stop()
+            self._set_resolution(sz)
+
+    def _on_probe_status(self, status):
+        if self._resolved or self._player is None:
+            return
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
+            self._check_probe_meta()
+            if not self._resolved:
+                # Some backends only report the size once a first frame has
+                # been decoded - pausing renders it into the (invisible) sink.
+                self._player.pause()
+        elif status == QMediaPlayer.InvalidMedia:
+            self._on_probe_timeout()
+
+    def _on_probe_frame(self, frame):
+        if self._resolved:
+            return
+        try:
+            if frame.isValid():
+                self._timeout.stop()
+                self._set_resolution(QSize(frame.width(), frame.height()))
+        except Exception:
+            pass
+
+    def _on_probe_timeout(self):
+        if not self._resolved:
+            self._set_resolution(None)
+
+    def _cleanup_probe(self, *_):
+        self._timeout.stop()
+        if self._player is not None:
+            try:
+                self._sink.videoFrameChanged.disconnect(self._on_probe_frame)
+            except Exception:
+                pass
+            try:
+                self._player.stop()
+                self._player.setVideoSink(None)
+                self._player.setSource(QUrl())
+            except Exception:
+                pass
+
+
+def show_media_details(parent, kind, raw=None, name=None, src=None, origin=None,
+                       base_dir=None, size_hint=None):
+    info = gather_media_details(kind, raw=raw, name=name, src=src, origin=origin,
+                                base_dir=base_dir, size_hint=size_hint)
+    dlg = MediaDetailsDialog(parent, info)
+    dlg.exec()
 
 
 class _MultiColorDialog(QDialog):
@@ -1723,6 +1981,242 @@ def replace_all_font_families(data, new_family):
     return data
 
 
+# --------------------------------------------------------------------------
+# Snapping - the magnet button in the top-right corner (MainWindow) switches
+# it on/off and picks what a component snaps to while it is dragged or
+# resized: other components' edges, their centres, equal spacing
+# ("equidistant") and the background dot grid ("grid"). The guide lines are painted by an overlay item (_SnapGuidesItem).
+# Hold Alt while dragging/resizing to turn snapping off temporarily.
+# --------------------------------------------------------------------------
+
+SNAP_OPTION_DEFAULTS = {
+    "enabled": True,       # master switch
+    "edges": True,         # edge <-> edge (aligned and touching)
+    "centers": True,       # centre lines (and centre <-> edge)
+    "resize": True,        # also while scaling a component by its handle
+    "equidistant": True,   # equal gaps between neighbouring components
+    "grid": False,         # snap to the background dot grid
+}
+SNAP_THRESHOLD_PX = 8.0    # pull-in distance, in screen pixels
+SNAP_GUIDE_COLOR = "#ff3d9a"
+
+
+def load_snap_options():
+    s = QSettings("OpenNote", "OpenNote")
+    s.beginGroup("snapping")
+    opts = {k: _qsettings_bool(s, k, v) for k, v in SNAP_OPTION_DEFAULTS.items()}
+    s.endGroup()
+    return opts
+
+
+def save_snap_options(opts):
+    s = QSettings("OpenNote", "OpenNote")
+    s.beginGroup("snapping")
+    for k, v in SNAP_OPTION_DEFAULTS.items():
+        s.setValue(k, bool(opts.get(k, v)))
+    s.endGroup()
+
+
+class SnapEngine:
+    """Pure geometry (no scene access): given the rectangle a component would
+    occupy and the rectangles of everything it could snap to, returns how far
+    to shift (move) or grow (resize) it plus the guides to draw.
+
+    Candidates are (delta, make_guides) pairs per axis; the smallest |delta|
+    inside the threshold wins, and every candidate that agrees with it
+    contributes its guide (so aligning to two components shows both lines)."""
+
+    EPS = 0.5
+
+    @staticmethod
+    def _span(r, axis):
+        """(lo, hi, cross_lo, cross_hi) of `r` along axis 0 = X / 1 = Y."""
+        if axis == 0:
+            return r.left(), r.left() + r.width(), r.top(), r.top() + r.height()
+        return r.top(), r.top() + r.height(), r.left(), r.left() + r.width()
+
+    @staticmethod
+    def _pt(axis, along, cross):
+        return QPointF(along, cross) if axis == 0 else QPointF(cross, along)
+
+    @classmethod
+    def _align_guide(cls, axis, pos, t_c_lo, t_c_hi):
+        def make(final):
+            _, _, f_lo, f_hi = cls._span(final, axis)
+            a, b = min(f_lo, t_c_lo), max(f_hi, t_c_hi)
+            return [{"kind": "line", "a": cls._pt(axis, pos, a), "b": cls._pt(axis, pos, b)}]
+        return make
+
+    @classmethod
+    def _gap_guide(cls, axis, lo, hi, cross_a, cross_b):
+        o_lo, o_hi = max(cross_a[0], cross_b[0]), min(cross_a[1], cross_b[1])
+        mid = (o_lo + o_hi) / 2.0 if o_hi > o_lo else (cross_a[0] + cross_a[1]) / 2.0
+        return {"kind": "gap", "axis": axis, "label": str(int(round(hi - lo))),
+                "a": cls._pt(axis, lo, mid), "b": cls._pt(axis, hi, mid)}
+
+    @classmethod
+    def _axis_candidates(cls, axis, mr, targets, opts, mode, thr):
+        span = cls._span
+        eps = cls.EPS
+        resize = (mode == "resize")
+        m_lo, m_hi, mc_lo, mc_hi = span(mr, axis)
+        m_mid = (m_lo + m_hi) / 2.0
+        m_w = m_hi - m_lo
+        use_edges = bool(opts.get("edges", True))
+        use_centers = bool(opts.get("centers", True))
+        cands = []
+
+        # ---- alignment: edges / centres of the others ---------------------
+        if use_edges or use_centers:
+            movers = [("hi", m_hi)] if resize else [("lo", m_lo), ("mid", m_mid), ("hi", m_hi)]
+            for t in targets:
+                t_lo, t_hi, tc_lo, tc_hi = span(t, axis)
+                t_mid = (t_lo + t_hi) / 2.0
+                for mname, mval in movers:
+                    if mname == "mid":
+                        tvals = [t_mid, t_lo, t_hi] if use_centers else []
+                    else:
+                        tvals = []
+                        if use_edges:
+                            tvals += [t_lo, t_hi]
+                        if use_centers:
+                            tvals.append(t_mid)
+                    for tval in tvals:
+                        d = tval - mval
+                        if abs(d) <= thr:
+                            cands.append((d, cls._align_guide(axis, tval, tc_lo, tc_hi)))
+
+        # ---- equidistant: equal gaps ----------------------------------------
+        if opts.get("equidistant", True):
+            ents = []
+            for t in targets:
+                lo, hi, c_lo, c_hi = span(t, axis)
+                if min(mc_hi, c_hi) - max(mc_lo, c_lo) > 0:   # shares the cross range
+                    ents.append((lo, hi, c_lo, c_hi))
+            lefts = [e for e in ents if e[1] <= m_lo + eps]
+            rights = [e for e in ents if (e[0] > m_lo + eps if resize else e[0] >= m_hi - eps)]
+            L = max(lefts, key=lambda e: e[1]) if lefts else None
+            Rn = min(rights, key=lambda e: e[0]) if rights else None
+            L2 = None
+            if L is not None:
+                prev = [e for e in ents if e[1] <= L[0] + eps]
+                L2 = max(prev, key=lambda e: e[1]) if prev else None
+            R2 = None
+            if Rn is not None:
+                nxt = [e for e in ents if e[0] >= Rn[1] - eps]
+                R2 = min(nxt, key=lambda e: e[0]) if nxt else None
+
+            def cr(e):
+                return (e[2], e[3])
+
+            if not resize:
+                # (1) between two neighbours: equal gap on both sides
+                if L is not None and Rn is not None and Rn[0] - L[1] - m_w > 0:
+                    new_lo = L[1] + (Rn[0] - L[1] - m_w) / 2.0
+                    d = new_lo - m_lo
+                    if abs(d) <= thr:
+                        def make(final, L=L, Rn=Rn):
+                            f_lo, f_hi, f_c_lo, f_c_hi = span(final, axis)
+                            fc = (f_c_lo, f_c_hi)
+                            return [cls._gap_guide(axis, L[1], f_lo, cr(L), fc),
+                                    cls._gap_guide(axis, f_hi, Rn[0], fc, cr(Rn))]
+                        cands.append((d, make))
+                # (2) continue the spacing of the two nearest on the left
+                if L is not None and L2 is not None and L[0] - L2[1] > eps:
+                    g = L[0] - L2[1]
+                    d = (L[1] + g) - m_lo
+                    if abs(d) <= thr:
+                        def make(final, L=L, L2=L2):
+                            f_lo, f_hi, f_c_lo, f_c_hi = span(final, axis)
+                            return [cls._gap_guide(axis, L2[1], L[0], cr(L2), cr(L)),
+                                    cls._gap_guide(axis, L[1], f_lo, cr(L), (f_c_lo, f_c_hi))]
+                        cands.append((d, make))
+                # (3) ... or of the two nearest on the right
+                if Rn is not None and R2 is not None and R2[0] - Rn[1] > eps:
+                    g = R2[0] - Rn[1]
+                    d = (Rn[0] - g - m_w) - m_lo
+                    if abs(d) <= thr:
+                        def make(final, Rn=Rn, R2=R2):
+                            f_lo, f_hi, f_c_lo, f_c_hi = span(final, axis)
+                            return [cls._gap_guide(axis, f_hi, Rn[0], (f_c_lo, f_c_hi), cr(Rn)),
+                                    cls._gap_guide(axis, Rn[1], R2[0], cr(Rn), cr(R2))]
+                        cands.append((d, make))
+            else:
+                # only the far edge moves: (4) gap to the right neighbour ==
+                # the gap already on the left side of this component
+                if L is not None and Rn is not None and m_lo - L[1] > eps:
+                    g0 = m_lo - L[1]
+                    d = (Rn[0] - g0) - m_hi
+                    if abs(d) <= thr:
+                        def make(final, L=L, Rn=Rn):
+                            f_lo, f_hi, f_c_lo, f_c_hi = span(final, axis)
+                            fc = (f_c_lo, f_c_hi)
+                            return [cls._gap_guide(axis, L[1], f_lo, cr(L), fc),
+                                    cls._gap_guide(axis, f_hi, Rn[0], fc, cr(Rn))]
+                        cands.append((d, make))
+                # (5) gap to the right neighbour == gap between the next two
+                if Rn is not None and R2 is not None and R2[0] - Rn[1] > eps:
+                    g = R2[0] - Rn[1]
+                    d = (Rn[0] - g) - m_hi
+                    if abs(d) <= thr:
+                        def make(final, Rn=Rn, R2=R2):
+                            f_lo, f_hi, f_c_lo, f_c_hi = span(final, axis)
+                            return [cls._gap_guide(axis, f_hi, Rn[0], (f_c_lo, f_c_hi), cr(Rn)),
+                                    cls._gap_guide(axis, Rn[1], R2[0], cr(Rn), cr(R2))]
+                        cands.append((d, make))
+        return cands
+
+    @classmethod
+    def _grid_delta(cls, axis, mr, grid, thr, mode):
+        """Shift that puts the rectangle's top-left corner (move) or its
+        moving bottom-right corner (resize) exactly on the nearest dot of
+        a grid with `grid` spacing, or None when that is further than the
+        snap threshold away."""
+        m_lo, m_hi, _, _ = cls._span(mr, axis)
+        ref = m_hi if mode == "resize" else m_lo
+        d = round(ref / grid) * grid - ref
+        return d if abs(d) <= thr else None
+
+    @classmethod
+    def snap(cls, mr, targets, opts, thr, mode="move", axes=(True, True), grid=0.0):
+        """mode "move": `mr` is the whole rectangle being dragged.
+        mode "resize": `mr` has a fixed top-left; only right/bottom move.
+        `grid` > 0 additionally snaps to a dot grid of that spacing - but
+        only on an axis where no other component's edge/centre/gap snap
+        applies, so aligning to other components always wins.
+        Returns (dx, dy, guides) - dx/dy shift the rect (move) or grow it
+        (resize)."""
+        if not targets and not grid:
+            return 0.0, 0.0, []
+        deltas = [0.0, 0.0]
+        chosen = [[], []]
+        for axis in (0, 1):
+            if not axes[axis]:
+                continue
+            cands = cls._axis_candidates(axis, mr, targets, opts, mode, thr) if targets else []
+            if not cands:
+                if grid:
+                    gd = cls._grid_delta(axis, mr, grid, thr, mode)
+                    if gd is not None:
+                        deltas[axis] = gd
+                        chosen[axis] = [(gd, lambda final: [])]   # the dot itself is the cue
+                continue
+            best = min(cands, key=lambda c: abs(c[0]))[0]
+            deltas[axis] = best
+            chosen[axis] = [c for c in cands if abs(c[0] - best) < cls.EPS]
+        dx, dy = deltas
+        if mode == "resize":
+            final = QRectF(mr.left(), mr.top(), mr.width() + dx, mr.height() + dy)
+        else:
+            final = QRectF(mr)
+            final.translate(dx, dy)
+        guides = []
+        for axis in (0, 1):
+            for _, make in chosen[axis]:
+                guides.extend(make(final))
+        return dx, dy, guides
+
+
 class EditableTextItem(QGraphicsTextItem):
     """A QGraphicsTextItem that only grabs mouse input while in edit mode,
     otherwise it lets clicks fall through to its parent component so the
@@ -1970,6 +2464,9 @@ class BaseComponentItem(QGraphicsObject):
         self.setAcceptHoverEvents(True)
         self.min_w, self.min_h = 80, 60
         self._resizing = False
+        # Snap targets for the current resize gesture, collected lazily on
+        # the first move and dropped on release (see mouseMoveEvent).
+        self._resize_snap_targets = None
         self._resize_start = QPointF()
         self._start_geom = (self._w, self._h)
         # See _raise_to_front_if_needed(): set False at the start of every
@@ -1991,6 +2488,9 @@ class BaseComponentItem(QGraphicsObject):
         # every component type.
         self.arrow_snap_method = None
         self._snap_method_actions = {}
+        # Start state of the current mouse-drag, used by the alignment
+        # snapping (see _begin_snap_drag / _apply_snap_drag).
+        self._snap_drag = None
 
     # -- geometry -----------------------------------------------------
     def boundingRect(self):
@@ -2074,13 +2574,78 @@ class BaseComponentItem(QGraphicsObject):
 
     def mousePressEvent(self, event):
         self._raised_this_press = False
+        self._snap_drag = None
         if self.isSelected() and self.handle_rect().contains(event.pos()):
             self._resizing = True
+            self._resize_snap_targets = None
             self._resize_start = event.scenePos()
             self._start_geom = (self._w, self._h)
             event.accept()
             return
         super().mousePressEvent(event)
+        self._begin_snap_drag(event)
+
+    # -- snapping (see SnapEngine and the magnet button in MainWindow) ---
+    def _begin_snap_drag(self, event):
+        """Remember where every item that is about to be dragged started,
+        so _apply_snap_drag can place them at start + mouse delta + snap
+        correction (absolute, rather than relying on Qt's incremental
+        move, which a snap correction would otherwise accumulate into)."""
+        self._snap_drag = None
+        sc = self.scene()
+        if sc is None or event.button() != Qt.LeftButton or isinstance(self, ArrowItem):
+            return
+        if self.isSelected():
+            items = [it for it in sc.selectedItems()
+                     if isinstance(it, BaseComponentItem) and it.topLevelItem() is it
+                     and (it.flags() & QGraphicsItem.ItemIsMovable)]
+        else:
+            items = [self]
+        if self not in items:
+            items.append(self)
+        rect = QRectF()
+        for it in items:
+            if not isinstance(it, ArrowItem):
+                rect = rect.united(it.mapRectToScene(it.rect()))
+        if rect.isNull():
+            return
+        self._snap_drag = {
+            "press": QPointF(event.scenePos()),
+            "starts": [(it, QPointF(it.pos())) for it in items],
+            "rect": rect,
+            # Other components' rectangles - they do not move during the
+            # drag, so they are collected once (lazily, on the first move
+            # that actually snaps) instead of on every mouse move.
+            "targets": None,
+        }
+
+    def _apply_snap_drag(self, event):
+        sd = self._snap_drag
+        sc = self.scene()
+        if sd is None or sc is None or not hasattr(sc, "snap_active"):
+            return
+        if not (event.buttons() & Qt.LeftButton):
+            return
+        if not sc.get_snap_options().get("enabled", True):
+            sc.clear_snap_guides()
+            return
+        delta = event.scenePos() - sd["press"]
+        dx = dy = 0.0
+        guides = []
+        if sc.snap_active(event.modifiers()):
+            raw = QRectF(sd["rect"])
+            raw.translate(delta)
+            if sd["targets"] is None:
+                exclude = {it for it, _ in sd["starts"]}
+                sd["targets"] = sc.snap_target_rects(exclude)
+            dx, dy, guides = SnapEngine.snap(
+                raw, sd["targets"], sc.get_snap_options(),
+                sc.snap_threshold(), "move", grid=sc.snap_grid_spacing())
+        for it, p0 in sd["starts"]:
+            np_ = QPointF(p0.x() + delta.x() + dx, p0.y() + delta.y() + dy)
+            if np_ != it.pos():
+                it.setPos(np_)
+        sc.set_snap_guides(guides)
 
     def mouseMoveEvent(self, event):
         if self._resizing:
@@ -2088,21 +2653,46 @@ class BaseComponentItem(QGraphicsObject):
             delta = event.scenePos() - self._resize_start
             w0, h0 = self._start_geom
             new_w, new_h = w0 + delta.x(), h0 + delta.y()
-            if (event.modifiers() & Qt.ControlModifier) and w0 > 0 and h0 > 0:
+            ctrl = bool(event.modifiers() & Qt.ControlModifier) and w0 > 0 and h0 > 0
+            dom_x = abs(delta.x()) >= abs(delta.y())
+            aspect = (w0 / h0) if ctrl else None
+            if ctrl:
                 # Constrain to the original width/height ratio, driven by
                 # whichever axis the mouse moved further along - the same
                 # feel as holding Shift/Ctrl for proportional resize in
                 # most design tools.
-                aspect = w0 / h0
-                if abs(delta.x()) >= abs(delta.y()):
+                if dom_x:
                     new_h = new_w / aspect
                 else:
                     new_w = new_h * aspect
+            sc = self.scene()
+            guides = []
+            if sc is not None and hasattr(sc, "snap_active") and sc.snap_active(
+                    event.modifiers(), resizing=True):
+                tl = self.scenePos()
+                raw = QRectF(tl.x(), tl.y(), new_w, new_h)
+                axes = (True, True) if not ctrl else ((True, False) if dom_x else (False, True))
+                if self._resize_snap_targets is None:
+                    self._resize_snap_targets = sc.snap_target_rects({self})
+                sdx, sdy, g = SnapEngine.snap(
+                    raw, self._resize_snap_targets, sc.get_snap_options(),
+                    sc.snap_threshold(), "resize", axes, grid=sc.snap_grid_spacing())
+                sw, sh = new_w + sdx, new_h + sdy
+                if ctrl:
+                    if dom_x:
+                        sh = sw / aspect
+                    else:
+                        sw = sh * aspect
+                if sw >= self.min_w and sh >= self.min_h:
+                    new_w, new_h, guides = sw, sh, g
+            if sc is not None and hasattr(sc, "set_snap_guides"):
+                sc.set_snap_guides(guides)
             self.set_size(new_w, new_h)
             event.accept()
             return
         self._raise_to_front_if_needed()
         super().mouseMoveEvent(event)
+        self._apply_snap_drag(event)
         self._update_board_hover_preview(event.scenePos())
 
     def _update_board_hover_preview(self, cursor_scene_pos):
@@ -2171,6 +2761,11 @@ class BaseComponentItem(QGraphicsObject):
         self._hover_board = target
 
     def mouseReleaseEvent(self, event):
+        self._snap_drag = None
+        self._resize_snap_targets = None
+        _snap_scene = self.scene()
+        if _snap_scene is not None and hasattr(_snap_scene, "clear_snap_guides"):
+            _snap_scene.clear_snap_guides()
         was_resizing = self._resizing
         if self._resizing:
             self._resizing = False
@@ -2867,6 +3462,17 @@ class MediaSourceMixin:
         self.media_src = externalize_media_bytes(
             self.MEDIA_KIND, raw, base_dir, self.media_origin, name=self.media_name)
 
+    def _show_media_details(self):
+        """Context menu > Details...: file name, path, size, resolution."""
+        mw = self._media_main_window()
+        base = mw.media_base_dir() if mw is not None else None
+        hint = None
+        if self.MEDIA_KIND == "image" and not self.pixmap_orig.isNull():
+            hint = self.pixmap_orig.size()
+        show_media_details(
+            mw, self.MEDIA_KIND, raw=self._media_raw_bytes(), name=self.media_name,
+            src=self.media_src, origin=self.media_origin, base_dir=base, size_hint=hint)
+
     def _change_media_path(self):
         mw = self._media_main_window()
         if mw is None:
@@ -3140,6 +3746,8 @@ class MediaCardMixin(MediaSourceMixin):
         # Local-path mode only: show where the file lives and let the user
         # re-point it (see MainWindow.choose_new_media_path).
         self._media_path_action = None
+        self._media_details_action = menu.addAction("Details\u2026")
+        menu.addSeparator()
         mw = self._media_main_window()
         if mw is not None and mw.media_mode_is_local():
             info = self.media_src or "(not written yet - goes to Assets on save)"
@@ -3161,6 +3769,9 @@ class MediaCardMixin(MediaSourceMixin):
     def _handle_media_context_action(self, action):
         """Call from the subclass's _handle_context_action override;
         returns True if the action was one of ours and was handled."""
+        if action is not None and action is getattr(self, "_media_details_action", None):
+            self._show_media_details()
+            return True
         if action is not None and action is getattr(self, "_media_path_action", None):
             self._change_media_path()
             return True
@@ -7189,16 +7800,45 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
                     self._detach_subitem(idx, event.scenePos())
                 return
             mw = getattr(self.scene(), "main_window", None) if self.scene() is not None else None
-            if sub.get("kind") in MEDIA_KINDS and mw is not None and mw.media_mode_is_local():
+            is_media = sub.get("kind") in MEDIA_KINDS
+            if is_media and mw is not None and mw.media_mode_is_local():
                 menu = QMenu()
+                details_action = menu.addAction("Details\u2026")
+                menu.addSeparator()
                 info = sub.get("src") or "(not written yet - goes to Assets on save)"
                 menu.addAction(f"Path: {info}").setEnabled(False)
                 change_action = menu.addAction("Change Path\u2026")
                 chosen = menu.exec(event.screenPos())
-                if chosen == change_action:
+                if chosen is not None and chosen == details_action:
+                    self._show_subitem_details(idx)
+                elif chosen is not None and chosen == change_action:
                     self._change_subitem_media_path(idx)
                 return
+            # Embedded mode: keep the card's own menu, with Details added
+            # on top (see _build_context_menu).
+            self._ctx_media_idx = idx if is_media else None
+            try:
+                super().contextMenuEvent(event)
+            finally:
+                self._ctx_media_idx = None
+            return
         super().contextMenuEvent(event)
+
+    def _show_subitem_details(self, idx):
+        if not (0 <= idx < len(self.subitems)):
+            return
+        sub = self.subitems[idx]
+        mw = getattr(self.scene(), "main_window", None) if self.scene() is not None else None
+        raw = None
+        data = sub.get("data")
+        if data:
+            try:
+                raw = base64.b64decode(data)
+            except Exception:
+                raw = None
+        show_media_details(
+            mw, sub.get("kind"), raw=raw, name=sub.get("name"), src=sub.get("src"),
+            origin=sub.get("_origin"), base_dir=mw.media_base_dir() if mw is not None else None)
 
     def _change_subitem_media_path(self, idx):
         """Local-path mode: re-point a media subitem at another file (see
@@ -7234,10 +7874,19 @@ class BoardCardItem(TopStripMixin, BaseComponentItem):
         self.update()
 
     def _build_context_menu(self, menu):
+        self._details_action = None
+        if getattr(self, "_ctx_media_idx", None) is not None:
+            self._details_action = menu.addAction("Details\u2026")
+            menu.addSeparator()
         self._build_top_strip_context_menu(menu)
         menu.addSeparator()
 
     def _handle_context_action(self, action):
+        if action is not None and action is getattr(self, "_details_action", None):
+            idx = getattr(self, "_ctx_media_idx", None)
+            if idx is not None:
+                self._show_subitem_details(idx)
+            return
         self._handle_top_strip_context_action(action)
 
     def serialize(self):
@@ -8448,6 +9097,74 @@ def deserialize_component(d):
 # Scene
 # --------------------------------------------------------------------------
 
+class _SnapGuidesItem(QGraphicsObject):
+    """Overlay that paints the snapping guide lines / equal-gap labels in
+    scene coordinates, above every component (see MindMapScene.set_snap_guides)."""
+
+    def __init__(self):
+        super().__init__()
+        self._guides = []
+        self._scale = 1.0
+        self._rect = QRectF()
+        self.setZValue(ANCHOR_HIGHLIGHT_Z + 1)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+
+    def set_guides(self, guides, scale):
+        self.prepareGeometryChange()
+        self._guides = list(guides)
+        self._scale = max(scale, 1e-6)
+        rect = QRectF()
+        for g in self._guides:
+            rect = rect.united(QRectF(g["a"], g["b"]).normalized())
+        pad = 80.0 / self._scale
+        self._rect = rect.adjusted(-pad, -pad, pad, pad) if self._guides else QRectF()
+        self.update()
+
+    def boundingRect(self):
+        return self._rect
+
+    def paint(self, painter, option, widget=None):
+        if not self._guides:
+            return
+        scale = abs(painter.worldTransform().m11()) or self._scale
+        pen = QPen(QColor(SNAP_GUIDE_COLOR), 1)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        tick = 4.0 / scale
+        for g in self._guides:
+            a, b = g["a"], g["b"]
+            painter.drawLine(a, b)
+            if g["kind"] == "gap":
+                if g["axis"] == 0:
+                    painter.drawLine(QPointF(a.x(), a.y() - tick), QPointF(a.x(), a.y() + tick))
+                    painter.drawLine(QPointF(b.x(), b.y() - tick), QPointF(b.x(), b.y() + tick))
+                else:
+                    painter.drawLine(QPointF(a.x() - tick, a.y()), QPointF(a.x() + tick, a.y()))
+                    painter.drawLine(QPointF(b.x() - tick, b.y()), QPointF(b.x() + tick, b.y()))
+        font = QFont("Segoe UI", 8)
+        fm = QFontMetrics(font)
+        painter.setFont(font)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        for g in self._guides:
+            if g["kind"] != "gap":
+                continue
+            mid = (g["a"] + g["b"]) / 2.0
+            text = g["label"]
+            w = fm.horizontalAdvance(text) + 10
+            h = fm.height() + 2
+            painter.save()
+            painter.translate(mid)
+            painter.scale(1.0 / scale, 1.0 / scale)
+            box = QRectF(-w / 2.0, -h / 2.0, w, h)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(SNAP_GUIDE_COLOR))
+            painter.drawRoundedRect(box, 3, 3)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(box, Qt.AlignCenter, text)
+            painter.restore()
+
+
 class _ArrowAnchorEndpointMarkers(QGraphicsObject):
     """Standalone overlay that paints the green anchor-point rings for
     every currently anchored endpoint of the selected arrow(s), in scene
@@ -8628,6 +9345,88 @@ class MindMapScene(QGraphicsScene):
         # view runs them once, for real, right after the drag ends.
         self.rubber_band_dragging = False
         self.selectionChanged.connect(self.update_anchor_endpoint_markers)
+        # Snapping guides currently shown (see SnapEngine / _SnapGuidesItem).
+        self._snap_guides_item = None
+
+    # -- snapping -----------------------------------------------------------
+    def get_snap_options(self):
+        mw = self.main_window
+        opts = getattr(mw, "snap_options", None) if mw is not None else None
+        return opts if opts is not None else SNAP_OPTION_DEFAULTS
+
+    def snap_active(self, modifiers=Qt.NoModifier, resizing=False):
+        """Whether a drag (or, with resizing=True, a resize) should snap now:
+        master switch on, at least one snap type on, Alt not held."""
+        o = self.get_snap_options()
+        if not o.get("enabled", True):
+            return False
+        if resizing and not o.get("resize", True):
+            return False
+        if modifiers & Qt.AltModifier:
+            return False
+        return bool(o.get("edges") or o.get("centers") or o.get("equidistant")
+                    or o.get("grid"))
+
+    def snap_grid_spacing(self):
+        """Spacing (scene units) of the background dots to snap to, or 0
+        when grid snapping is off. Follows drawBackground: the dots'
+        spacing doubles while it would be tighter than MIN_SCREEN_SPACING
+        on screen, so the corner always lands on a dot that is visible."""
+        if not self.get_snap_options().get("grid"):
+            return 0.0
+        views = self.views()
+        scale = abs(views[0].transform().m11()) if views else 1.0
+        scale = scale or 1.0
+        grid = self.GRID_SPACING
+        while grid * scale < self.MIN_SCREEN_SPACING:
+            grid *= 2
+        return float(grid)
+
+    def snap_threshold(self):
+        views = self.views()
+        scale = views[0].transform().m11() if views else 1.0
+        return SNAP_THRESHOLD_PX / max(abs(scale), 1e-6)
+
+    def snap_target_rects(self, exclude):
+        # NOTE: do not call item.parentItem() on top-level items here (or in
+        # BaseComponentItem._begin_snap_drag): in PySide6 it returns None and
+        # drops the Python-side ownership of the item, so the item is
+        # destroyed as soon as the temporary wrapper is garbage-collected -
+        # which made every other component vanish from the board the moment
+        # a drag with snapping started. topLevelItem() is safe.
+        rects = []
+        for it in self.items():
+            if (isinstance(it, BaseComponentItem) and not isinstance(it, ArrowItem)
+                    and it.topLevelItem() is it and it.isVisible() and it not in exclude):
+                rects.append(it.mapRectToScene(it.rect()))
+        return rects
+
+    def set_snap_guides(self, guides):
+        """Show/clear the guide lines. Painted by a regular overlay item (see
+        _SnapGuidesItem), like the arrow anchor markers - not by
+        drawForeground/scene.update(rect), which left the rest of the canvas
+        blank with the OpenGL viewport."""
+        item = self._snap_guides_item
+        if item is not None:
+            try:
+                if item.scene() is not self:
+                    item = None
+            except RuntimeError:
+                item = None
+        if not guides:
+            if item is not None:
+                item.set_guides([], 1.0)
+            return
+        if item is None:
+            item = _SnapGuidesItem()
+            self.addItem(item)
+            self._snap_guides_item = item
+        views = self.views()
+        scale = abs(views[0].transform().m11()) if views else 1.0
+        item.set_guides(guides, scale)
+
+    def clear_snap_guides(self):
+        self.set_snap_guides([])
 
     @staticmethod
     def _is_anchored_arrow(it):
@@ -8809,7 +9608,9 @@ class MindMapScene(QGraphicsScene):
                 if it.anchor2 is not None and it.anchor2.get("item") is item:
                     it.anchor2 = None
         super().removeItem(item)
-        if item is self._anchor_endpoint_markers:
+        if item is self._snap_guides_item:
+            self._snap_guides_item = None
+        elif item is self._anchor_endpoint_markers:
             self._anchor_endpoint_markers = None
         else:
             self.update_anchor_endpoint_markers()
@@ -8876,14 +9677,16 @@ class MindMapScene(QGraphicsScene):
         # single drawPoints() call is dramatically faster than the
         # equivalent number of individual drawPoint() calls (each of
         # which pays its own call overhead) - see the note above.
-        points = []
-        x = left
-        while x < rect.right():
-            y = top
-            while y < rect.bottom():
-                points.append(QPointF(x, y))
-                y += grid
-            x += grid
+        # Same points as the old nested while-loops (x < rect.right(),
+        # y < rect.bottom(), stepping by `grid`), but with the right/bottom
+        # edges computed once instead of two QRectF method calls per
+        # iteration (~200k calls per 60 repaints on a busy board) and the
+        # list built by a comprehension - this runs on every repaint while
+        # panning, so the per-point Python overhead is what showed up in
+        # profiles of large boards.
+        xs = range(left, int(math.ceil(rect.right())), grid)
+        ys = range(top, int(math.ceil(rect.bottom())), grid)
+        points = [QPointF(x, y) for x in xs for y in ys]
         if points:
             painter.drawPoints(points)
 
@@ -9357,6 +10160,76 @@ class MindMapView(QGraphicsView):
         self._panning = False
         self._pan_start = QPoint()
         self._growing_scene_rect = False
+        # Idle-time image prefetch (see _schedule_prefetch below).
+        self._prefetch_queue = []
+        self._prefetch_idle_timer = QTimer(self)
+        self._prefetch_idle_timer.setSingleShot(True)
+        self._prefetch_idle_timer.timeout.connect(self._prefetch_collect)
+        self._prefetch_step_timer = QTimer(self)
+        self._prefetch_step_timer.setSingleShot(True)
+        self._prefetch_step_timer.timeout.connect(self._prefetch_step)
+
+    # -- idle-time image prefetch ---------------------------------------
+    # Board Card image subitems are decoded from base64 lazily, the first
+    # time they are painted (BoardCardItem._get_or_create_image_pixmap).
+    # On a big board that means every time a pan brings a not-yet-seen
+    # card into view, that one frame also pays for decoding its images -
+    # 15 ms per ordinary image, far more for a large one - which shows up
+    # as a hitch (a visible stutter) exactly while panning. So whenever the
+    # view has been still for a moment, quietly decode the images of cards
+    # in and around the viewport, one image per event-loop turn, so the
+    # next pan finds them ready. Any scroll cancels the work in progress,
+    # so it never competes with an active pan; cards far from the viewport
+    # are still decoded lazily, so memory use on huge boards is unchanged.
+    PREFETCH_IDLE_MS = 150      # how long the view must sit still first
+    PREFETCH_MARGIN_PX = 1500   # how far past the viewport edge to look, in screen pixels
+
+    def _schedule_prefetch(self):
+        self._prefetch_queue = []
+        self._prefetch_step_timer.stop()
+        self._prefetch_idle_timer.start(self.PREFETCH_IDLE_MS)
+
+    def _prefetch_collect(self):
+        scene = self.scene()
+        if scene is None or self._panning:
+            return
+        viewport_rect = self.viewport().rect()
+        if not viewport_rect.isValid():
+            return
+        visible = self.mapToScene(viewport_rect).boundingRect()
+        margin = self.PREFETCH_MARGIN_PX / max(self.transform().m11(), 1e-6)
+        area = visible.adjusted(-margin, -margin, margin, margin)
+        queue = []
+        for it in scene.items(area):
+            if not isinstance(it, BoardCardItem):
+                continue
+            cache = it._image_pixmap_cache
+            for idx, sub in enumerate(it.subitems):
+                if sub.get("kind") == "image" and sub.get("data") and id(sub) not in cache:
+                    queue.append((weakref.ref(it), idx))
+        self._prefetch_queue = queue
+        if queue:
+            self._prefetch_step_timer.start(0)
+
+    def _prefetch_step(self):
+        scene = self.scene()
+        while self._prefetch_queue:
+            ref, idx = self._prefetch_queue.pop(0)
+            it = ref()
+            if it is None:
+                continue
+            try:
+                if it.scene() is not scene or idx >= len(it.subitems):
+                    continue
+                sub = it.subitems[idx]
+                if sub.get("kind") != "image":
+                    continue
+                it._get_or_create_image_pixmap(sub)
+            except RuntimeError:
+                continue  # the C++ item was deleted underneath us (board switched)
+            break  # exactly one decode per turn, so the UI stays responsive
+        if self._prefetch_queue:
+            self._prefetch_step_timer.start(0)
 
     def _grow_scene_rect_if_needed(self):
         scene = self.scene()
@@ -9401,20 +10274,24 @@ class MindMapView(QGraphicsView):
     def scrollContentsBy(self, dx, dy):
         super().scrollContentsBy(dx, dy)
         self._grow_scene_rect_if_needed()
+        self._schedule_prefetch()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._grow_scene_rect_if_needed()
+        self._schedule_prefetch()
 
     def showEvent(self, event):
         super().showEvent(event)
         self._grow_scene_rect_if_needed()
+        self._schedule_prefetch()
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.ControlModifier:
             factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
             self.scale(factor, factor)
             self._grow_scene_rect_if_needed()
+            self._schedule_prefetch()
             self.main_window._update_zoom_label()
         else:
             super().wheelEvent(event)
@@ -9441,6 +10318,7 @@ class MindMapView(QGraphicsView):
         cx, cy = state.get("center_x"), state.get("center_y")
         if cx is not None and cy is not None:
             self.centerOn(cx, cy)
+        self._schedule_prefetch()
 
     def mousePressEvent(self, event):
         # A press anywhere deselects whichever Board Card subitem was
@@ -9634,8 +10512,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   var scale = 1, originX = 60, originY = 60;
   var isPanning = false, startX = 0, startY = 0;
 
+  // translate3d (not plain translate): a 3D transform promotes #canvas to
+  // its own compositor layer, so panning just moves that already-rasterised
+  // layer on the GPU instead of re-laying-out/repainting every card and
+  // image on each mousemove. On big boards (dozens of embedded images,
+  // tall Board Cards with box-shadows) this was the difference between a
+  // laggy pan and a smooth one - measured on a 110 MB export, slow frames
+  // during a pan dropped from ~260 to ~25 under 4x CPU throttling.
   function apply() {{
-    canvas.style.transform = 'translate(' + originX + 'px,' + originY + 'px) scale(' + scale + ')';
+    canvas.style.transform = 'translate3d(' + originX + 'px,' + originY + 'px,0) scale(' + scale + ')';
   }}
 
   // Fit the initial view to where the content actually is, instead of
@@ -11174,6 +12059,8 @@ class MainWindow(QMainWindow):
         self.breadcrumb_layout.setContentsMargins(10, 4, 10, 4)
         self.breadcrumb_layout.setSpacing(2)
         self.breadcrumb_layout.addStretch(1)
+        self._build_snap_button()
+        self.breadcrumb_layout.addWidget(self.snap_button)
         central_layout.addWidget(self.breadcrumb_bar)
         # Body row: [left tool column | canvas]. The tool column is inserted
         # by _build_toolbar, so it starts right below the breadcrumb/tab
@@ -11804,6 +12691,7 @@ class MainWindow(QMainWindow):
         colours from Preferences) to everything that carries its own
         stylesheet."""
         apply_dark_theme(QApplication.instance(), self.prefs)
+        self._refresh_snap_button()   # magnet icon follows the accent colour
         self._left_tb.setStyleSheet(_theme_text(self._left_tb_qss))
         self.breadcrumb_bar.setStyleSheet(_theme_text("background:#1b1b1b; border-bottom:1px solid #000;"))
         self._update_breadcrumb_bar()
@@ -14562,12 +15450,88 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, error_title, str(e))
 
     # -- breadcrumb bar (nested-boards navigation) -----------------------
+    # -- snapping button (magnet, top-right corner) ----------------------
+    @staticmethod
+    def _snap_icon(enabled):
+        color = THEME_ACCENT if enabled else "#707070"
+        body = (
+            f'<g fill="none" stroke="{color}" stroke-width="2" stroke-linejoin="round" '
+            f'stroke-linecap="round">'
+            f'<path d="M5 3h5v9a2 2 0 0 0 4 0V3h5v9a7 7 0 0 1-14 0z"/>'
+            f'<path d="M5 8h5M14 8h5"/></g>'
+        )
+        return _svg_to_icon(body, 20)
+
+    def _build_snap_button(self):
+        """Magnet icon with a drop-down of snapping options (checkboxes):
+        master on/off, snap to edges, snap to centres, snap while resizing
+        and equidistant spacing. Choices persist between runs."""
+        self.snap_options = load_snap_options()
+        btn = QToolButton()
+        btn.setAutoRaise(True)
+        btn.setFocusPolicy(Qt.NoFocus)
+        btn.setIconSize(QSize(20, 20))
+        btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        btn.setPopupMode(QToolButton.InstantPopup)
+        self.snap_button = btn
+
+        menu = QMenu(btn)
+        self._snap_checks = {}
+
+        def add_row(widget, left):
+            holder = QWidget()
+            hl = QHBoxLayout(holder)
+            hl.setContentsMargins(left, 5, 16, 5)
+            hl.addWidget(widget)
+            wa = QWidgetAction(menu)
+            wa.setDefaultWidget(holder)
+            menu.addAction(wa)
+
+        def add_check(key, text, indent):
+            cb = QCheckBox(text)
+            cb.setFocusPolicy(Qt.NoFocus)
+            cb.setChecked(bool(self.snap_options.get(key, True)))
+            cb.toggled.connect(lambda checked, k=key: self._on_snap_option_toggled(k, checked))
+            self._snap_checks[key] = cb
+            add_row(cb, 26 if indent else 12)
+
+        add_check("enabled", "Enable snapping", False)
+        menu.addSeparator()
+        add_check("edges", "Snap to edges", True)
+        add_check("centers", "Snap to centers", True)
+        add_check("resize", "Snap while resizing", True)
+        add_check("equidistant", "Equidistant spacing", True)
+        add_check("grid", "Snap to grid", True)
+        menu.addSeparator()
+        hint = QLabel("Hold Alt while dragging to\ntemporarily turn snapping off.")
+        hint.setStyleSheet("color:#8a8a8a; font-size:11px;")
+        add_row(hint, 12)
+        btn.setMenu(menu)
+        self._refresh_snap_button()
+
+    def _on_snap_option_toggled(self, key, checked):
+        self.snap_options[key] = bool(checked)
+        save_snap_options(self.snap_options)
+        if key == "enabled":
+            self._refresh_snap_button()
+
+    def _refresh_snap_button(self):
+        on = bool(self.snap_options.get("enabled", True))
+        self.snap_button.setIcon(self._snap_icon(on))
+        self.snap_button.setToolTip("Snapping: " + ("on" if on else "off"))
+        for key, cb in self._snap_checks.items():
+            if key != "enabled":
+                cb.setEnabled(on)
+        if not on and hasattr(self, "scene"):
+            self.scene.clear_snap_guides()
+
     def _update_breadcrumb_bar(self):
         layout = self.breadcrumb_layout
+        snap_btn = getattr(self, "snap_button", None)
         while layout.count() > 0:
             child = layout.takeAt(0)
             w = child.widget()
-            if w is not None:
+            if w is not None and w is not snap_btn:   # the magnet button persists
                 w.deleteLater()
 
         project_dir = os.path.dirname(self.current_file) if self.current_file else None
@@ -14598,6 +15562,8 @@ class MainWindow(QMainWindow):
                     btn.clicked.connect(lambda checked=False, p=target_path: self.navigate_to_file(p))
             layout.addWidget(btn)
         layout.addStretch(1)
+        if snap_btn is not None:
+            layout.addWidget(snap_btn)   # always the far right of the strip
 
 
 # --------------------------------------------------------------------------
